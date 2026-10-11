@@ -9,3 +9,4 @@ export/build/
 Design_1_ref.graf
 *.tar.xz
 .env
+export/release/
