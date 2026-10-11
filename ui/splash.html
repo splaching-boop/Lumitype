@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Lumitype</title>
+    <!-- Icône d'onglet : le logo du projet, traité par Vite comme toute ressource (nom haché à la compilation). -->
+    <link rel="icon" type="image/png" sizes="32x32" href="/src/assets/logo/logo-32.png" />
+    <link rel="stylesheet" href="/src/splash.css" />
+  </head>
+  <body>
+    <!-- Bannière de lancement : fenêtre sans bordure, affichée seule pendant que l'application se prépare.
+         Avec une bannière complète (assets/splash/banner.*), l'image occupe toute la fenêtre et porte elle-même
+         le nom du logiciel ; sinon le nom est écrit ici, sur l'image de fond (assets/splash/background.*). -->
+    <main data-tauri-drag-region id="splash">
+      <div class="image" id="image"></div>
+      <div class="fade"></div>
+      <section>
+        <img id="logo" alt="" width="44" height="44" />
+        <h1>Lumitype</h1>
+        <p class="edition">ÉDITEUR D'IMAGES</p>
+      </section>
+      <footer>
+        <p class="status"><span class="dots"><i></i><i></i><i></i></span><span id="status">DÉMARRAGE</span><span id="version"></span></p>
+        <p class="legal">Projet initié par Antoine Deg. · Codé par l'IA Claude (Anthropic).</p>
+      </footer>
+      <div class="bar"><div id="progress"></div></div>
+    </main>
+    <script type="module" src="/src/splash.ts"></script>
+  </body>
+</html>

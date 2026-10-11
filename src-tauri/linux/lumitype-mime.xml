@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Type des projets Lumitype (.graf) : double-clic pour les ouvrir, icône de Lumitype dans le gestionnaire de fichiers. -->
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-lumitype">
+    <comment>Projet Lumitype</comment>
+    <comment xml:lang="en">Lumitype project</comment>
+    <icon name="lumitype"/>
+    <glob pattern="*.graf"/>
+  </mime-type>
+</mime-info>

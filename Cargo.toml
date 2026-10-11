@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = ["crates/engine", "src-tauri"]
+# Runtime Chromium (CEF), compilé seulement avec `--features cef` : jamais par un `cargo build` du dépôt entier.
+# Copie locale de winit-x11 (glisser-déposer, voir crates/winit-x11/PORTAGE-LUMITYPE.md) : branchée par [patch] ci-dessous.
+exclude = ["crates/tauri-runtime-cef", "crates/winit-x11"]
+
+[workspace.package]
+version = "1.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[profile.dev.package.engine]
+# Le moteur reste utilisable en `tauri dev` : sans optimisation, le découpage
+# en tuiles d'une image 8000x8000 prend plusieurs secondes.
+opt-level = 3
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+
+# Glisser-déposer sous Linux/Chromium : winit-x11 laisse passer les adresses web (http/https) et l'image d'un
+# glisser HTML, au lieu de ne garder que les fichiers locaux. Version figée par tauri-runtime-cef (winit =0.31.0-beta.2).
+[patch.crates-io]
+winit-x11 = { path = "crates/winit-x11" }

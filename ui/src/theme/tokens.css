@@ -1,0 +1,52 @@
+/* Design tokens. Un thème clair redéfinira ces variables sous [data-theme="light"]. */
+:root {
+  color-scheme: dark;
+
+  /* Noir chaud (une pointe de rouge-brun), palette « affiche » de Lumitype : fond, barres, panneaux. */
+  --bg-app: #121111;
+  --bg-bar: #171616;
+  --bg-bar-2: #191818;
+  --bg-panel: #1a1919;
+  --bg-field: #201e1e;
+  --bg-menu: #221f20;
+  --bg-hover: rgba(255, 255, 255, 0.06);
+  --bg-active: rgba(255, 255, 255, 0.1);
+  /* Gris neutre : le fond du canevas ne doit pas fausser la perception des couleurs. */
+  --bg-canvas: #1d1d1e;
+
+  --border: rgba(255, 255, 255, 0.06);
+  --border-strong: rgba(255, 255, 255, 0.1);
+
+  --text: #ececee;
+  --text-2: #c4c4ca;
+  --text-3: #a1a1a8;
+  --text-muted: #8b8b93;
+  --text-disabled: #55555c;
+
+  --pill-bg: #ec2a3c;
+  --pill-text: #ffffff;
+  /* Rouge corail de l'affiche : accent unique de l'interface (cadres, onglet actif, boutons principaux, jauge). */
+  --accent: #ec2a3c;
+  --accent-strong: #f03142;
+  --accent-deep: #8d1f2a;
+  --accent-shadow: #391b1e;
+  --danger: #ff7a5c;
+
+  /* Arrondis de toute l'interface. Bords droits (0) depuis beta97 ; anciennes valeurs en commentaire pour
+     revenir en arrière d'un seul chiffre. Les vrais cercles (pastilles, curseurs, poignées) restent en 50 %. */
+  --radius-xs: 0px; /* 2px : champs serrés, poignées */
+  --radius-s: 0px; /* 6px : boutons, champs */
+  --radius-m: 0px; /* 9px : cartes, lignes de panneau */
+  --radius-l: 0px; /* 12px : panneaux, menus, boîtes de dialogue */
+  --radius-pill: 0px; /* 999px : boutons principaux, étiquettes, badges */
+  --shadow-menu: 0 18px 50px rgba(0, 0, 0, 0.6);
+
+  --font: "Geist Variable", "Inter", system-ui, sans-serif;
+  --size-text: 12px;
+  --ruler: 20px;
+  --ease: cubic-bezier(0.2, 0, 0, 1);
+  /* Curseur de rotation (dessin maison) : arc à double flèche. */
+  /* Curseur de rotation : dessiné par lib/cursors.ts, orienté selon l'angle survolé. */
+  /* Curseur pipette (dessin maison) : la pointe, en bas à gauche, est le point prélevé. */
+  --cursor-pipette: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke-linecap='round' stroke-linejoin='round'><g stroke='black' stroke-width='4'><path d='M16 4l4 4-3 3-4-4zM13 9l-9 9v2h2l9-9'/></g><g stroke='white' stroke-width='1.6'><path d='M16 4l4 4-3 3-4-4zM13 9l-9 9v2h2l9-9'/></g></svg>") 4 20, crosshair;
+}

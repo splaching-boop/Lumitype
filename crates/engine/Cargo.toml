@@ -1,0 +1,53 @@
+[package]
+name = "engine"
+description = "Moteur d'image en tuiles, indépendant de toute interface."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+# Sans cela, `cargo bench` lance aussi les tests unitaires en mode bench et les affiche « ignored ».
+bench = false
+
+[dependencies]
+# Décodage/encodage des formats d'échange. Fonctions limitées au strict nécessaire.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "tiff"] }
+# HEIC/HEIF (photos d'iPhone) : décodeur HEVC 100 % Rust, sans bibliothèque C ni greffon système.
+heic-rs = "0.1"
+# DNG (négatif numérique) : dématriçage, balance des blancs et matrice couleur, 100 % Rust (moteur de DNGLab).
+rawler = "0.8"
+# Parallélisme de données pour le découpage, l'encodage et les mips.
+rayon = "1.10"
+# Export rapide : compression deflate (moteur zlib-rs, 100 % Rust) et CRC des morceaux, pour l'encodeur PNG
+# multi-cœurs (png_parallel.rs) ; redimensionnement SIMD multi-cœurs ; encodeur JPEG SIMD.
+flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
+crc32fast = "1.4"
+fast_image_resize = { version = "6", default-features = false, features = ["std", "rayon"] }
+jpeg-encoder = { version = "0.7", features = ["simd"] }
+# Export WebP avec perte (VP8 + alpha) et sans perte (VP8L) : libwebp, la bibliothèque de référence, compilée avec
+# le projet (libwebp-sys, via cc). L'encodeur 100 % Rust de `image` ne sait faire que du sans perte.
+webp = { version = "0.3", default-features = false }
+# Format de projet : structure JSON + archive zip non compressée (les PNG le sont déjà).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+zip = { version = "2", default-features = false }
+# Erreurs typées sans code répétitif.
+thiserror = "2"
+# Texte : mise en forme (rustybuzz/harfrust), polices système et de repli, bidi, et rendu des
+# glyphes (swash) en un seul crate éprouvé (bureau COSMIC). `swash` seul ne fait ni mise en page ni repli.
+cosmic-text = "0.14"
+sys-locale = "0.3"
+# Écriture de chaque caractère (latin, arabe, han…), pour charger d'avance les polices de repli propres à une écriture
+# (même version que celle de cosmic-text).
+unicode-script = "0.5"
+# Disque de travail de l'historique : compression LZ4 des tuiles écrites sur le disque, très rapide dans les deux
+# sens (le but est de libérer la mémoire vite et de relire un état sans attendre, pas de gagner le dernier octet).
+lz4_flex = { version = "0.14", default-features = false, features = ["std", "safe-encode", "safe-decode", "checked-decode"] }
+
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false }
+tempfile = "3"
+
+[[bench]]
+name = "tiles"
+harness = false

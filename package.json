@@ -1,0 +1,45 @@
+{
+  "name": "image-editor",
+  "private": true,
+  "version": "1.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "check": "svelte-check --tsconfig ./tsconfig.json",
+    "tauri": "tauri",
+    "smoke": "vite build --outDir ../dist-smoke --logLevel warn && node ui/tests/smoke.mjs",
+    "test:geometry": "node ui/tests/geometry.test.mjs",
+    "test:tiles": "node ui/tests/tile-cache.test.mjs",
+    "test": "npm run check && npm run test:geometry && npm run test:tiles && npm run test:path && npm run test:runs && npm run test:brush && npm run test:gpu && npm run test:gpu-layers && npm run test:resolution && npm run test:guides && npm run test:metadata && npm run test:performance && npm run test:smart && npm run smoke",
+    "test:path": "node ui/tests/path.test.mjs",
+    "test:runs": "node ui/tests/text-runs.test.mjs",
+    "test:brush": "node ui/tests/brush-path.test.mjs",
+    "export:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File export/windows.ps1",
+    "export:linux": "bash export/linux.sh",
+    "maj": "bash export/maj.sh",
+    "test:gpu": "node ui/tests/gpu-plan.test.mjs",
+    "test:gpu-layers": "node ui/tests/gpu-layers.test.mjs",
+    "test:gpu-parity": "node ui/tests/gpu-parity.mjs",
+    "test:resolution": "node ui/tests/resolution.test.mjs",
+    "test:guides": "node ui/tests/guide-templates.test.mjs",
+    "test:metadata": "node ui/tests/metadata.test.mjs",
+    "test:performance": "node ui/tests/performance.test.mjs",
+    "test:smart": "node ui/tests/smart-geometry.test.mjs"
+  },
+  "dependencies": {
+    "@fontsource-variable/geist": "^5.3.0",
+    "@tauri-apps/api": "2.12.0",
+    "@tauri-apps/plugin-dialog": "2.8.0"
+  },
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "^7.3.0",
+    "@tauri-apps/cli": "2.12.0",
+    "@tsconfig/svelte": "^5.0.8",
+    "jsdom": "^30.1.0",
+    "svelte": "^5.57.1",
+    "svelte-check": "^4.7.6",
+    "typescript": "^6.0.3",
+    "vite": "^8.3.0"
+  }
+}

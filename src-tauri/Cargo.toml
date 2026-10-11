@@ -1,0 +1,69 @@
+[package]
+name = "image-editor"
+description = "Éditeur d'images raster"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+engine = { path = "../crates/engine" }
+# `devtools` : inspecteur WebKit disponible même en version compilée (clic droit > Inspecter l'élément).
+# Indispensable pour profiler l'affichage sur la machine où le problème se produit. À retirer pour une
+# version publique.
+# Fonctions par défaut de Tauri reprises une à une, SAUF le moteur de la webview (wry : WebView2 sous Windows, WebKitGTK
+# sous Linux), qui ne vient qu'avec la fonction « wry » ci-dessous : la version Chromium (CEF) ne dépend pas de WebKitGTK.
+tauri = { version = "2", default-features = false, features = ["unstable", "devtools", "compression", "common-controls-v6", "dynamic-acl"] }
+# Boîtes de dialogue natives Ouvrir / Enregistrer. Sous Linux, par le PORTAIL de bureau (xdg-desktop-portal : la boîte
+# du bureau, GNOME ou KDE, par D-Bus) et non par GTK en direct : avec le moteur Chromium, la boîte GTK s'ouvrait puis
+# faisait quitter Lumitype au bout d'une seconde (deux boucles d'événements, GTK et Chromium, sur la même fenêtre X11).
+tauri-plugin-dialog = { version = "2", default-features = false, features = ["xdg-portal"] }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+# Téléchargement d'une image glissée depuis un navigateur quand celui-ci ne fournit que son
+# adresse. Client HTTP bloquant, petit, sans moteur asynchrone ; la webview ne peut pas le faire
+# elle-même (les serveurs d'images n'autorisent pas la lecture entre origines).
+ureq = "2"
+# Presse-papiers du système lu et écrit nativement (X11, Wayland, Windows) : la webview de Linux ne livre pas
+# les images copiées ailleurs (captures d'écran) dans ses événements de collage.
+arboard = { version = "3", default-features = false, features = ["image-data"] }
+serde_json = "1"
+# Double-clic sur un projet alors que Lumitype tourne déjà : le fichier s'ouvre dans la fenêtre existante.
+tauri-plugin-single-instance = "2"
+# Mémoire vive de la machine, pour l'allocation automatique du cache. Seule la partie « système » est compilée.
+sysinfo = { version = "0.33", default-features = false, features = ["system"] }
+# Nombre de cœurs réglable : les calculs du moteur tournent dans un groupe de threads dédié, reconstruit à la demande.
+rayon = "1"
+# Vignettes des pointes de pinceau (PNG) : mêmes réglages que le moteur.
+image = { version = "0.25", default-features = false, features = ["png"] }
+# Mémoire vidéo de la carte (préférences › Mémoire vidéo utilisable) : lue par Vulkan, chargeur ouvert à l'exécution
+# (fonction « loaded » : pas de lien statique, échec silencieux sans Vulkan). Voir gpu_info.rs.
+ash = { version = "0.38", default-features = false, features = ["loaded", "std"] }
+
+# Moteur web de remplacement : Chromium (CEF) au lieu de WebKitGTK, pour Linux. WebKitGTK plafonne vers 45-50 i/s en
+# plein écran 4K, même sur une page vide ; Chromium suit les 240 Hz de l'écran. Compilé seulement avec
+# `--features cef` (la version par défaut reste WebKitGTK). Runtime CEF de Tauri maintenu hors de Tauri en attendant
+# sa publication officielle : copie de https://github.com/SableClient/tauri-runtime-cef (commit 6568170, 01/10/2026)
+# dans crates/tauri-runtime-cef, adaptée à la version de Tauri de Lumitype (voir son PORTAGE-LUMITYPE.md).
+# Les binaires CEF (~300 Mo) sont téléchargés à la première compilation et copiés à côté de l'exécutable.
+tauri-runtime-cef = { path = "../crates/tauri-runtime-cef", default-features = false, features = ["devtools"], optional = true }
+# Seulement pour `cef-check` : vérifier la compilation sans télécharger CEF (fonction « dox » de cef-dll-sys).
+cef = { version = "=150.2.1", default-features = false, optional = true }
+
+# Mémoire vidéo de la carte (préférences › Mémoire vidéo utilisable) : lue par DXGI sous Windows quand Vulkan ne
+# répond pas. Même version que dans crates/tauri-runtime-cef, pour ne pas compiler deux fois la crate.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common"] }
+
+[features]
+# Par défaut : la webview du système (WebView2 sous Windows — c'est Chromium —, WebKitGTK sous Linux, qui plafonne vers
+# 45-50 i/s en plein écran 4K). Sous Linux, export/linux.sh compile Chromium (CEF) : `--no-default-features --features cef`.
+default = ["wry"]
+wry = ["tauri/wry", "tauri/x11", "tauri/dbus"]
+cef = ["dep:tauri-runtime-cef"]
+# Vérification de type sans binaires CEF : `cargo check -p image-editor --no-default-features --features cef-check`.
+cef-check = ["cef", "dep:cef", "cef/dox"]
+
+[dev-dependencies]

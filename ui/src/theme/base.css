@@ -1,0 +1,101 @@
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  overflow: hidden;
+  background: var(--bg-app);
+  color: var(--text);
+  font: 400 var(--size-text) / 1.3 var(--font);
+  font-variant-numeric: tabular-nums;
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+  cursor: default;
+}
+
+button,
+input,
+select {
+  font: inherit;
+  color: inherit;
+}
+
+button {
+  border: 0;
+  padding: 0;
+  background: transparent;
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: default;
+}
+
+:focus-visible {
+  outline: 1.5px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* Curseurs : un seul dessin pour toute l'interface, au lieu de celui de chaque moteur (bleu sous WebKit,
+   gris sous WebView2). CSS seul : piste fine à bords droits, du ton des champs de saisie, et bouton blanc
+   rond (comme les autres vrais cercles de l'interface, voir tokens.css). Pas de remplissage à gauche du
+   bouton : la feuille de style ne connaît pas la valeur du curseur, et le piloter en script sur chaque
+   curseur n'en valait pas la fragilité. Une piste colorée (`.tinted`, réglages) redéfinit le fond.
+   `accent-color` : secours si un moteur ignorait `appearance: none`. */
+input[type="range"] {
+  appearance: none;
+  -webkit-appearance: none;
+  box-sizing: border-box;
+  height: 4px;
+  margin: 7px 0;
+  padding: 0;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-xs);
+  background: var(--bg-field);
+  accent-color: var(--accent);
+  cursor: pointer;
+  vertical-align: middle;
+}
+input[type="range"]:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+input[type="range"]::-webkit-slider-thumb {
+  appearance: none;
+  -webkit-appearance: none;
+  box-sizing: border-box;
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  background: #fff;
+  border: 1px solid rgba(0, 0, 0, 0.5);
+}
+input[type="range"]::-moz-range-thumb {
+  box-sizing: border-box;
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  background: #fff;
+  border: 1px solid rgba(0, 0, 0, 0.5);
+}
+input[type="range"]::-moz-range-track {
+  height: 4px;
+  background: transparent;
+  border: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    transition: none !important;
+    animation: none !important;
+  }
+}

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name={{name}}
+Comment={{comment}}
+Categories={{categories}}
+Icon={{icon}}
+Exec={{exec}} %F
+StartupWMClass={{exec}}
+Terminal=false
+MimeType=application/x-lumitype;

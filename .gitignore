@@ -1,0 +1,11 @@
+node_modules/
+target/
+dist/
+dist-smoke/
+ClaudeBackups/
+export/sorties/
+export/.travail/
+export/build/
+Design_1_ref.graf
+*.tar.xz
+.env

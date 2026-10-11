@@ -1,0 +1,213 @@
+/* Bannière de lancement, dans l'esprit des logiciels de montage : panneau sombre à gauche avec le
+   nom, image de l'auteur à droite, fondue dans le panneau. */
+html,
+body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  background: #121111;
+  color: #fff;
+  font-family: Geist, Inter, "Segoe UI", system-ui, sans-serif;
+  user-select: none;
+  cursor: default;
+}
+main {
+  position: relative;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  box-sizing: border-box;
+  padding: 0 0 0 56px;
+}
+.image {
+  position: absolute;
+  inset: 0 0 0 38%;
+  background: radial-gradient(circle at 30% 30%, #8d1f2a 0%, rgba(141, 31, 42, 0) 55%), radial-gradient(circle at 80% 75%, #ec2a3c 0%, rgba(236, 42, 60, 0) 55%), #171616;
+  background-size: cover;
+  background-position: center;
+  animation: drift 8s ease-out forwards;
+}
+.fade {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, #121111 0%, #121111 36%, rgba(18, 17, 17, 0.86) 46%, rgba(18, 17, 17, 0.25) 64%, rgba(18, 17, 17, 0) 80%), linear-gradient(0deg, rgba(18, 17, 17, 0.55) 0%, rgba(18, 17, 17, 0) 35%);
+  pointer-events: none;
+}
+section,
+footer {
+  position: relative;
+  pointer-events: none;
+}
+section {
+  margin-top: 96px;
+  animation: rise 800ms cubic-bezier(0.2, 0.7, 0.2, 1) both;
+}
+#logo {
+  display: block;
+  margin-bottom: 22px;
+  border-radius: 0;
+}
+h1 {
+  margin: 0;
+  font-size: 64px;
+  font-weight: 600;
+  letter-spacing: -0.04em;
+  line-height: 1;
+}
+.edition {
+  margin: 14px 0 0 3px;
+  font-size: 15px;
+  letter-spacing: 0.22em;
+  color: rgba(255, 255, 255, 0.62);
+}
+footer {
+  width: 46%;
+  padding-bottom: 30px;
+}
+.status {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 0 0 10px;
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  color: rgba(255, 255, 255, 0.9);
+}
+.dots {
+  display: flex;
+  gap: 4px;
+}
+.dots i {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: #fff;
+  animation: pulse 1.2s ease-in-out infinite;
+}
+.dots i:nth-child(2) {
+  animation-delay: 0.18s;
+}
+.dots i:nth-child(3) {
+  animation-delay: 0.36s;
+}
+/* Barre d'avancement : un filet sur toute la largeur, au ras du bas de la fenêtre. */
+.bar {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 3px;
+  background: rgba(255, 255, 255, 0.16);
+  overflow: hidden;
+}
+#progress {
+  position: relative;
+  width: 4%;
+  height: 100%;
+  background: #fff;
+  transition: width 220ms linear;
+  overflow: hidden;
+}
+#progress::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, transparent, rgba(240, 49, 66, 0.95), transparent);
+  animation: sweep 1.4s linear infinite;
+}
+.legal {
+  margin: 14px 0 0;
+  font-size: 10px;
+  line-height: 1.55;
+  color: rgba(255, 255, 255, 0.38);
+}
+@keyframes pulse {
+  0%,
+  100% {
+    opacity: 0.25;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+@keyframes sweep {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(100%);
+  }
+}
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(14px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+@keyframes drift {
+  from {
+    transform: scale(1.05);
+  }
+  to {
+    transform: scale(1);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .image,
+  section,
+  .dots i,
+  #progress::after {
+    animation: none;
+  }
+}
+
+#version {
+  margin-left: auto;
+  opacity: 0.6;
+}
+
+/* ---- Bannière complète : l'image de l'auteur, seule, plein cadre. Le logiciel n'y ajoute que l'étape en
+   cours, dans une pastille lisible sur n'importe quelle image, et le filet d'avancement. */
+.full {
+  padding: 0;
+}
+.full .image {
+  inset: 0;
+  animation: none;
+}
+.full .fade,
+.full section,
+.full .legal {
+  display: none;
+}
+.full footer {
+  position: absolute;
+  left: 22px;
+  bottom: 18px;
+  width: auto;
+  padding: 0;
+}
+.full .status {
+  margin: 0;
+  padding: 7px 12px;
+  border-radius: 0;
+  background: rgba(16, 17, 21, 0.62);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  color: #fff;
+  gap: 10px;
+}
+.full #version {
+  margin-left: 6px;
+}
+.full .bar {
+  background: rgba(16, 17, 21, 0.25);
+}
+.full #progress {
+  background: #1a1919;
+}

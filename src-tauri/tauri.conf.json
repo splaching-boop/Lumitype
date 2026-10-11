@@ -1,0 +1,98 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Lumitype",
+  "version": "1.1.0",
+  "identifier": "dev.imageeditor.app",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Lumitype",
+        "width": 1440,
+        "height": 900,
+        "minWidth": 1100,
+        "minHeight": 700,
+        "maximized": true,
+        "decorations": false,
+        "shadow": true,
+        "backgroundColor": "#121111",
+        "dragDropEnabled": false,
+        "visible": false
+      },
+      {
+        "label": "splashscreen",
+        "title": "Lumitype",
+        "url": "splash.html",
+        "width": 1040,
+        "height": 430,
+        "center": true,
+        "resizable": false,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "shadow": true,
+        "backgroundColor": "#121111",
+        "dragDropEnabled": false
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "resources": [
+      "templates/*",
+      "fonts/**/*"
+    ],
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.png",
+      "icons/icon.ico"
+    ],
+    "publisher": "Antoine Deg.",
+    "shortDescription": "Éditeur d'images raster",
+    "longDescription": "Lumitype : éditeur d'images raster — calques, masques, sélections, texte, tracés, réglages non destructifs, filtres et effets de calque.",
+    "category": "GraphicsAndDesign",
+    "fileAssociations": [
+      {
+        "ext": [
+          "graf"
+        ],
+        "name": "Projet Lumitype",
+        "description": "Projet Lumitype",
+        "role": "Editor",
+        "mimeType": "application/x-lumitype"
+      }
+    ],
+    "linux": {
+      "deb": {
+        "desktopTemplate": "linux/lumitype.desktop",
+        "files": {
+          "/usr/share/mime/packages/lumitype.xml": "linux/lumitype-mime.xml"
+        }
+      },
+      "rpm": {
+        "desktopTemplate": "linux/lumitype.desktop",
+        "files": {
+          "/usr/share/mime/packages/lumitype.xml": "linux/lumitype-mime.xml"
+        }
+      },
+      "appimage": {
+        "files": {
+          "/usr/share/mime/packages/lumitype.xml": "linux/lumitype-mime.xml"
+        }
+      }
+    }
+  },
+  "mainBinaryName": "lumitype"
+}
