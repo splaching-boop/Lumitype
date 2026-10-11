@@ -78,18 +78,33 @@
       "deb": {
         "desktopTemplate": "linux/lumitype.desktop",
         "files": {
-          "/usr/share/mime/packages/lumitype.xml": "linux/lumitype-mime.xml"
+          "/usr/share/mime/packages/lumitype.xml": "linux/lumitype-mime.xml",
+          "/usr/share/icons/hicolor/48x48/mimetypes/application-x-lumitype.png": "linux/mimetypes/application-x-lumitype-48.png",
+          "/usr/share/icons/hicolor/64x64/mimetypes/application-x-lumitype.png": "linux/mimetypes/application-x-lumitype-64.png",
+          "/usr/share/icons/hicolor/128x128/mimetypes/application-x-lumitype.png": "linux/mimetypes/application-x-lumitype-128.png",
+          "/usr/share/icons/hicolor/256x256/mimetypes/application-x-lumitype.png": "linux/mimetypes/application-x-lumitype-256.png",
+          "/usr/share/icons/hicolor/512x512/mimetypes/application-x-lumitype.png": "linux/mimetypes/application-x-lumitype-512.png"
         }
       },
       "rpm": {
         "desktopTemplate": "linux/lumitype.desktop",
         "files": {
-          "/usr/share/mime/packages/lumitype.xml": "linux/lumitype-mime.xml"
+          "/usr/share/mime/packages/lumitype.xml": "linux/lumitype-mime.xml",
+          "/usr/share/icons/hicolor/48x48/mimetypes/application-x-lumitype.png": "linux/mimetypes/application-x-lumitype-48.png",
+          "/usr/share/icons/hicolor/64x64/mimetypes/application-x-lumitype.png": "linux/mimetypes/application-x-lumitype-64.png",
+          "/usr/share/icons/hicolor/128x128/mimetypes/application-x-lumitype.png": "linux/mimetypes/application-x-lumitype-128.png",
+          "/usr/share/icons/hicolor/256x256/mimetypes/application-x-lumitype.png": "linux/mimetypes/application-x-lumitype-256.png",
+          "/usr/share/icons/hicolor/512x512/mimetypes/application-x-lumitype.png": "linux/mimetypes/application-x-lumitype-512.png"
         }
       },
       "appimage": {
         "files": {
-          "/usr/share/mime/packages/lumitype.xml": "linux/lumitype-mime.xml"
+          "/usr/share/mime/packages/lumitype.xml": "linux/lumitype-mime.xml",
+          "/usr/share/icons/hicolor/48x48/mimetypes/application-x-lumitype.png": "linux/mimetypes/application-x-lumitype-48.png",
+          "/usr/share/icons/hicolor/64x64/mimetypes/application-x-lumitype.png": "linux/mimetypes/application-x-lumitype-64.png",
+          "/usr/share/icons/hicolor/128x128/mimetypes/application-x-lumitype.png": "linux/mimetypes/application-x-lumitype-128.png",
+          "/usr/share/icons/hicolor/256x256/mimetypes/application-x-lumitype.png": "linux/mimetypes/application-x-lumitype-256.png",
+          "/usr/share/icons/hicolor/512x512/mimetypes/application-x-lumitype.png": "linux/mimetypes/application-x-lumitype-512.png"
         }
       }
     }
