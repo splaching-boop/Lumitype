@@ -40,6 +40,91 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Couche lue par la comparaison (options de fusion « Comparaison sur »).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BlendIfChannel {
+    #[default]
+    Gray,
+    Red,
+    Green,
+    Blue,
+}
+
+/// Comparaison (« Blend If » de Photoshop) : le calque n'est visible que là où sa propre valeur (`this`) et celle de
+/// l'image dessous (`under`) tombent dans leurs plages. Chaque plage est `[noir début, noir fin, blanc début, blanc
+/// fin]` de 0 à 255 : sous le noir début (ou au-dessus du blanc fin) le calque disparaît ; entre début et fin, il
+/// apparaît en fondu (triangle scindé par Alt). Noir début = noir fin : coupure franche.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlendIf {
+    #[serde(default)]
+    pub channel: BlendIfChannel,
+    #[serde(default = "full_range")]
+    pub this: [u8; 4],
+    #[serde(default = "full_range")]
+    pub under: [u8; 4],
+}
+
+const fn full_range() -> [u8; 4] {
+    [0, 0, 255, 255]
+}
+
+impl Default for BlendIf {
+    fn default() -> Self {
+        Self { channel: BlendIfChannel::Gray, this: full_range(), under: full_range() }
+    }
+}
+
+impl BlendIf {
+    /// Plages entières des deux côtés : aucun effet.
+    pub fn is_identity(&self) -> bool {
+        self.this == full_range() && self.under == full_range()
+    }
+
+    /// Plages remises en ordre (début ≤ fin, noir ≤ blanc), comme le moteur les applique.
+    pub fn normalized(mut self) -> Self {
+        let fix = |mut r: [u8; 4]| {
+            r[1] = r[1].max(r[0]);
+            r[2] = r[2].max(r[1]);
+            r[3] = r[3].max(r[2]);
+            r
+        };
+        self.this = fix(self.this);
+        self.under = fix(self.under);
+        self
+    }
+
+    /// Valeur (0 à 255) de la couche comparée, sur une couleur non prémultipliée dans `0..=1`.
+    #[inline]
+    pub fn value(&self, rgb: [f32; 3]) -> f32 {
+        255.0
+            * match self.channel {
+                BlendIfChannel::Gray => 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2],
+                BlendIfChannel::Red => rgb[0],
+                BlendIfChannel::Green => rgb[1],
+                BlendIfChannel::Blue => rgb[2],
+            }
+    }
+
+    /// Part visible pour une valeur `v` (0 à 255) et une plage.
+    #[inline]
+    pub fn ramp(range: [u8; 4], v: f32) -> f32 {
+        let [a, b, c, d] = range.map(f32::from);
+        let low = if b > a { ((v - a) / (b - a)).clamp(0.0, 1.0) } else if v >= a { 1.0 } else { 0.0 };
+        let high = if d > c { ((d - v) / (d - c)).clamp(0.0, 1.0) } else if v <= d { 1.0 } else { 0.0 };
+        low.min(high)
+    }
+
+    /// Part visible d'un pixel source sur un pixel du dessous, tous deux en RGBA prémultiplié dans `0..=1`. Un dessous
+    /// transparent compte comme noir.
+    #[inline]
+    pub fn factor(&self, src: [f32; 4], dst: [f32; 4]) -> f32 {
+        let straight = |p: [f32; 4]| if p[3] > 0.0 { [p[0] / p[3], p[1] / p[3], p[2] / p[3]] } else { [0.0; 3] };
+        Self::ramp(self.this, self.value(straight(src))) * Self::ramp(self.under, self.value(straight(dst)))
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BlendMode {

@@ -1,16 +1,25 @@
+import { fitRect, guideTarget, guidesOf } from "./artboards.svelte";
+import { printPrefs, setPref } from "./print.svelte";
 import { t } from "./i18n.svelte";
 // Actions de l'application. Menus, raccourcis et boutons passent tous par `runAction`.
 import { ask, open, save } from "@tauri-apps/plugin-dialog";
-import { app, type OpenDocument } from "../state/app.svelte";
-import { centerCamera, fitCamera, steppedZoom, zoomAt } from "../viewport/camera";
+import { app, type OpenDocument, type RawDevelopRequest } from "../state/app.svelte";
+import { lastApplied, lastFilter, rememberApplied } from "./filter-memory";
+import { centerCamera, fitCamera, rotationOf, steppedZoom, zoomAt } from "../viewport/camera";
+import { cycleByCycleAction, selectGroupTool } from "./tool-groups.svelte";
 import { BLEND_ORDER } from "./blend";
 import { avifPathToPng, avifToPng, isAvif } from "./avif";
 import { forgetRecovery } from "./autosave.svelte";
 import { recordRecent } from "./recents.svelte";
-import { adopt, edit, editLatest, enqueue, refreshThumbnails, settlePendingEdits } from "./engine";
-import { IMAGE_EXTENSIONS, IMAGE_MIME_TYPES, LEGACY_PROJECT_EXTENSION, PROJECT_EXTENSION, api, type DevelopValues, type Adjustment, type LayerInfo } from "./ipc";
+import { recordFormat, type UsedFormat } from "./recent-formats";
+import { adopt, edit, editLatest, enqueue, historyStep, refreshThumbnails, settlePendingEdits } from "./engine";
+import { IMAGE_EXTENSIONS, IMAGE_MIME_TYPES, LEGACY_PROJECT_EXTENSION, PROJECT_EXTENSION, RAW_EXTENSIONS, api, dialogExtensions, isRawPath, type EditOp, type Filter, type RawFinishMode, type RawOpened, type RawParams, type SmartFilter, type DevelopValues, type Adjustment, type LayerInfo, type MixerRow, type SelectiveFamily } from "./ipc";
 import { commitTransform, openTransform, positionLocked, sameLayers, transformIsPending } from "./transform-session";
-import { chooseProofProfile } from "./proof-profiles";
+import { colorSettings } from "./color-settings.svelte";
+import { activeColorMode, chooseColorMode, effectiveProof, foregroundInMode, workflowSpace } from "./color-mode.svelte";
+import { type RawBatch, type RawSeries, endRawBatch, onSeriesCount, rawBatch, rawInTurn, startRaw } from "./raw-queue";
+import { LAYER_SEARCH_EVENT } from "./layer-search";
+import { manualOpen } from "./manual-nav.svelte";
 
 export type ActionId =
   | "file.new"
@@ -29,16 +38,40 @@ export type ActionId =
   | "edit.fillForeground"
   | "edit.fillBackground"
   | "help.about"
+  | "help.manual"
+  | "help.reportBug"
+  | "help.openLogs"
   | "edit.preferences"
+  | "edit.colorSettings"
   | "copyright.metadata"
   | "layer.effects"
+  | "layer.copyStyle"
+  | "layer.pasteStyle"
+  | "layer.clearStyle"
   | "view.guideLayout"
   | "image.invert"
+  | "image.printSetup"
+  | "image.correctInk"
+  | "view.printBleed"
+  | "view.printSafe"
+  | "view.printMarks"
+  | "view.inkAlert"
+  | "view.separations"
+  | "file.preflight"
+  | "image.modeBitmap"
+  | "image.modeGrayscale"
+  | "image.modeRgb"
+  | "image.modeCmyk"
+  | "image.mode8Bits"
   | "select.quickMask"
   | "tool.crop"
   | "tool.shape"
   | "tool.shapeCycle"
   | "filter.liquify"
+  | "filter.gallery"
+  | "filter.lastFilter"
+  | "filter.cameraRaw"
+  | "layer.search"
   | "edit.copy"
   | "edit.cut"
   | "edit.paste"
@@ -76,11 +109,6 @@ export type ActionId =
   | "view.toggleGuides"
   | "view.toggleSnap"
   | "view.proofCmyk"
-  | "view.proofFogra39"
-  | "view.proofFogra51"
-  | "view.proofFogra52"
-  | "view.proofGracol2006"
-  | "view.proofSwop2006c3"
   | "view.lockGuides"
   | "doc.next"
   | "doc.previous"
@@ -114,10 +142,22 @@ export type ActionId =
   | "tool.heal"
   | "tool.wandCycle"
   | "select.modify"
+  | "select.advanced"
   | "filter.colorDither"
   | "filter.chromaticAberration"
   | "filter.ascii"
   | "adjust.develop"
+  | "adjust.curves"
+  | "adjust.exposure"
+  | "adjust.colorBalance"
+  | "adjust.blackWhite"
+  | "adjust.channelMixer"
+  | "adjust.selectiveColor"
+  | "adjust.posterize"
+  | "adjust.threshold"
+  | "layer.fillSolidColor"
+  | "layer.fillGradient"
+  | "layer.fillPattern"
   | "tool.fill"
   | "tool.fillCycle"
   | "tool.pen"
@@ -131,6 +171,10 @@ export type ActionId =
   | "tool.brush"
   | "tool.eraser"
   | "tool.hand"
+  | "tool.rotateView"
+  | "view.resetRotation"
+  | "view.mirror"
+  | "artboard.open"
   | "tool.zoom";
 
 /** Exécute une opération longue en tenant l'utilisateur informé ; les erreurs sont affichées, jamais avalées. */
@@ -145,15 +189,95 @@ async function withBusy(label: string, work: () => Promise<void>): Promise<void>
   }
 }
 
-const IMAGE_FILTER = { name: "Images", extensions: IMAGE_EXTENSIONS };
+const IMAGE_FILTER = { name: "Images", extensions: dialogExtensions(IMAGE_EXTENSIONS) };
+const RAW_FILTER = () => ({ name: t("RAW d'appareil photo"), extensions: dialogExtensions(RAW_EXTENSIONS) });
+const PROJECT_FILTER = () => ({ name: t("Projets Lumitype"), extensions: dialogExtensions([PROJECT_EXTENSION, LEGACY_PROJECT_EXTENSION]) });
+
+// ------------------------------------------------------------ développement RAW
+
+/** Un RAW à développer : désigné par son chemin, ou déposé (contenu seul). */
+type RawSource = { path: string } | { file: File };
+
+/** Série du dialogue affiché : son « n sur N » suit les RAW qui la rejoignent (voir lib/raw-queue.ts). */
+let shownSeries: RawSeries | null = null;
+onSeriesCount((series) => {
+  if (app.rawDevelop && shownSeries === series) app.rawDevelop.count = Math.max(series.count, app.rawDevelop.index);
+});
+
+/** Montre la fenêtre de développement et attend la réponse (`null` : Annuler). Ne ferme que sa propre fenêtre. */
+async function askRawDevelop(request: Omit<RawDevelopRequest, "resolve">, series: RawSeries | null): Promise<{ params: RawParams; applyToRest: boolean; keepRaw: boolean } | null> {
+  shownSeries = series;
+  try {
+    return await new Promise((resolve) => {
+      app.rawDevelop = { ...request, resolve };
+    });
+  } finally {
+    if (app.rawDevelop?.opened.id === request.opened.id) app.rawDevelop = null;
+    shownSeries = null;
+  }
+}
+
+/**
+ * Fenêtre « Développement RAW », avant que le fichier devienne un document (`open`), un calque (`layer`) ou un objet
+ * dynamique (`smart`) du document actif. Annuler : rien n'est créé. Si le capteur ne peut pas être décodé ici (format
+ * que le dématriçage ne connaît pas…), `fallback` ouvre le fichier comme avant (l'aperçu embarqué sert alors de secours).
+ */
+function developRaw(source: RawSource, mode: RawFinishMode, batch: RawBatch, fallback: () => Promise<void>): Promise<void> {
+  return rawInTurn(() => developRawNow(source, mode, batch, fallback));
+}
+
+async function developRawNow(source: RawSource, mode: RawFinishMode, part: RawBatch, fallback: () => Promise<void>): Promise<void> {
+  const position = startRaw(part);
+  const series = part.series;
+  let opened: RawOpened;
+  app.busy = t("Lecture du RAW…");
+  try {
+    opened = "path" in source ? await api.rawOpen(source.path) : await api.rawOpenDropped(new Uint8Array(await source.file.arrayBuffer()), source.file.name);
+  } catch {
+    app.busy = null;
+    return fallback();
+  }
+  app.busy = null;
+  try {
+    let params = series.forRest;
+    if (!params) {
+      const answer = await askRawDevelop({ opened, mode, ...position, initial: series.last, keepRaw: series.keepRaw }, series);
+      if (!answer) return; // Annuler : ce fichier seulement, la série continue
+      params = answer.params;
+      series.last = params;
+      series.keepRaw = answer.keepRaw;
+      if (answer.applyToRest) series.forRest = params;
+    }
+    const chosen = params;
+    const keepRaw = series.keepRaw || mode === "smart";
+    // Calque ou objet dynamique : dans le document actif ; sans document (ou depuis l'accueil), un nouveau document.
+    const target = mode === "open" || app.homeVisible ? null : app.active;
+    await withBusy(t("Développement…"), async () => {
+      const run = () => api.rawFinish(opened.id, chosen, target ? mode : "open", target?.info.id ?? null, activeId(), keepRaw);
+      if (target) {
+        settlePendingEdits();
+        const result = await enqueue(target.info.id, run);
+        adopt(result.document, result.dirty);
+      } else {
+        const { document } = await run();
+        app.add(document);
+        refreshThumbnails(document, []);
+        if ("path" in source) recordRecent(source.path, document);
+      }
+    });
+  } finally {
+    void api.rawClose(opened.id).catch(() => {}); // déjà libérée après un développement réussi
+  }
+}
 
 async function openDocuments(): Promise<void> {
   const selection = await open({
     multiple: true,
     filters: [
-      { name: t("Images et projets"), extensions: [PROJECT_EXTENSION, LEGACY_PROJECT_EXTENSION, ...IMAGE_EXTENSIONS] },
-      { name: t("Projets Lumitype"), extensions: [PROJECT_EXTENSION, LEGACY_PROJECT_EXTENSION] },
+      { name: t("Images et projets"), extensions: dialogExtensions([PROJECT_EXTENSION, LEGACY_PROJECT_EXTENSION, ...IMAGE_EXTENSIONS]) },
+      PROJECT_FILTER(),
       IMAGE_FILTER,
+      RAW_FILTER(),
     ],
   });
   if (!selection) return;
@@ -184,50 +308,73 @@ export async function pasteFromOtherDocument(origin: { docId: number; ids: numbe
  * calque (comme un dépôt ordinaire) ; sinon, ou pour un projet, chacun s'ouvre en document.
  */
 export async function importLocalPaths(paths: readonly string[], asSmartObject = false): Promise<void> {
-  for (const path of paths) {
-    const extension = path.split(".").pop()?.toLowerCase() ?? "";
-    const isProject = extension === PROJECT_EXTENSION || extension === LEGACY_PROJECT_EXTENSION;
-    if (!isProject && !IMAGE_EXTENSIONS.includes(extension)) {
-      app.error = `Format non pris en charge : ${path.split(/[\\/]/).pop()}`;
-      continue;
-    }
-    if (isProject || !app.active || app.homeVisible) {
-      await openPaths([path]);
-      continue;
-    }
-    if (isAvif(path)) {
-      try {
-        await importDroppedFiles([await avifPathToPng(path)], asSmartObject);
-      } catch (error) {
-        app.fail(error);
+  const raws = rawBatch(paths.filter(isRawPath).length);
+  try {
+    for (const path of paths) {
+      const extension = path.split(".").pop()?.toLowerCase() ?? "";
+      const isProject = extension === PROJECT_EXTENSION || extension === LEGACY_PROJECT_EXTENSION;
+      if (!isProject && !IMAGE_EXTENSIONS.includes(extension)) {
+        app.error = `Format non pris en charge : ${path.split(/[\\/]/).pop()}`;
+        continue;
       }
-      continue;
+      if (isProject || !app.active || app.homeVisible) {
+        await openPaths([path], raws);
+        continue;
+      }
+      if (isAvif(path)) {
+        try {
+          await importDroppedFiles([await avifPathToPng(path)], asSmartObject);
+        } catch (error) {
+          app.fail(error);
+        }
+        continue;
+      }
+      // Alt au dépôt : objet dynamique incorporé, plutôt qu'un calque de pixels.
+      const op = asSmartObject ? ({ op: "placeSmartObject", path, linked: false, above: activeId() } as const) : ({ op: "importLayer", path, above: activeId() } as const);
+      const importPlain = () => withBusy(t("Import…"), async () => void (await edit(op)));
+      if (isRawPath(path)) {
+        await developRaw({ path }, asSmartObject ? "smart" : "layer", raws, importPlain);
+        continue;
+      }
+      await importPlain();
     }
-    // Alt au dépôt : objet dynamique incorporé, plutôt qu'un calque de pixels.
-    const op = asSmartObject ? ({ op: "placeSmartObject", path, linked: false, above: activeId() } as const) : ({ op: "importLayer", path, above: activeId() } as const);
-    await withBusy("Import…", async () => void (await edit(op)));
+  } finally {
+    endRawBatch(raws);
   }
 }
 
 /** Ouvre des fichiers désignés par leur chemin : double-clic dans l'explorateur, au lancement ou pendant que l'application tourne. */
-export async function openPaths(paths: readonly string[]): Promise<void> {
-  for (const path of paths) {
-    if (isAvif(path)) {
-      await withBusy("Ouverture…", async () => {
-        const file = await avifPathToPng(path);
-        const { document } = await api.importDropped(new Uint8Array(await file.arrayBuffer()), file.name, null, null);
-        app.add(document);
-        refreshThumbnails(document, []);
-        recordRecent(path, document);
-      });
-      continue;
+export async function openPaths(paths: readonly string[], batch?: RawBatch): Promise<void> {
+  // Série reçue d'un appelant (dépôt) : c'est lui qui la termine.
+  const raws = batch ?? rawBatch(paths.filter(isRawPath).length);
+  try {
+    for (const path of paths) {
+      const openPlain = () =>
+        withBusy(t("Ouverture…"), async () => {
+          const info = await api.openPath(path);
+          app.add(info);
+          refreshThumbnails(info, []);
+          recordRecent(path, info);
+        });
+      // RAW : fenêtre « Développement RAW » avant de devenir un document.
+      if (isRawPath(path)) {
+        await developRaw({ path }, "open", raws, openPlain);
+        continue;
+      }
+      if (isAvif(path)) {
+        await withBusy(t("Ouverture…"), async () => {
+          const file = await avifPathToPng(path);
+          const { document } = await api.importDropped(new Uint8Array(await file.arrayBuffer()), file.name, null, null);
+          app.add(document);
+          refreshThumbnails(document, []);
+          recordRecent(path, document);
+        });
+        continue;
+      }
+      await openPlain();
     }
-    await withBusy("Ouverture…", async () => {
-      const info = await api.openPath(path);
-      app.add(info);
-      refreshThumbnails(info, []);
-      recordRecent(path, info);
-    });
+  } finally {
+    if (!batch) endRawBatch(raws);
   }
   if (paths.length > 0) app.newDocumentDialogOpen = false; // inutile de proposer un nouveau document
 }
@@ -237,16 +384,26 @@ async function importLayer(): Promise<void> {
   // Une ou plusieurs images d'un coup : chacune devient un calque.
   const paths = await open({ multiple: true, filters: [IMAGE_FILTER] });
   if (!paths) return;
-  for (const path of paths) {
-    if (isAvif(path)) {
-      try {
-        await importDroppedFiles([await avifPathToPng(path)]);
-      } catch (error) {
-        app.fail(error);
+  const raws = rawBatch(paths.filter(isRawPath).length);
+  try {
+    for (const path of paths) {
+      const importPlain = () => withBusy(t("Import…"), async () => void (await edit({ op: "importLayer", path, above: activeId() })));
+      if (isRawPath(path)) {
+        await developRaw({ path }, "layer", raws, importPlain);
+        continue;
       }
-      continue;
+      if (isAvif(path)) {
+        try {
+          await importDroppedFiles([await avifPathToPng(path)]);
+        } catch (error) {
+          app.fail(error);
+        }
+        continue;
+      }
+      await importPlain();
     }
-    await withBusy("Import…", async () => void (await edit({ op: "importLayer", path, above: activeId() })));
+  } finally {
+    endRawBatch(raws);
   }
 }
 
@@ -262,8 +419,8 @@ async function saveProject(forcePrompt: boolean): Promise<void> {
       filters: [{ name: t("Projet Lumitype"), extensions: [PROJECT_EXTENSION] }],
     }));
   if (!path) return;
-  await withBusy("Enregistrement…", async () => {
-    const info = await api.saveProject(active.info.id, path);
+  await withBusy(t("Enregistrement…"), async () => {
+    const info = await api.saveProject(active.info.id, path, active.workSeconds);
     app.update(info);
     // Contenu d'un objet dynamique : « Enregistrer sous » n'en écrit qu'une copie à part, le parent n'en sait rien. Le
     // document reste donc « modifié » tant que l'objet n'a pas été mis à jour (Ctrl+S), et sa fermeture le propose.
@@ -285,7 +442,7 @@ function addAdjustment(adjustment: Adjustment, clipped = true): Promise<boolean>
 }
 
 /** Calque au-dessus duquel placer un nouveau calque (le calque actif, ou rien : tout en haut). */
-export const activeLayerIdForNewLayer = (): number | null => app.activeLayer?.id ?? null;
+export const activeLayerIdForNewLayer = (): number | null => activeId();
 
 export const NEUTRAL_DEVELOP: DevelopValues = { temperature: 0, tint: 0, exposure: 0, contrast: 0, highlights: 0, shadows: 0, whites: 0, blacks: 0, clarity: 0, dehaze: 0, vibrance: 0, saturation: 0, redHue: 0, greenHue: 0, blueHue: 0 };
 
@@ -401,7 +558,7 @@ async function closeActive(): Promise<void> {
   const active = app.active;
   if (!active) return;
   if (!(await settleUnsaved(active))) return;
-  await withBusy("Fermeture…", async () => {
+  await withBusy(t("Fermeture…"), async () => {
     await api.closeDocument(active.info.id);
     app.remove(active.info.id);
   });
@@ -409,7 +566,12 @@ async function closeActive(): Promise<void> {
 
 // ---------------------------------------------------------------------- calques
 
-const activeId = () => app.activeLayer?.id ?? null;
+/**
+ * Calque de référence d'un ajout (nouveau calque, import, collage…) : le calque actif ; sinon le plan de travail
+ * isolé, pour que l'ajout entre dans ce plan et non au-dessus de tous les plans (le moteur place « au-dessus » d'un
+ * plan DANS ce plan, voir `Document::placement_slot`).
+ */
+const activeId = () => app.activeLayer?.id ?? app.active?.boardFocus ?? null;
 const selection = () => app.active?.selection ?? [];
 
 /** Ctrl+Alt+G : écrête le calque actif sur celui du dessous, ou annule l'écrêtage. */
@@ -515,8 +677,18 @@ function frame(mode: "fit" | "actual"): void {
   const active = app.active;
   if (!active) return;
   const { width, height } = app.viewport;
+  // Plan isolé (liste du panneau Calques) : Taille écran cadre ce plan, 100 % se centre sur lui.
+  const board = active.boardFocus !== null ? (active.info.layers.find((l) => l.id === active.boardFocus)?.artboard ?? null) : null;
+  if (board) {
+    if (mode === "fit") return fitRect(board);
+    const zoom = 1;
+    app.moveCamera({ zoom, x: Math.round(width / 2 - (board.x + board.width / 2) * zoom), y: Math.round(height / 2 - (board.y + board.height / 2) * zoom), rotation: 0 }, false);
+    return;
+  }
   const { width: docW, height: docH } = active.info;
-  app.moveCamera(mode === "fit" ? fitCamera(docW, docH, width, height) : centerCamera(docW, docH, width, height, 1), mode === "fit");
+  // La rotation de l'affichage est gardée, comme dans Photoshop (Taille écran cadre alors le document tourné).
+  const rotation = rotationOf(active.camera);
+  app.moveCamera(mode === "fit" ? fitCamera(docW, docH, width, height, 32, rotation) : centerCamera(docW, docH, width, height, 1, rotation), mode === "fit");
 }
 
 const HANDLERS: Record<ActionId, () => void | Promise<unknown>> = {
@@ -532,8 +704,8 @@ const HANDLERS: Record<ActionId, () => void | Promise<unknown>> = {
   // L'identifiant date du temps où seul le PNG existait ; il est conservé pour ne pas casser les raccourcis enregistrés.
   "file.exportPng": () => void (app.exportOpen = true),
   "file.close": closeActive,
-  "edit.undo": () => edit({ op: "undo" }),
-  "edit.redo": () => edit({ op: "redo" }),
+  "edit.undo": () => historyStep("undo"),
+  "edit.redo": () => historyStep("redo"),
   // Ctrl+Alt+Z : bascule entre le dernier état et le précédent.
   "edit.toggleLastState": () => edit({ op: app.active?.info.canRedo ? "redo" : "undo" }),
   "edit.fillForeground": () => fill("foreground"),
@@ -541,27 +713,73 @@ const HANDLERS: Record<ActionId, () => void | Promise<unknown>> = {
   // Presse-papiers interne : pixels sélectionnés du calque actif (tout le calque sans sélection).
   // Ctrl+I, comme Photoshop : inverse directement les pixels du calque (dans la sélection s'il y en a une).
   "help.about": () => void (app.aboutOpen = true),
+  // Aide › Notice : l'accueil s'ouvre sur la notice (voir lib/manual.ts).
+  "help.manual": () => manualOpen(),
+  "help.reportBug": () => void (app.bugReportOpen = true),
+  "help.openLogs": () => void api.openLogsDir().catch((error: unknown) => app.fail(error)),
   "edit.preferences": () => void (app.preferencesOpen = true),
+  "edit.colorSettings": () => void (colorSettings.dialogOpen = true),
   "copyright.metadata": () => void (app.copyrightOpen = true),
   "layer.effects": () => void (app.effectsLayer = app.activeLayer?.id ?? null),
+  // Style de calque (comme Photoshop) : effets ET options de fusion, copiés d'un calque puis collés sur tous les
+  // calques sélectionnés en un seul état d'historique ; Effacer le style rend le calque nu (Normal, 100 %).
+  "layer.copyStyle": () => {
+    const layer = app.activeLayer;
+    if (!layer || !canCarryStyle(layer)) return;
+    app.styleClipboard = JSON.parse(JSON.stringify({ effects: layer.effects, blend: layer.blend, opacity: layer.opacity, fill: layer.fill })) as NonNullable<typeof app.styleClipboard>;
+  },
+  "layer.pasteStyle": () => {
+    const style = app.styleClipboard;
+    const ids = styleTargets().map((l) => l.id);
+    if (!style || ids.length === 0) return;
+    void edit({ op: "setStyle", ids, effects: JSON.parse(JSON.stringify(style.effects)), blend: style.blend, opacity: style.opacity, fill: style.fill });
+  },
+  "layer.clearStyle": () => {
+    const ids = styleTargets().map((l) => l.id);
+    if (ids.length > 0) void edit({ op: "setStyle", ids, effects: [], blend: "normal", opacity: 1, fill: 1 });
+  },
   "view.guideLayout": () => void (app.guideLayoutOpen = true),
   "select.quickMask": () => void (app.quickMask = !app.quickMask),
   "tool.crop": () => void (app.tool = "crop"),
-  "tool.shape": () => void (app.tool = "shape"),
-  "tool.shapeCycle": () => {
-    // Maj+U : rectangle, ellipse, triangle, puis de nouveau rectangle.
-    const next = { rect: "ellipse", ellipse: "polygon", polygon: "rect" } as const;
-    app.shapeKind = app.tool === "shape" ? next[app.shapeKind] : "rect";
-    if (app.shapeKind === "polygon") app.shapeSides = 3;
-    app.tool = "shape";
-  },
+  // Outils empilés (voir lib/tool-groups.svelte.ts) : la lettre reprend l'outil affiché par la case du groupe,
+  // Maj + la lettre passe au suivant. Les identifiants d'actions d'avant sont gardés : les raccourcis personnalisés tiennent.
+  "tool.shape": () => selectGroupTool("tool.shape"),
+  "tool.shapeCycle": () => cycleByCycleAction("tool.shapeCycle"),
   "filter.liquify": () => void (app.liquifyOpen = true),
+  // Maj+Ctrl+A : la fenêtre Développement RAW sur le calque actif (hors galerie, comme la Fluidité).
+  "filter.cameraRaw": () => cameraRawFilter(),
+  // Ctrl+Maj+F : le champ de recherche du panneau Calques prend le focus (il s'affiche s'il était masqué).
+  "layer.search": () => void window.dispatchEvent(new CustomEvent(LAYER_SEARCH_EVENT)),
+  // La galerie s'ouvre sur le dernier filtre appliqué (sinon le flou gaussien).
+  "filter.gallery": () => void (app.filterDialog = lastFilter() ?? "gaussianBlur"),
+  // Ctrl+F : le dernier filtre appliqué, avec les mêmes réglages, sans repasser par la galerie (comme Photoshop).
+  "filter.lastFilter": () => {
+    const last = lastApplied();
+    const id = activeId();
+    return last && id !== null ? edit({ op: "applyFilter", id, filter: last }) : undefined;
+  },
   // Ctrl+I : sur le masque de fusion s'il est la cible (ce qui était masqué se révèle), sinon sur les pixels.
   "image.invert": () => {
     const id = activeId();
     if (id === null) return undefined;
     return edit(app.active?.target === "mask" && app.activeLayer?.hasMask ? { op: "invertMask", id } : { op: "invert", id });
   },
+  // Impression (lib/print.svelte.ts) : fenêtres, et cases d'Affichage › Impression (mémorisées).
+  "image.printSetup": () => void (app.printSetupDialogOpen = true),
+  "image.correctInk": () => void (app.correctInkDialogOpen = true),
+  "view.printBleed": () => setPref("showBleed", !printPrefs.showBleed),
+  "view.printSafe": () => setPref("showSafe", !printPrefs.showSafe),
+  "view.printMarks": () => setPref("showMarks", !printPrefs.showMarks),
+  "view.inkAlert": () => setPref("inkAlert", !printPrefs.inkAlert),
+  "view.separations": () => setPref("separations", !printPrefs.separations),
+  "file.preflight": () => void (app.preflightOpen = true),
+  // Image › Mode (voir lib/color-mode.svelte.ts) : Bitmap et CMJN ouvrent leur fenêtre, les autres convertissent.
+  "image.modeBitmap": () => chooseColorMode("bitmap"),
+  "image.modeGrayscale": () => chooseColorMode("grayscale"),
+  "image.modeRgb": () => chooseColorMode("rgb"),
+  "image.modeCmyk": () => chooseColorMode("cmykWorkflow"),
+  // Simple indication (8 bits par couche : la seule profondeur du moteur), cochée et grisée.
+  "image.mode8Bits": () => undefined,
   // Copier et couper alimentent aussi le presse-papiers du système, pour coller dans un autre logiciel.
   // Avec une sélection : les pixels sélectionnés. Sans sélection : les calques sélectionnés eux-mêmes, groupes
   // et contenu compris (texte, effets, masques), à coller ici ou dans un autre document.
@@ -619,15 +837,22 @@ const HANDLERS: Record<ActionId, () => void | Promise<unknown>> = {
   // Comme Photoshop : avec une sélection active, Suppr efface les pixels ; sinon, le calque.
   // Bouton corbeille et menus : toujours le calque (le moteur refuse un calque verrouillé par le cadenas).
   "layer.delete": () => edit({ op: "delete", ids: selection() }),
-  // Touche Suppr : dans le panneau Calques, c'est le calque ; sur l'image avec une sélection, ce sont les pixels
-  // sélectionnés (ou, le masque de fusion étant visé, la sélection y est masquée) ; sans sélection, le calque.
-  // Un calque caché se supprime donc comme les autres depuis le panneau.
-  "edit.deleteKey": () => {
+  // Touche Suppr : sur l'image avec une sélection, ce sont les pixels sélectionnés (ou, le masque de fusion étant visé,
+  // la sélection y est masquée). Sinon, le masque de fusion visé (vignette du masque cliquée, un seul calque) est
+  // retiré — le calque reste ; à défaut, c'est le calque. Un calque caché se supprime donc comme les autres depuis le
+  // panneau. Le bouton corbeille et Maj+Suppr suppriment toujours le calque.
+  "edit.deleteKey": async () => {
+    const doc = app.active;
     const id = activeId();
     const inLayersPanel = Boolean(document.activeElement?.closest("[data-panel='layers']"));
-    if (inLayersPanel || !app.active?.info.hasSelection || id === null) return edit({ op: "delete", ids: selection() });
-    const onMask = app.active.target === "mask" && app.activeLayer?.hasMask === true;
-    return edit({ op: "clearPixels", id, onMask });
+    const onMask = doc?.target === "mask" && app.activeLayer?.hasMask === true;
+    if (doc && id !== null && !inLayersPanel && doc.info.hasSelection) return edit({ op: "clearPixels", id, onMask });
+    if (doc && id !== null && onMask && doc.selection.length === 1) {
+      // Refusé (calque verrouillé…) : le masque est toujours là, il reste visé.
+      if (await edit({ op: "removeMask", id })) doc.target = "pixels";
+      return;
+    }
+    return edit({ op: "delete", ids: selection() });
   },
   // Ctrl+A : le contenu du calque actif (ses pixels opaques), pas tout le plan de travail.
   "select.all": () => edit({ op: "selectAll", layer: app.activeLayer && !app.activeLayer.isGroup ? app.activeLayer.id : undefined }),
@@ -646,7 +871,7 @@ const HANDLERS: Record<ActionId, () => void | Promise<unknown>> = {
   "layer.resetSmartTransform": () => smartEdit("resetSmartTransform"),
   "layer.rasterize": () => {
     const layer = app.activeLayer;
-    return layer && (layer.text || layer.shape || layer.smart) ? edit({ op: "rasterize", id: layer.id }) : undefined;
+    return layer && (layer.text || layer.shape || layer.smart || layer.fillLayer) ? edit({ op: "rasterize", id: layer.id }) : undefined;
   },
   "layer.blendNext": () => cycleBlend(1),
   "layer.blendPrevious": () => cycleBlend(-1),
@@ -657,15 +882,13 @@ const HANDLERS: Record<ActionId, () => void | Promise<unknown>> = {
   "view.toggleRulers": () => void (app.rulersVisible = !app.rulersVisible),
   "view.toggleGuides": () => void (app.guidesVisible = !app.guidesVisible),
   "view.toggleSnap": () => void (app.snapEnabled = !app.snapEnabled),
-  // Ctrl+Y : allume l'épreuve avec le dernier profil choisi, ou l'éteint.
+  // Ctrl+Y : allume l'épreuve dans l'espace CMJN des Paramètres de couleur, ou l'éteint.
   "view.proofCmyk": () => void (app.proofCmyk = !app.proofCmyk),
-  "view.proofFogra39": () => chooseProofProfile("fogra39"),
-  "view.proofFogra51": () => chooseProofProfile("fogra51"),
-  "view.proofFogra52": () => chooseProofProfile("fogra52"),
-  "view.proofGracol2006": () => chooseProofProfile("gracol2006"),
-  "view.proofSwop2006c3": () => chooseProofProfile("swop2006c3"),
   "view.lockGuides": () => edit({ op: "setGuidesLocked", locked: !app.active?.info.guidesLocked }),
-  "view.clearGuides": () => edit({ op: "clearGuides" }),
+  "view.clearGuides": () => {
+    const target = guideTarget();
+    if (target) void edit({ op: "clearGuides", board: target.board });
+  },
   "doc.next": () => stepDocument(1),
   "doc.previous": () => stepDocument(-1),
   "color.swap": () => void ([app.foreground, app.background] = [app.background, app.foreground]),
@@ -673,17 +896,11 @@ const HANDLERS: Record<ActionId, () => void | Promise<unknown>> = {
   "brush.smaller": () => resizeBrush(-1),
   "brush.larger": () => resizeBrush(1),
   "tool.move": () => void (app.tool = "move"),
-  "tool.marquee": () => void (app.tool = "marquee"),
-  "tool.marqueeCycle": () => {
-    app.marqueeShape = app.tool === "marquee" && app.marqueeShape === "rect" ? "ellipse" : "rect";
-    app.tool = "marquee";
-  },
-  "tool.lasso": () => void (app.tool = "lasso"),
-  "tool.lassoCycle": () => {
-    app.lassoShape = app.tool === "lasso" && app.lassoShape === "free" ? "polygon" : "free";
-    app.tool = "lasso";
-  },
-  "tool.wand": () => void (app.tool = "wand"),
+  "tool.marquee": () => selectGroupTool("tool.marquee"),
+  "tool.marqueeCycle": () => cycleByCycleAction("tool.marqueeCycle"),
+  "tool.lasso": () => selectGroupTool("tool.lasso"),
+  "tool.lassoCycle": () => cycleByCycleAction("tool.lassoCycle"),
+  "tool.wand": () => selectGroupTool("tool.wand"),
   // Calques de réglage : créés au-dessus du calque actif, avec des paramètres neutres.
   "adjust.brightnessContrast": () => addAdjustment({ type: "brightnessContrast", brightness: 0, contrast: 0 }),
   // Ctrl+U : le calque de réglage est créé ; ses curseurs sont dans Propriétés (l'onglet ne change pas tout seul).
@@ -694,6 +911,26 @@ const HANDLERS: Record<ActionId, () => void | Promise<unknown>> = {
   "adjust.gradientMap": () =>
     addAdjustment({ type: "gradientMap", stops: [{ position: 0, color: [0, 0, 0, 255] }, { position: 1, color: [255, 255, 255, 255] }], reverse: false, dither: false, smoothness: 100 }),
   "adjust.develop": () => addAdjustment({ type: "develop", ...NEUTRAL_DEVELOP }),
+  // Courbes : la diagonale (neutre) ; les points s'ajoutent dans Propriétés.
+  "adjust.curves": () => addAdjustment({ type: "curves", rgb: [[0, 0], [255, 255]], red: [], green: [], blue: [] }),
+  "adjust.exposure": () => addAdjustment({ type: "exposure", exposure: 0, offset: 0, gamma: 1 }),
+  "adjust.colorBalance": () => addAdjustment({ type: "colorBalance", shadows: [0, 0, 0], midtones: [0, 0, 0], highlights: [0, 0, 0], preserveLuminosity: true }),
+  // Noir et blanc : les poids par défaut de Photoshop.
+  "adjust.blackWhite": () => addAdjustment({ type: "blackWhite", reds: 40, yellows: 60, greens: 40, cyans: 60, blues: 20, magentas: 80, tint: false, tintHue: 35, tintSaturation: 25 }),
+  "adjust.channelMixer": () =>
+    addAdjustment({ type: "channelMixer", red: [100, 0, 0, 0], green: [0, 100, 0, 0], blue: [0, 0, 100, 0], gray: [40, 40, 20, 0], monochrome: false }),
+  "adjust.selectiveColor": () =>
+    addAdjustment({
+      type: "selectiveColor",
+      absolute: false,
+      ...(Object.fromEntries(["reds", "yellows", "greens", "cyans", "blues", "magentas", "whites", "neutrals", "blacks"].map((key) => [key, [0, 0, 0, 0]])) as Record<SelectiveFamily, MixerRow>),
+    }),
+  "adjust.posterize": () => addAdjustment({ type: "posterize", levels: 4 }),
+  "adjust.threshold": () => addAdjustment({ type: "threshold", level: 128 }),
+  // Calques de remplissage : la boîte de dialogue crée le calque (au-dessus du calque actif, masque blanc) et le règle en direct.
+  "layer.fillSolidColor": () => void (app.fillDialog = { kind: "solidColor", layer: null }),
+  "layer.fillGradient": () => void (app.fillDialog = { kind: "gradient", layer: null }),
+  "layer.fillPattern": () => void (app.fillDialog = { kind: "pattern", layer: null }),
   "filter.gaussianBlur": () => void (app.filterDialog = "gaussianBlur"),
   "filter.fieldBlur": () => void (app.filterDialog = "fieldBlur"),
   "filter.motionBlur": () => void (app.filterDialog = "motionBlur"),
@@ -704,44 +941,51 @@ const HANDLERS: Record<ActionId, () => void | Promise<unknown>> = {
   "filter.presence": () => void (app.filterDialog = "presence"),
   "filter.glass": () => void (app.filterDialog = "glass"),
   "tool.heal": () => void (app.tool = "heal"),
-  "tool.wandCycle": () => void (app.tool = app.tool === "wand" ? "quickSelect" : "wand"),
+  "tool.wandCycle": () => cycleByCycleAction("tool.wandCycle"),
   "select.modify": () => void (app.modifySelectionOpen = true),
+  "select.advanced": () => void (app.advancedSelectOpen = true),
   "filter.gaussianNoise": () => void (app.filterDialog = "gaussianNoise"),
   "filter.colorDither": () => void (app.filterDialog = "colorDither"),
   "filter.chromaticAberration": () => void (app.filterDialog = "chromaticAberration"),
   "filter.ascii": () => void (app.filterDialog = "ascii"),
   // Négatif : même courbe qu'Inverser, mais sur toute l'image (calque libre, non écrêté) : le fond aussi devient négatif.
   "adjust.negative": () => addAdjustment({ type: "negative" }, false),
-  "tool.fill": () => void (app.tool = "fill"),
-  "tool.fillCycle": () => {
-    app.fill.kind = app.tool === "fill" && app.fill.kind === "gradient" ? "bucket" : "gradient";
-    app.tool = "fill";
-  },
+  // G : le pot de peinture par défaut, ou le dernier outil choisi dans la case (Dégradé) ; Maj+G alterne.
+  "tool.fill": () => selectGroupTool("tool.fill"),
+  "tool.fillCycle": () => cycleByCycleAction("tool.fillCycle"),
   "tool.pen": () => void (app.tool = "pen"),
   "tool.pathSelect": () => void (app.tool = "pathSelect"),
   "path.toSelection": () => edit({ op: "pathToSelection", mode: "replace" }),
   "path.fill": () => {
     const id = activeId();
-    return id === null ? undefined : edit({ op: "fillPath", id, color: app.foreground });
+    return id === null ? undefined : edit({ op: "fillPath", id, color: foregroundInMode() });
   },
   // Le contour utilise le pinceau tel qu'il est réglé (taille, dureté, opacité) et la couleur de premier plan.
   "path.stroke": () => {
     const id = activeId();
-    return id === null ? undefined : edit({ op: "strokePath", id, brush: { ...app.brushes.brush, size: app.brushes.brush.size || 1, color: app.foreground, erase: false, pressureSize: false } });
+    return id === null ? undefined : edit({ op: "strokePath", id, brush: { ...app.brushes.brush, size: app.brushes.brush.size || 1, color: foregroundInMode(), erase: false, pressureSize: false } });
   },
   "path.clear": () => edit({ op: "setPath", paths: [], label: t("Effacer le tracé") }),
   "tool.eyedropper": () => void (app.tool = "eyedropper"),
   "tool.text": () => void (app.tool = "text"),
   "tool.brush": () => void (app.tool = "brush"),
   "tool.eraser": () => void (app.tool = "eraser"),
-  "tool.hand": () => void (app.tool = "hand"),
+  "tool.hand": () => selectGroupTool("tool.hand"),
+  "tool.rotateView": () => selectGroupTool("tool.rotateView"),
+  "view.resetRotation": () => app.setViewRotation(0),
+  "view.mirror": () => void (app.viewMirrored = !app.viewMirrored),
+  "artboard.open": () => void (app.artboardDialog = true),
   "tool.zoom": () => void (app.tool = "zoom"),
 };
 
 const NO_DOCUMENT_NEEDED: ReadonlySet<ActionId> = new Set([
   "file.home",
   "help.about",
+  "help.manual",
+  "help.reportBug",
+  "help.openLogs",
   "edit.preferences",
+  "edit.colorSettings",
   "copyright.metadata",
   "file.new",
   "file.open",
@@ -750,11 +994,6 @@ const NO_DOCUMENT_NEEDED: ReadonlySet<ActionId> = new Set([
   "view.toggleGuides",
   "view.toggleSnap",
   "view.proofCmyk",
-  "view.proofFogra39",
-  "view.proofFogra51",
-  "view.proofFogra52",
-  "view.proofGracol2006",
-  "view.proofSwop2006c3",
   "color.swap",
   "color.reset",
   "brush.smaller",
@@ -776,6 +1015,7 @@ const NO_DOCUMENT_NEEDED: ReadonlySet<ActionId> = new Set([
   "tool.brush",
   "tool.eraser",
   "tool.hand",
+  "tool.rotateView",
   "tool.zoom",
 ]);
 
@@ -793,20 +1033,33 @@ export function isActionChecked(id: ActionId): boolean | null {
   switch (id) {
     case "view.toggleSnap":
       return app.snapEnabled;
+    case "view.mirror":
+      return app.viewMirrored;
+    // En mode CMJN, l'épreuve du profil du document est allumée d'office (et non désactivable).
     case "view.proofCmyk":
-      return app.proofCmyk;
-    case "view.proofFogra39":
-      return app.proofProfile === "fogra39";
-    case "view.proofFogra51":
-      return app.proofProfile === "fogra51";
-    case "view.proofFogra52":
-      return app.proofProfile === "fogra52";
-    case "view.proofGracol2006":
-      return app.proofProfile === "gracol2006";
-    case "view.proofSwop2006c3":
-      return app.proofProfile === "swop2006c3";
+      return effectiveProof() !== null;
+    case "image.modeBitmap":
+      return app.active ? activeColorMode().kind === "bitmap" : false;
+    case "image.modeGrayscale":
+      return app.active ? activeColorMode().kind === "grayscale" : false;
+    case "image.modeRgb":
+      return app.active ? activeColorMode().kind === "rgb" : false;
+    case "image.modeCmyk":
+      return app.active ? activeColorMode().kind === "cmykWorkflow" : false;
+    case "image.mode8Bits":
+      return true;
     case "view.toggleRulers":
       return app.rulersVisible;
+    case "view.printBleed":
+      return printPrefs.showBleed;
+    case "view.printSafe":
+      return printPrefs.showSafe;
+    case "view.printMarks":
+      return printPrefs.showMarks;
+    case "view.inkAlert":
+      return printPrefs.inkAlert;
+    case "view.separations":
+      return printPrefs.separations;
     case "view.toggleGuides":
       return app.guidesVisible;
     case "view.lockGuides":
@@ -818,12 +1071,32 @@ export function isActionChecked(id: ActionId): boolean | null {
   }
 }
 
+/** Un style (effets) ne se pose ni sur un groupe ni sur un calque de réglage, ni sur un calque verrouillé. */
+function canCarryStyle(layer: LayerInfo): boolean {
+  return !layer.isGroup && !layer.adjustment && !layer.locks.all;
+}
+
+/** Calques sélectionnés qui peuvent recevoir un style (Coller / Effacer le style). */
+function styleTargets(): LayerInfo[] {
+  const doc = app.active;
+  if (!doc) return [];
+  return doc.info.layers.filter((l) => doc.selection.includes(l.id) && canCarryStyle(l));
+}
+
 export function isActionEnabled(id: ActionId): boolean {
   if (app.busy !== null) return false;
+  // Document en mode CMJN : l'épreuve écran de son espace reste allumée, Épreuve CMJN est grisée (cochée).
+  if (id === "view.proofCmyk" && workflowSpace() !== null) return false;
+  if (id === "image.mode8Bits") return false;
   if (NO_DOCUMENT_NEEDED.has(id)) return true;
   const doc = app.active;
   if (!doc) return false;
   switch (id) {
+    // Cadres et traits de coupe : seulement sur un document qui a un format d'impression.
+    case "view.printBleed":
+    case "view.printSafe":
+    case "view.printMarks":
+      return !!doc.info.print;
     case "edit.undo":
       return doc.info.canUndo;
     case "edit.redo":
@@ -836,10 +1109,15 @@ export function isActionEnabled(id: ActionId): boolean {
     case "edit.deleteKey":
       // Un calque verrouillé par le cadenas ne se supprime pas : le déverrouiller d'abord.
       return doc.selection.length > 0 && !doc.info.layers.some((l) => doc.selection.includes(l.id) && l.locks.all);
-    case "layer.effects": {
+    case "layer.effects":
+    case "layer.copyStyle": {
       const layer = app.activeLayer;
-      return doc.selection.length === 1 && !!layer && !layer.isGroup && !layer.adjustment;
+      return doc.selection.length === 1 && !!layer && canCarryStyle(layer);
     }
+    case "layer.pasteStyle":
+      return app.styleClipboard !== null && styleTargets().length > 0;
+    case "layer.clearStyle":
+      return styleTargets().some((l) => l.effects.length > 0 || l.blend !== "normal" || l.opacity < 1 || l.fill < 1);
     case "filter.gaussianBlur":
     case "filter.liquify":
     case "filter.fieldBlur":
@@ -853,6 +1131,8 @@ export function isActionEnabled(id: ActionId): boolean {
     case "filter.chromaticAberration":
     case "filter.dither":
     case "filter.ascii":
+    case "filter.gallery":
+    case "filter.lastFilter":
     case "filter.sharpen": {
       // Un filtre agit sur les pixels d'UN calque ; une forme ou un texte sont pixellisés au passage. Un objet
       // dynamique, lui, refuse (le moteur le dit) : on pixellise ou on modifie son contenu d'abord.
@@ -872,20 +1152,32 @@ export function isActionEnabled(id: ActionId): boolean {
       return app.activeLayer?.smart?.linked === true;
     case "layer.rasterize": {
       const layer = app.activeLayer;
-      return !!layer && (!!layer.text || !!layer.shape || !!layer.smart);
+      return !!layer && (!!layer.text || !!layer.shape || !!layer.smart || !!layer.fillLayer);
     }
     case "path.toSelection":
     case "path.fill":
     case "path.stroke":
     case "path.clear":
       return doc.info.paths.some((sub) => sub.anchors.length > 0);
-    case "view.clearGuides":
-      return doc.info.guides.length > 0;
+    // Repères : dans un document à plans, seulement sur un plan actif, et seulement les siens.
+    case "view.clearGuides": {
+      const target = guideTarget();
+      return target !== null && guidesOf(doc.info.guides, target.board).length > 0;
+    }
+    case "view.guideLayout":
+    case "view.lockGuides":
+      return guideTarget() !== null;
     case "select.none":
     case "select.feather":
       return doc.info.hasSelection;
     case "layer.addMask":
       return app.activeLayer !== null && !app.activeLayer.hasMask;
+    case "filter.cameraRaw": {
+      // Comme les autres filtres, sur UN calque qui a des pixels ; un objet dynamique est accepté : la fenêtre
+      // propose de le pixelliser (voir `cameraRawFilter`).
+      const layer = app.activeLayer;
+      return doc.selection.length === 1 && !!layer && !layer.isGroup && !layer.adjustment;
+    }
     default:
       return true;
   }
@@ -902,49 +1194,65 @@ export function runAction(id: ActionId): void {
  * comme nouveau document. Un projet `.iep` s'ouvre toujours à part.
  */
 export async function importDroppedFiles(files: File[], asSmartObject = false): Promise<void> {
-  for (const original of files) {
-    // AVIF : décodé par la webview, puis confié au moteur en PNG.
-    let file = original;
-    if (isAvif(original.name, original.type)) {
-      try {
-        file = await avifToPng(original, original.name || "Image.avif");
-      } catch (error) {
-        app.fail(error);
+  const raws = rawBatch(files.filter((f) => isRawPath(f.name)).length);
+  try {
+    for (const original of files) {
+      // AVIF : décodé par la webview, puis confié au moteur en PNG.
+      let file = original;
+      if (isAvif(original.name, original.type)) {
+        try {
+          file = await avifToPng(original, original.name || "Image.avif");
+        } catch (error) {
+          app.fail(error);
+          continue;
+        }
+      }
+      const extension = file.name.split(".").pop()?.toLowerCase() ?? "";
+      // Une image collée ou glissée depuis un navigateur n'a pas toujours d'extension : son type suffit.
+      const isImage = IMAGE_MIME_TYPES.includes(file.type);
+      const isProject = extension === PROJECT_EXTENSION || extension === LEGACY_PROJECT_EXTENSION;
+      if (!isProject && !IMAGE_EXTENSIONS.includes(extension) && !isImage) {
+        app.error = `Format non pris en charge : ${file.name}`;
         continue;
       }
-    }
-    const extension = file.name.split(".").pop()?.toLowerCase() ?? "";
-    // Une image collée ou glissée depuis un navigateur n'a pas toujours d'extension : son type suffit.
-    const isImage = IMAGE_MIME_TYPES.includes(file.type);
-    const isProject = extension === PROJECT_EXTENSION || extension === LEGACY_PROJECT_EXTENSION;
-    if (!isProject && !IMAGE_EXTENSIONS.includes(extension) && !isImage) {
-      app.error = `Format non pris en charge : ${file.name}`;
-      continue;
-    }
-    // Depuis l'accueil (même avec des documents ouverts dessous), une image ouvre un nouveau document.
-    const target = isProject || app.homeVisible ? null : app.active;
-    await withBusy("Import…", async () => {
-      const bytes = new Uint8Array(await file.arrayBuffer());
-      // Objet dynamique (Alt au dépôt, Importer comme objet dynamique) : seulement dans un document ouvert.
-      const run = () => api.importDropped(bytes, file.name, target?.info.id ?? null, activeId(), asSmartObject && target !== null && !isProject);
-      if (target) {
-        settlePendingEdits();
-        const result = await enqueue(target.info.id, run);
-        adopt(result.document, result.dirty);
-      } else {
-        const { document } = await run();
-        app.add(document);
-        refreshThumbnails(document, []);
+      // Depuis l'accueil (même avec des documents ouverts dessous), une image ouvre un nouveau document.
+      const target = isProject || app.homeVisible ? null : app.active;
+      const importPlain = () => withBusy(t("Import…"), async () => {
+        const bytes = new Uint8Array(await file.arrayBuffer());
+        // Objet dynamique (Alt au dépôt, Importer comme objet dynamique) : seulement dans un document ouvert.
+        const run = () => api.importDropped(bytes, file.name, target?.info.id ?? null, activeId(), asSmartObject && target !== null && !isProject);
+        if (target) {
+          settlePendingEdits();
+          const result = await enqueue(target.info.id, run);
+          adopt(result.document, result.dirty);
+        } else {
+          const { document } = await run();
+          app.add(document);
+          refreshThumbnails(document, []);
+        }
+      });
+      // RAW : fenêtre « Développement RAW » d'abord (calque, objet dynamique avec Alt, ou nouveau document).
+      if (!isProject && isRawPath(file.name)) {
+        await developRaw({ file }, target ? (asSmartObject ? "smart" : "layer") : "open", raws, importPlain);
+        continue;
       }
-    });
+      await importPlain();
+    }
+  } finally {
+    endRawBatch(raws);
   }
 }
 
-export async function createDocument(params: Parameters<typeof api.newDocument>[0]): Promise<void> {
+/**
+ * Nouveau document. Une fois créé, son format passe en tête de l'historique des formats rapides de l'accueil
+ * (`used` : le format du catalogue choisi ; à défaut, la taille seule).
+ */
+export async function createDocument(params: Parameters<typeof api.newDocument>[0], used?: UsedFormat): Promise<void> {
   await withBusy(t("Création…"), async () => {
     const info = await api.newDocument(params);
     app.add(info);
     refreshThumbnails(info, []);
+    void recordFormat(used ?? { width: params.width, height: params.height, dpi: params.dpi, transparent: params.transparent });
   });
 }
 
@@ -952,9 +1260,9 @@ export async function createDocument(params: Parameters<typeof api.newDocument>[
 
 /** Ce qu'on peut placer comme objet dynamique : une image ou un projet entier. */
 const placeFilters = () => [
-  { name: t("Images et projets"), extensions: [...IMAGE_EXTENSIONS, PROJECT_EXTENSION, LEGACY_PROJECT_EXTENSION] },
+  { name: t("Images et projets"), extensions: dialogExtensions([...IMAGE_EXTENSIONS, PROJECT_EXTENSION, LEGACY_PROJECT_EXTENSION]) },
   IMAGE_FILTER,
-  { name: t("Projets Lumitype"), extensions: [PROJECT_EXTENSION, LEGACY_PROJECT_EXTENSION] },
+  PROJECT_FILTER(),
 ];
 
 /** Nom affiché d'un document : celui d'un contenu d'objet dynamique dit d'où il vient (« Logo.graf — contenu de « Logo » »). */
@@ -979,18 +1287,30 @@ async function placeSmartObjects(linked: boolean): Promise<void> {
   if (!app.active) return;
   const paths = await open({ multiple: true, filters: placeFilters() });
   if (!paths) return;
-  for (const path of paths) {
-    if (isAvif(path)) {
-      // AVIF : décodé par la webview, il ne peut être qu'incorporé (le moteur ne sait pas le relire).
-      if (linked) app.error = t("Image AVIF : elle est incorporée, un lien ne pourrait pas être relu.");
-      try {
-        await importDroppedFiles([await avifPathToPng(path)], true);
-      } catch (error) {
-        app.fail(error);
+  const raws = rawBatch(linked ? 0 : paths.filter(isRawPath).length);
+  try {
+    for (const path of paths) {
+      if (isAvif(path)) {
+        // AVIF : décodé par la webview, il ne peut être qu'incorporé (le moteur ne sait pas le relire).
+        if (linked) app.error = t("Image AVIF : elle est incorporée, un lien ne pourrait pas être relu.");
+        try {
+          await importDroppedFiles([await avifPathToPng(path)], true);
+        } catch (error) {
+          app.fail(error);
+        }
+        continue;
       }
-      continue;
+      const placePlain = () => withBusy(t("Import…"), async () => void (await edit({ op: "placeSmartObject", path, linked, above: activeId() })));
+      // RAW incorporé : développé dans sa fenêtre, l'objet dynamique contient l'image développée. Un RAW lié reste relu
+      // tel quel à chaque changement du fichier (réglages par défaut) : pas de fenêtre.
+      if (!linked && isRawPath(path)) {
+        await developRaw({ path }, "smart", raws, placePlain);
+        continue;
+      }
+      await placePlain();
     }
-    await withBusy(t("Import…"), async () => void (await edit({ op: "placeSmartObject", path, linked, above: activeId() })));
+  } finally {
+    endRawBatch(raws);
   }
 }
 
@@ -1002,6 +1322,8 @@ export async function openSmartContent(id?: number): Promise<void> {
   const doc = app.active;
   const layer = smartLayer(id);
   if (!doc || !layer) return;
+  // RAW « à redévelopper » : la fenêtre de développement, avec ses réglages, plutôt qu'un onglet de document.
+  if (layer.smart?.rawDevelop) return redevelopSmartRaw(doc.info.id, layer.id);
   const docId = doc.info.id;
   settlePendingEdits(); // une transformation en attente est validée : le contenu ouvert est celui d'après
   await withBusy(t("Ouverture du contenu…"), async () => {
@@ -1014,6 +1336,99 @@ export async function openSmartContent(id?: number): Promise<void> {
       refreshThumbnails(info, []);
     }
   });
+}
+
+/**
+ * Objet dynamique RAW : la fenêtre « Développement RAW » se rouvre sur le RAW gardé, avec ses réglages. Valider
+ * redéveloppe le RAW et remplace le contenu de toutes les instances, en une étape d'historique (Ctrl+Z l'annule).
+ */
+function redevelopSmartRaw(docId: number, layerId: number): Promise<void> {
+  // Même file que les RAW ouverts ou déposés : une seule fenêtre de développement à la fois.
+  return rawInTurn(() => redevelopSmartRawNow(docId, layerId));
+}
+
+async function redevelopSmartRawNow(docId: number, layerId: number): Promise<void> {
+  settlePendingEdits();
+  let reopened: { opened: RawOpened; params: RawParams };
+  app.busy = t("Lecture du RAW…");
+  try {
+    reopened = await enqueue(docId, () => api.rawOpenSmart(docId, layerId));
+  } catch (error) {
+    app.fail(error);
+    return;
+  } finally {
+    app.busy = null;
+  }
+  const { opened, params } = reopened;
+  try {
+    const answer = await askRawDevelop({ opened, mode: "redevelop", index: 1, count: 1, initial: params, keepRaw: true }, null);
+    if (!answer) return;
+    await withBusy(t("Développement…"), async () => {
+      const result = await enqueue(docId, () => api.rawRedevelop(opened.id, answer.params, docId, layerId));
+      adopt(result.document, result.dirty);
+    });
+  } finally {
+    void api.rawClose(opened.id).catch(() => {});
+  }
+}
+
+/**
+ * Filtre › Filtre Camera Raw (Maj+Ctrl+A) : la fenêtre « Développement RAW » s'ouvre sur les pixels du calque actif
+ * (session construite par le moteur depuis le calque, voir `raw_open_layer`), mêmes curseurs, sans EXIF. « Appliquer »
+ * passe par l'opération ordinaire `applyFilter` : une étape d'historique « Filtre Camera Raw », limitée à la sélection,
+ * texte et formes pixellisés au passage comme pour les autres filtres ; Ctrl+F la refait avec les mêmes réglages.
+ * Un objet dynamique (que les filtres refusent) est pixellisé puis filtré dans la même étape (`rasterizeAndFilter`),
+ * après accord donné dans la fenêtre.
+ */
+function cameraRawFilter(): Promise<void> {
+  // Même file que les RAW : une seule fenêtre de développement à la fois.
+  return rawInTurn(() => cameraRawFilterNow(null));
+}
+
+/** Filtre dynamique Camera Raw rouvert (double-clic dans le panneau Calques) : `index` dans la liste du calque actif. */
+export function editCameraRawFilter(index: number): Promise<void> {
+  return rawInTurn(() => cameraRawFilterNow(index));
+}
+
+async function cameraRawFilterNow(editIndex: number | null): Promise<void> {
+  const doc = app.active;
+  const layer = app.activeLayer;
+  if (!doc || !layer || layer.isGroup || layer.adjustment) return;
+  const [docId, layerId, smart] = [doc.info.id, layer.id, layer.smart !== null];
+  // Filtre rouvert : ses réglages, et la fenêtre part de ce qu'il reçoit.
+  const existing = editIndex === null ? null : layer.filters?.list[editIndex];
+  const initial = existing?.filter.type === "cameraRaw" ? $state.snapshot(existing.filter.params) : null;
+  settlePendingEdits();
+  let opened: RawOpened;
+  app.busy = t("Préparation du calque…");
+  try {
+    opened = await enqueue(docId, () => api.rawOpenLayer(docId, layerId, editIndex));
+  } catch (error) {
+    app.fail(error);
+    return;
+  } finally {
+    app.busy = null;
+  }
+  try {
+    const answer = await askRawDevelop({ opened, mode: "filter", index: 1, count: 1, initial, keepRaw: false }, null);
+    if (!answer) return;
+    // « Auto » est figé à la balance calculée pour la fenêtre : le calque reçoit ce que montrait l'aperçu.
+    const params: RawParams =
+      answer.params.whiteBalance === "auto" ? { ...answer.params, whiteBalance: "custom", temperature: opened.info.autoTemperature, tint: opened.info.autoTint } : answer.params;
+    const filter: Filter = { type: "cameraRaw", params };
+    // Filtre rouvert : il est remplacé dans la liste. Objet dynamique : pixellisé et filtré par une seule opération du
+    // moteur, donc une seule étape d'historique (Ctrl+Z rend l'objet), et rien n'est pixellisé si le filtre échoue.
+    const list = layer.filters ? ($state.snapshot(layer.filters.list) as SmartFilter[]) : null;
+    if (editIndex !== null && list && list[editIndex]) {
+      list[editIndex] = { ...list[editIndex], filter, enabled: true };
+      await edit({ op: "setSmartFilters", id: layerId, list, enabled: layer.filters?.enabled ?? true }, docId);
+      return;
+    }
+    const op: EditOp = smart ? { op: "rasterizeAndFilter", id: layerId, filter } : { op: "applyFilter", id: layerId, filter };
+    if (await edit(op, docId)) rememberApplied(filter);
+  } finally {
+    void api.rawClose(opened.id).catch(() => {});
+  }
 }
 
 /**

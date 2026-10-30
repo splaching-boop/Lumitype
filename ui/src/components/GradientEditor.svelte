@@ -2,6 +2,7 @@
   import { t } from "../lib/i18n.svelte";
   import { type GradientStop, resolveStops, toCss } from "../lib/gradient";
   import { app } from "../state/app.svelte";
+  import { backgroundInMode, foregroundInMode } from "../lib/color-mode.svelte";
   import GradientStops from "./GradientStops.svelte";
 
   // Éditeur de dégradé de l'outil Dégradé : la rangée d'arrêts partagée (`GradientStops`) dans une
@@ -12,7 +13,7 @@
   let panel = $state<HTMLDivElement>();
   let editor = $state<ReturnType<typeof GradientStops>>();
 
-  const stops = $derived(resolveStops(app.gradient, app.foreground, app.background));
+  const stops = $derived(resolveStops(app.gradient, foregroundInMode(), backgroundInMode()));
 
   /** Toute modification fige le dégradé : il ne suit plus les couleurs de premier plan et d'arrière-plan. */
   function commit(next: GradientStop[]): void {
@@ -37,10 +38,10 @@
 <div class="editor" role="dialog" aria-label={t("Éditeur de dégradé")} bind:this={panel} style:left="{left}px" style:top="{y}px">
   <GradientStops bind:this={editor} {stops} onchange={commit}>
     <button class="preset" class:on={app.gradient.dynamic === "foregroundToBackground"} title={t("Premier plan → arrière-plan (suit vos couleurs)")} aria-label={t("Premier plan vers arrière-plan")} onclick={() => (app.gradient = { stops: [], dynamic: "foregroundToBackground" })}>
-      <span style:background={toCss(resolveStops({ stops: [], dynamic: "foregroundToBackground" }, app.foreground, app.background))}></span>
+      <span style:background={toCss(resolveStops({ stops: [], dynamic: "foregroundToBackground" }, foregroundInMode(), backgroundInMode()))}></span>
     </button>
     <button class="preset" class:on={app.gradient.dynamic === "foregroundToTransparent"} title={t("Premier plan → transparent (suit votre couleur)")} aria-label={t("Premier plan vers transparent")} onclick={() => (app.gradient = { stops: [], dynamic: "foregroundToTransparent" })}>
-      <span style:background={toCss(resolveStops({ stops: [], dynamic: "foregroundToTransparent" }, app.foreground, app.background))}></span>
+      <span style:background={toCss(resolveStops({ stops: [], dynamic: "foregroundToTransparent" }, foregroundInMode(), backgroundInMode()))}></span>
     </button>
   </GradientStops>
 </div>
@@ -66,7 +67,7 @@
     padding: 0;
     border-radius: var(--radius-m);
     overflow: hidden;
-    border: 1px solid rgba(255, 255, 255, 0.12);
+    border: 1px solid rgb(var(--ink) / 0.12);
     background: repeating-conic-gradient(#3a3a3e 0% 25%, #232326 0% 50%) 0 0 / 10px 10px;
   }
   .preset span {

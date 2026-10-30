@@ -12,7 +12,7 @@
 use std::sync::Arc;
 
 use crate::adjust::Adjustment;
-use crate::blend::{BlendMode, blend_function, blend_premultiplied};
+use crate::blend::{BlendIf, BlendMode, blend_function, blend_premultiplied};
 use crate::tiles::{MaskTile, TILE_SIZE, Tile, TileCoord};
 
 /// Nombre de pixels d'une tuile.
@@ -70,8 +70,9 @@ pub enum Op {
     Load { target: u16, source: Arc<Tile> },
     /// Recopie un tampon dans un autre (mémorise l'état avant un groupe en Transfert).
     Copy { target: u16, source: u16 },
-    /// Fusionne une source sur le tampon, avec un mode, une opacité et un masque.
-    Blend { target: u16, source: Source, mode: BlendMode, opacity: f32, mask: Coverage },
+    /// Fusionne une source sur le tampon, avec un mode, une opacité et un masque ; `range` : comparaison (options de
+    /// fusion), qui atténue encore la source selon sa valeur et celle du dessous.
+    Blend { target: u16, source: Source, mode: BlendMode, opacity: f32, mask: Coverage, range: Option<BlendIf> },
     /// Interpole le tampon vers l'état mémorisé : opacité et masque d'un groupe en Transfert.
     Mix { target: u16, before: u16, opacity: f32, mask: Coverage },
     /// Applique un calque de réglage au tampon (l'alpha ne change pas).
@@ -208,10 +209,11 @@ impl Machine {
             Op::Copy { target, source } => {
                 self.walk(*target, &Source::Buffer(*source), |_, px, dst| *dst = px);
             }
-            Op::Blend { target, source, mode, opacity, mask } => {
-                let (coord, mode, opacity) = (self.coord, *mode, *opacity);
+            Op::Blend { target, source, mode, opacity, mask, range } => {
+                let (coord, mode, opacity, range) = (self.coord, *mode, *opacity, *range);
                 self.walk(*target, source, |index, px, dst| {
-                    if let Some(src) = prepare_source(coord, mode, px, opacity * mask.at(index), index) {
+                    let compared = range.map_or(1.0, |r| r.factor(px, *dst));
+                    if let Some(src) = prepare_source(coord, mode, px, opacity * mask.at(index) * compared, index) {
                         *dst = blend_premultiplied(mode, src, *dst);
                     }
                 });
@@ -329,8 +331,8 @@ mod tests {
     #[test]
     fn a_program_blends_in_order_and_rounds_like_the_engine() {
         let mut builder = Builder::new();
-        builder.push(Op::Blend { target: 0, source: Source::Tile(filled([255; 4])), mode: BlendMode::Normal, opacity: 1.0, mask: Coverage::Uniform(1.0) });
-        builder.push(Op::Blend { target: 0, source: Source::Tile(filled([0, 0, 0, 255])), mode: BlendMode::Normal, opacity: 0.5, mask: Coverage::Uniform(1.0) });
+        builder.push(Op::Blend { target: 0, source: Source::Tile(filled([255; 4])), mode: BlendMode::Normal, opacity: 1.0, mask: Coverage::Uniform(1.0), range: None });
+        builder.push(Op::Blend { target: 0, source: Source::Tile(filled([0, 0, 0, 255])), mode: BlendMode::Normal, opacity: 0.5, mask: Coverage::Uniform(1.0), range: None });
         let tile = builder.finish(TileCoord::new(0, 0)).run_on_cpu().expect("tuile");
         assert_eq!(tile.pixel(4, 4), [128, 128, 128, 255]);
     }

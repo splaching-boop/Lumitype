@@ -1,6 +1,6 @@
 // Portions stylées d'un texte (un mot dans une autre police ou une autre couleur).
 // Positions en unités UTF-16, celles de la sélection d'un champ de saisie. Fonctions pures.
-import type { Rgb, StyleRun, TextData } from "./ipc";
+import type { Rgb, StyleRun, TextCaps, TextData } from "./ipc";
 
 export type RunStyle = Omit<StyleRun, "start" | "end">;
 /** Style effectif d'une plage ; `null` = valeurs différentes dans la plage (affiché « ? »). */
@@ -9,9 +9,17 @@ export interface RangeStyle {
   weight: number | null;
   italic: boolean | null;
   color: Rgb | null;
+  size: number | null;
+  tracking: number | null;
+  caps: TextCaps | null;
+  /** Style de caractère commun à la plage ; `undefined` : aucun ; `null` : plusieurs. */
+  style: number | undefined | null;
 }
 
-const KEYS = ["fontFamily", "weight", "italic", "color"] as const;
+const KEYS = ["fontFamily", "weight", "italic", "color", "size", "tracking", "caps", "style"] as const;
+/** Style d'une unité de texte : chaque réglage, `style` absent si aucun style de caractère. */
+type Unit = { fontFamily: string; weight: number; italic: boolean; color: Rgb; size: number; tracking: number; caps: TextCaps; style: number | undefined };
+const baseOf = (text: TextData): Unit => ({ fontFamily: text.fontFamily, weight: text.weight, italic: text.italic, color: text.color, size: text.size, tracking: text.tracking, caps: text.caps ?? "normal", style: text.style ?? undefined });
 const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
 
 /**
@@ -33,8 +41,8 @@ export function adjustRuns(runs: readonly StyleRun[], before: string, after: str
 }
 
 /** Style de chaque unité du texte : réglages du calque, surchargés par les portions. */
-function expand(text: TextData, length: number): Required<RunStyle>[] {
-  const base: Required<RunStyle> = { fontFamily: text.fontFamily, weight: text.weight, italic: text.italic, color: text.color };
+function expand(text: TextData, length: number): Unit[] {
+  const base = baseOf(text);
   const units = Array.from({ length }, () => ({ ...base }));
   for (const run of text.runs ?? []) {
     for (let i = Math.max(0, run.start); i < Math.min(length, run.end); i++) {
@@ -47,14 +55,12 @@ function expand(text: TextData, length: number): Required<RunStyle>[] {
 }
 
 /** Regroupe les unités voisines de même style ; ce qui est identique au calque n'a pas besoin de portion. */
-function collapse(text: TextData, units: Required<RunStyle>[]): StyleRun[] {
+function collapse(text: TextData, units: Unit[]): StyleRun[] {
   const runs: StyleRun[] = [];
-  const diff = (unit: Required<RunStyle>): RunStyle => {
+  const base = baseOf(text);
+  const diff = (unit: Unit): RunStyle => {
     const out: RunStyle = {};
-    if (unit.fontFamily !== text.fontFamily) out.fontFamily = unit.fontFamily;
-    if (unit.weight !== text.weight) out.weight = unit.weight;
-    if (unit.italic !== text.italic) out.italic = unit.italic;
-    if (!same(unit.color, text.color)) out.color = unit.color;
+    for (const key of KEYS) if (!same(unit[key], base[key]) && unit[key] !== undefined) Object.assign(out, { [key]: unit[key] });
     return out;
   };
   units.forEach((unit, i) => {
@@ -92,7 +98,7 @@ export function styleOver(text: TextData, start: number, end: number): RangeStyl
   const units = expand(text, text.content.length);
   const from = Math.min(start, end);
   const slice = from === Math.max(start, end) ? units.slice(Math.max(0, from - 1), Math.max(1, from)) : units.slice(from, Math.max(start, end));
-  const first = slice[0] ?? { fontFamily: text.fontFamily, weight: text.weight, italic: text.italic, color: text.color };
+  const first = slice[0] ?? baseOf(text);
   const common = <K extends (typeof KEYS)[number]>(key: K) => (slice.every((unit) => same(unit[key], first[key])) ? first[key] : null);
-  return { fontFamily: common("fontFamily"), weight: common("weight"), italic: common("italic"), color: common("color") };
+  return { fontFamily: common("fontFamily"), weight: common("weight"), italic: common("italic"), color: common("color"), size: common("size"), tracking: common("tracking"), caps: common("caps"), style: common("style") };
 }

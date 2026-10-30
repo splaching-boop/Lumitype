@@ -70,9 +70,63 @@ export async function loadLocale(): Promise<void> {
  * telle quelle, en français, plutôt que vide : l'interface reste toujours lisible.
  */
 export function t(text: string, vars?: Record<string, string | number>): string {
-  const translated = current === "fr" ? text : (DICTIONARIES[current][text] ?? text);
+  const found = current === "fr" ? text : (DICTIONARIES[current][text] ?? byPattern(current, text) ?? text);
+  // Clé à contexte, « Édition|Annuler » : un même mot français qui se traduit différemment selon l'endroit
+  // (Undo / Cancel). Le contexte sert seulement à la recherche dans le dictionnaire, il n'est jamais affiché.
+  // Seul un « | » collé (sans espace autour) sépare un contexte : « Avant | Après » reste un texte ordinaire.
+  const context = /^[^|]*\S\|(?=\S)/.exec(found);
+  const translated = context ? found.slice(context[0].length) : found;
   if (!vars) return translated;
   return translated.replace(/\{(\w+)\}/g, (whole, name: string) => (name in vars ? String(vars[name]) : whole));
+}
+
+/**
+ * Message déjà rempli (erreur du moteur : « le calque « Fond » est verrouillé ») : il ne se trouve pas tel quel
+ * dans le dictionnaire, mais sa phrase à variables, elle, y est. On la retrouve par motif, et la traduction
+ * reprend les morceaux variables à leur place. Seules les chaînes à `{…}` sont candidates, et seulement
+ * quand la recherche exacte a échoué : le coût ne se paie que sur les messages à variables.
+ */
+type Pattern = { regex: RegExp; names: string[]; translation: string; fixed: number };
+const PATTERNS = new Map<Locale, Pattern[]>();
+
+function byPattern(locale: Exclude<Locale, "fr">, text: string): string | null {
+  let patterns = PATTERNS.get(locale);
+  if (!patterns) {
+    patterns = [];
+    for (const [key, translation] of Object.entries(DICTIONARIES[locale])) {
+      if (!/\{\w*\}/.test(key)) continue;
+      const names: string[] = [];
+      const source = key
+        .split(/(\{\w*\})/)
+        .map((part, index) => {
+          if (index % 2 === 0) return part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+          names.push(part.slice(1, -1));
+          return "([\\s\\S]+?)";
+        })
+        .join("");
+      patterns.push({ regex: new RegExp(`^${source}$`), names, translation, fixed: key.replace(/\{\w*\}/g, "").length });
+    }
+    // Les motifs les plus précis d'abord (le plus de texte fixe) : « {a} : {b} » ne doit pas attraper une
+    // phrase entière qui a sa propre traduction.
+    patterns.sort((a, b) => b.fixed - a.fixed);
+    PATTERNS.set(locale, patterns);
+  }
+  for (const { regex, names, translation } of patterns) {
+    const match = regex.exec(text);
+    if (!match) continue;
+    // `{nom}` reprend le morceau de même nom ; `{}` (sans nom) les reprend dans l'ordre.
+    let seen = 0;
+    return translation.replace(/\{(\w*)\}/g, (whole, name: string) => {
+      let index = names.indexOf(name);
+      if (name === "") {
+        let rank = 0;
+        index = names.findIndex((n) => n === "" && rank++ === seen);
+        seen += 1;
+      }
+      return index >= 0 ? (match[index + 1] ?? whole) : whole;
+    });
+  }
+  return null;
 }
 
 /** Format d'une date dans la langue courante (`articleDate` et les récents). */

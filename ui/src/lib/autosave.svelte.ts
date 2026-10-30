@@ -8,6 +8,7 @@
 import { listen } from "@tauri-apps/api/event";
 import { app } from "../state/app.svelte";
 import { api } from "./ipc";
+import { refreshThumbnails } from "./engine";
 
 export const AUTOSAVE_MIN = 2;
 export const AUTOSAVE_MAX = 60;
@@ -19,7 +20,7 @@ async function saveOne(doc: (typeof app.documents)[number]): Promise<void> {
   app.autosaveProgress = 0;
   const stop = await listen<number>("autosave-progress", ({ payload }) => (app.autosaveProgress = payload));
   try {
-    await api.autosave(doc.info.id, doc.recoveryKey);
+    await api.autosave(doc.info.id, doc.recoveryKey, doc.workSeconds);
     [doc.autosavedRevision, doc.autosavedAt] = [revision, Date.now()];
   } catch (error) {
     // Une copie de secours manquée n'interrompt pas le travail : on retentera au prochain passage.
@@ -61,6 +62,7 @@ export function forgetRecovery(doc: { recoveryKey: string; info: { revision: num
 export async function recover(key: string): Promise<void> {
   const info = await api.recoveryOpen(key);
   app.add(info);
+  refreshThumbnails(info, []);
   const doc = app.documents.find((d) => d.info.id === info.id);
   if (doc) {
     doc.recoveryKey = key;

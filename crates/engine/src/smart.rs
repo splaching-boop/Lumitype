@@ -2,7 +2,8 @@
 //!
 //! Un calque objet dynamique ([`crate::document::LayerKind::Smart`]) contient un document entier, son **contenu** :
 //! - **incorporé** : un document Lumitype complet, enregistré dans le projet ; s'il vient d'une image placée, le
-//!   fichier d'origine est gardé tel quel ([`OriginalFile`]) et le document n'en est que le décodage ;
+//!   fichier d'origine est gardé tel quel ([`OriginalFile`]) et le document n'en est que le décodage — pour un RAW
+//!   « à redévelopper », son développement avec les réglages gardés dans [`OriginalFile::develop`] ;
 //! - **lié** : un fichier externe (image ou `.graf`), relu quand il change ([`SmartContent::reload`]). Le dernier
 //!   document lu reste en mémoire et le dernier rendu dans le projet : un fichier introuvable n'efface rien, l'objet
 //!   est seulement signalé « manquant ».
@@ -62,6 +63,9 @@ pub struct OriginalFile {
     /// Nom du fichier, extension comprise.
     pub name: String,
     pub bytes: Arc<Vec<u8>>,
+    /// RAW placé par la fenêtre « Développement RAW » (« redévelopper plus tard ») : ses réglages. Le document du
+    /// contenu est alors le développement du RAW avec ces réglages ; « Modifier le contenu » rouvre la fenêtre.
+    pub develop: Option<crate::raw::RawParams>,
 }
 
 /// D'où vient le contenu.
@@ -151,6 +155,19 @@ impl SmartContent {
             SmartSource::Linked { path, .. } => SmartSource::Linked { path: path.clone(), modified: modified_time(path), missing: false },
         };
         Self::new(self.id, self.name.clone(), Arc::new(document), source)
+    }
+
+    /// Réglages de développement d'un RAW incorporé « à redévelopper » (voir [`OriginalFile::develop`]).
+    pub fn raw_develop(&self) -> Option<&crate::raw::RawParams> {
+        self.original().and_then(|o| o.develop.as_ref())
+    }
+
+    /// RAW redéveloppé avec d'autres réglages : même identifiant (toutes les instances suivent), même fichier
+    /// d'origine ; `document` est le nouveau développement.
+    pub fn redeveloped(&self, document: Document, develop: crate::raw::RawParams) -> Result<Self, EngineError> {
+        let original = self.original().ok_or_else(|| EngineError::InvalidOperation("ce contenu n'est pas un RAW incorporé".into()))?;
+        let original = OriginalFile { name: original.name.clone(), bytes: Arc::clone(&original.bytes), develop: Some(develop) };
+        Ok(Self::new(self.id, self.name.clone(), Arc::new(document), SmartSource::Embedded { original: Some(original) }))
     }
 
     /// Contenu lié devenu incorporé (« Incorporer le lien ») : même identifiant, même document.
@@ -358,7 +375,7 @@ pub fn read_bytes(bytes: Vec<u8>, origin: &Path) -> Result<(Document, Option<Ori
     }
     let document = crate::io::import_image_bytes(&bytes, origin)?;
     let name = origin.file_name().and_then(|n| n.to_str()).unwrap_or("image").to_owned();
-    Ok((document, Some(OriginalFile { name, bytes: Arc::new(bytes) })))
+    Ok((document, Some(OriginalFile { name, bytes: Arc::new(bytes), develop: None })))
 }
 
 /// Nom d'un contenu placé depuis un fichier : le nom du fichier sans extension.
@@ -383,6 +400,13 @@ pub fn content_from_file(path: &Path, linked: bool) -> Result<SmartContent, Engi
 pub fn content_from_bytes(bytes: Vec<u8>, origin: &Path) -> Result<SmartContent, EngineError> {
     let (document, original) = read_bytes(bytes, origin)?;
     Ok(SmartContent::new(new_content_id(), name_of(origin), Arc::new(document), SmartSource::Embedded { original }))
+}
+
+/// Contenu d'un RAW incorporé « à redévelopper » : le fichier RAW (`file_name`, `bytes`) gardé à l'octet près, ses
+/// réglages, et `document`, son développement avec ces réglages.
+pub fn content_from_raw(file_name: &str, bytes: Arc<Vec<u8>>, develop: crate::raw::RawParams, document: Document) -> SmartContent {
+    let original = OriginalFile { name: file_name.to_owned(), bytes, develop: Some(develop) };
+    SmartContent::new(new_content_id(), name_of(Path::new(file_name)), Arc::new(document), SmartSource::Embedded { original: Some(original) })
 }
 
 /// Chemin de `path` relatif au dossier `base` (`..` compris), ou rien si les deux n'ont pas de racine commune
@@ -664,7 +688,7 @@ mod tests {
         assert!(refused(doc.fill_layer(smart, [1, 2, 3])), "remplir");
         assert!(refused(doc.invert_layer(smart)), "inverser");
         assert!(refused(doc.apply_filter(smart, &crate::filters::Filter::GaussianBlur { radius: 2.0 })), "filtre");
-        assert!(refused(doc.filter_preview(smart, &crate::filters::Filter::GaussianBlur { radius: 2.0 }, 64).map(|_| ())), "aperçu de filtre");
+        assert!(refused(doc.filter_preview(smart, &crate::filters::Filter::GaussianBlur { radius: 2.0 }, 64, None).map(|_| ())), "aperçu de filtre");
         assert!(refused(doc.pixels_mut(smart).map(|_| ())));
         doc.add_mask(smart, true).expect("masque");
         assert!(crate::paint::Stroke::begin(&doc, smart, true, brush).is_ok(), "le masque se peint");

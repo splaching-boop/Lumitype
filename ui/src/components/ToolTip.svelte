@@ -8,7 +8,9 @@
   // l'autre : une bulle qui grandit ou rétrécit en suivant le curseur donnerait une barre d'outils qui
   // tressaute. Seul l'aperçu peut manquer — un outil sans démonstration filmée n'affiche rien du tout
   // plutôt qu'une image de remplacement, et la bulle est alors simplement plus courte.
-  let { tool, top }: { tool: ToolId; top: number } = $props();
+  // `name` et `keys` remplacent ceux de l'aide pour un outil empilé (Pot de peinture plutôt que « Dégradé / pot ») ;
+  // `more` : ligne réservée sous la phrase d'aide (« Clic droit : autres outils »), vide pour un outil seul.
+  let { tool, top, name, keys, more = "" }: { tool: ToolId; top: number; name?: string; keys?: string; more?: string } = $props();
 
   const help = $derived(TOOL_HELP[tool]);
   /** Démonstration filmée de l'outil ; vide tant qu'elle n'a pas été tournée. */
@@ -25,7 +27,7 @@
   /** Hauteur totale, tenue par le style : elle sert à recaler la bulle si elle dépasse en bas. */
   /** 250 px de large en 16:9 : le film remplit le cadre, sans bande noire. */
   const PREVIEW = 141;
-  const TEXT = 97;
+  const TEXT = 114;
   const height = $derived(demo.length > 0 ? PREVIEW + TEXT : TEXT);
   const MARGIN = 8;
   const y = $derived(Math.max(MARGIN, Math.min(top, window.innerHeight - height - MARGIN)));
@@ -46,10 +48,11 @@
   {/if}
   <div class="body">
     <div class="head">
-      <span class="name">{t(help.name)}</span>
-      <span class="key">{t(help.keys)}</span>
+      <span class="name">{t(name ?? help.name)}</span>
+      <span class="key">{keys ?? t(help.keys)}</span>
     </div>
     <p class="hint">{t(help.hint)}</p>
+    <p class="more">{more}</p>
   </div>
 </aside>
 
@@ -103,6 +106,13 @@
     background: var(--bg-field);
     border: 1px solid var(--border-strong);
     border-radius: var(--radius-s);
+  }
+  .more {
+    height: 15px;
+    margin: 2px 0 0;
+    font-size: 11px;
+    line-height: 15px;
+    color: var(--text-muted);
   }
   .hint {
     /* Trois lignes réservées : toutes les bulles ont exactement la même taille. */

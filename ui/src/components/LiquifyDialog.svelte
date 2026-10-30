@@ -1,8 +1,10 @@
 <script lang="ts">
   import { t } from "../lib/i18n.svelte";
+  import { describeError } from "../lib/errors";
   import { onMount, untrack } from "svelte";
   import { edit } from "../lib/engine";
-  import { api } from "../lib/ipc";
+  import { api, type Filter } from "../lib/ipc";
+  import { replaceFilter } from "../lib/smart-filters";
   import { app } from "../state/app.svelte";
 
   // Fluidité : on pousse, gonfle, pince ou rétablit l'image au pinceau. La déformation est une
@@ -13,6 +15,13 @@
   const CELL = 6; // pas de la grille, en pixels de l'aperçu
   const docId = untrack(() => app.activeId);
   const layerId = untrack(() => app.activeLayer?.id ?? null);
+  /** Fluidité dynamique rouverte : sa grille au départ, et « OK » la remplace dans la liste du calque. */
+  const editing = untrack(() => {
+    const target = app.filterEdit;
+    const layer = target && app.active?.info.layers.find((l) => l.id === target.layerId);
+    const item = target && layer?.filters?.list[target.index];
+    return target && layer && item?.filter.type === "liquify" ? { layer: $state.snapshot(layer), index: target.index, filter: $state.snapshot(item.filter) as Extract<Filter, { type: "liquify" }> } : null;
+  });
 
   type Tool = "push" | "bloat" | "pucker" | "reconstruct";
   const TOOLS: { id: Tool; label: string; hint: string }[] = [
@@ -56,19 +65,24 @@
   onMount(() => {
     if (docId === null || layerId === null) return;
     // Une grille nulle ne déforme rien : on récupère ainsi la réduction du calque telle quelle.
-    api.filterPreview(docId, layerId, { type: "liquify", cols: 2, rows: 2, dx: [0, 0, 0, 0], dy: [0, 0, 0, 0] }, PREVIEW_SIDE).then(
+    api.filterPreview(docId, layerId, { type: "liquify", cols: 2, rows: 2, dx: [0, 0, 0, 0], dy: [0, 0, 0, 0] }, PREVIEW_SIDE, false, editing?.index ?? null).then(
       (buffer) => {
         const header = new DataView(buffer);
         [w, h] = [header.getUint32(0, true), header.getUint32(4, true)];
         source = new Uint8ClampedArray(buffer, 8);
         [cols, rows] = [Math.ceil(w / CELL) + 1, Math.ceil(h / CELL) + 1];
         [dx, dy] = [new Float32Array(cols * rows), new Float32Array(cols * rows)];
+        // Grille reprise du filtre rouvert (même réduction, donc même grille ; sinon on repart de zéro).
+        if (editing && editing.filter.cols === cols && editing.filter.rows === rows) {
+          [dx, dy] = [Float32Array.from(editing.filter.dx), Float32Array.from(editing.filter.dy)];
+          changed = true;
+        }
         output = new ImageData(w, h);
         dims = { width: w, height: h };
         [ready, dirty] = [true, true];
         raf = requestAnimationFrame(tick);
       },
-      (error: unknown) => (failure = String(error)),
+      (error: unknown) => (failure = describeError(error)),
     );
     return () => cancelAnimationFrame(raf);
   });
@@ -182,7 +196,10 @@
 
   function close(apply: boolean): void {
     app.liquifyOpen = false;
-    if (apply && changed && layerId !== null) void edit({ op: "applyFilter", id: layerId, filter: { type: "liquify", cols, rows, dx: [...dx], dy: [...dy] } });
+    app.filterEdit = null;
+    const grid: Filter = { type: "liquify", cols, rows, dx: [...dx], dy: [...dy] };
+    if (apply && changed && editing) replaceFilter(editing.layer, editing.index, grid);
+    else if (apply && changed && layerId !== null) void edit({ op: "applyFilter", id: layerId, filter: grid });
   }
 </script>
 
@@ -337,7 +354,7 @@
   }
   .tools button.on {
     background: var(--bg-active);
-    color: #fff;
+    color: var(--text-strong);
   }
   label {
     display: grid;

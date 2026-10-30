@@ -1,12 +1,33 @@
+# Dépendances et compilation
 node_modules/
-target/
 dist/
 dist-smoke/
+target/
+src-tauri/gen/
+*.tmp
+
+# Python, éditeurs, systèmes
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# Fichiers de travail de l'assistant
 ClaudeBackups/
-export/sorties/
-export/.travail/
-export/build/
-Design_1_ref.graf
-*.tar.xz
-.env
-export/release/
+
+# Construction des paquets (packaging/linux.sh, windows.bat) : sorties, release et dossiers de travail
+packaging/out/
+packaging/release/
+packaging/.work/
+
+# Copie des modèles faite par packaging/lib/sync-templates.* (source : templates/)
+src-tauri/templates/*.graf
+src-tauri/templates/*.txt
+
+# Sorties régénérables de tools/icon-sheet.* et tools/icons/
+ui/src/assets/icons/_icon-sheet.png
+ui/src/assets/icons/_icon-sheet.svg
+ui/src/assets/icons/_png-models/
+tools/icons/.cursors/

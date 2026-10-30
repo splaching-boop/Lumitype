@@ -133,10 +133,31 @@ fn bicubic<const C: usize>(sampler: &mut Sampler<'_, C>, x: f64, y: f64) -> [f64
     out
 }
 
+/// Décalage entier `(dx, dy)` si la matrice n'est qu'une translation de pixels entiers (à 1e-9 près).
+fn integer_translation(matrix: &Matrix) -> Option<(i32, i32)> {
+    let m = &matrix.0;
+    let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
+    let shape = [(0, 1.0), (1, 0.0), (3, 0.0), (4, 1.0), (6, 0.0), (7, 0.0), (8, 1.0)];
+    if !shape.iter().all(|&(i, v)| near(m[i], v)) {
+        return None;
+    }
+    let (dx, dy) = (m[2], m[5]);
+    if !near(dx, dx.round()) || !near(dy, dy.round()) || dx.abs() > 1e7 || dy.abs() > 1e7 {
+        return None;
+    }
+    Some((dx.round() as i32, dy.round() as i32))
+}
+
 /// Transforme un stockage : `matrix` envoie les coordonnées de la source vers celles du résultat.
 pub fn transform_store<const C: usize>(source: &Store<C>, matrix: &Matrix, quality: Quality) -> Result<Store<C>, EngineError> {
     let invalid = || EngineError::InvalidOperation("transformation impossible : forme aplatie ou retournée à l'infini".into());
     let inverse = matrix.inverse().ok_or_else(invalid)?;
+    // Translation d'un nombre entier de pixels (déplacement, Ctrl+T sans rotation ni échelle) : simple décalage des
+    // tuiles, sans rééchantillonnage (identique au pixel près, et sans copie quand le décalage est un multiple de
+    // la tuile).
+    if let Some((dx, dy)) = integer_translation(matrix) {
+        return Ok(source.translated(dx, dy));
+    }
     let mut out = Store::with_background(source.background());
     let Some((sx0, sy0, sx1, sy1)) = source.bounds() else { return Ok(out) };
 
@@ -232,6 +253,7 @@ pub fn transform_store<const C: usize>(source: &Store<C>, matrix: &Matrix, quali
 mod tests {
     use super::*;
     use crate::tiles::TileStore;
+    use std::sync::Arc;
 
     fn square() -> TileStore {
         let mut store = TileStore::new();
@@ -264,7 +286,17 @@ mod tests {
             assert_eq!(same.to_premultiplied(100, 100), source.to_premultiplied(100, 100));
             let moved = transform_store(&source, &Matrix::translation(-300.0, 40.0), quality).expect("translation");
             assert_eq!((at(&moved, -300, 40), at(&moved, -201, 139), at(&moved, -200, 139)), ([255, 0, 0, 255], [255, 0, 0, 255], [0; 4]));
+            // Raccourci de la translation entière : mêmes pixels que le rééchantillonnage, tuiles partagées quand le
+            // décalage est un multiple de la tuile.
+            let shifted = transform_store(&source, &Matrix::translation(256.0, -512.0), quality).expect("translation");
+            assert!(Arc::ptr_eq(source.get(TileCoord::new(0, 0)).expect("tuile"), shifted.get(TileCoord::new(1, -2)).expect("tuile")));
+            assert_eq!(at(&shifted, 355, -413), [255, 0, 0, 255]);
+            let half = transform_store(&source, &Matrix::translation(0.5, 0.0), quality).expect("demi-pixel");
+            assert_ne!(at(&half, 0, 50), [255, 0, 0, 255], "un demi-pixel passe par le rééchantillonnage");
         }
+        assert_eq!(integer_translation(&Matrix::translation(3.0, -7.0)), Some((3, -7)));
+        assert_eq!(integer_translation(&Matrix::translation(3.5, 0.0)), None);
+        assert_eq!(integer_translation(&Matrix::scaling(2.0)), None);
     }
 
     #[test]

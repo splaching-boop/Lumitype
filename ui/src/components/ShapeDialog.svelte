@@ -3,6 +3,7 @@
   import { edit } from "../lib/engine";
   import type { ShapeData } from "../lib/ipc";
   import { app } from "../state/app.svelte";
+  import { foregroundInMode } from "../lib/color-mode.svelte";
 
   // « Créer une forme » : ouverte par un double-clic avec l'outil Forme. On choisit la forme, le nombre
   // de côtés d'un polygone et la taille exacte ; la forme est posée centrée sur le point cliqué.
@@ -37,7 +38,7 @@
     [app.shapeKind, app.shapeSides] = [kind, n];
     const [w, h] = [Math.min(16384, Math.max(2, Math.round(width) || 2)), Math.min(16384, Math.max(2, Math.round(height) || 2))];
     const { fill, ...rest } = $state.snapshot(app.shapeDefaults);
-    const shape: ShapeData = { kind, sides: n, width: w, height: h, ...rest, fill: fill === undefined ? [...app.foreground, 255] : fill };
+    const shape: ShapeData = { kind, sides: n, width: w, height: h, ...rest, fill: fill === undefined ? [...foregroundInMode(), 255] : fill };
     void edit({ op: "addShape", x: Math.round(at.x - w / 2), y: Math.round(at.y - h / 2), shape, above: app.activeLayer?.id ?? null });
   }
 </script>
@@ -127,7 +128,7 @@
     gap: 2px;
     padding: 2px;
     border-radius: var(--radius-m);
-    background: #0f0f11;
+    background: var(--bg-well);
     border: 1px solid var(--border);
   }
   .segmented button {
@@ -138,7 +139,7 @@
   }
   .segmented button.on {
     background: var(--bg-active);
-    color: #fff;
+    color: var(--text-strong);
   }
   .row {
     display: flex;

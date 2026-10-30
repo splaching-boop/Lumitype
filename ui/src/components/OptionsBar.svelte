@@ -1,14 +1,27 @@
 <script lang="ts">
   import { t } from "../lib/i18n.svelte";
   import { isActionEnabled, runAction } from "../lib/actions";
+  import { editLatest } from "../lib/engine";
   import { resolveStops, toCss } from "../lib/gradient";
+  import { backgroundInMode, foregroundInMode } from "../lib/color-mode.svelte";
   import BrushPicker from "./BrushPicker.svelte";
   import GradientEditor from "./GradientEditor.svelte";
   import type { IconName } from "../lib/icons";
   import { app, type ToolId } from "../state/app.svelte";
   import Icon from "./Icon.svelte";
+  import { currentVariant } from "../lib/tool-groups.svelte";
+  import { normalizeAngle, rotationOf } from "../viewport/camera";
 
-  const TOOL_ICON: Record<ToolId, IconName> = { move: "move", marquee: "marquee", lasso: "lasso", wand: "wand", brush: "brush", eraser: "eraser", text: "type", crop: "crop", heal: "heal", quickSelect: "quickSelect", shape: "shape", fill: "bucket", eyedropper: "pipette", pen: "pen", pathSelect: "pathSelect", hand: "hand", zoom: "zoom" };
+  const TOOL_ICON: Record<ToolId, IconName> = { move: "move", marquee: "marquee", lasso: "lasso", wand: "wand", brush: "brush", eraser: "eraser", text: "type", crop: "crop", heal: "heal", quickSelect: "quickSelect", shape: "shape", fill: "bucket", eyedropper: "pipette", pen: "pen", pathSelect: "pathSelect", hand: "hand", rotateView: "rotateView", zoom: "zoom" };
+  /** Icône de l'outil en main : celle de sa variante (Ellipse de sélection, Dégradé…) quand c'est un outil empilé. */
+  const toolIcon = $derived(currentVariant()?.icon ?? TOOL_ICON[app.tool]);
+
+  /** Rotation de l'affichage du document actif, en degrés (sens horaire), arrondie au dixième. */
+  const viewAngle = $derived(Math.round((rotationOf(app.active?.camera) * 1800) / Math.PI) / 10);
+  function setViewAngle(degrees: number): void {
+    if (!Number.isFinite(degrees)) return;
+    app.setViewRotation(normalizeAngle((degrees * Math.PI) / 180));
+  }
   const HINT: Partial<Record<ToolId, string>> = {
     text: "Clic : écrire sur l'image · clic dans un texte : le modifier · Ctrl+Entrée : valider · Échap : annuler",
     eyedropper: "Clic ou glisser : prélever la couleur de premier plan · Alt avec le pinceau ou le pot de peinture : pipette temporaire",
@@ -45,13 +58,26 @@
   ];
 
   let gradientEditor = $state<{ x: number; y: number } | null>(null);
+
+  /**
+   * Option « Texte dynamique » de l'outil Texte : vaut pour les prochains cadres tracés, et pour le texte de paragraphe
+   * actif s'il y en a un (un seul état d'historique).
+   */
+  function setTextDynamic(on: boolean): void {
+    app.textDynamic = on;
+    const layer = app.activeLayer;
+    if (!layer?.text?.frame || !!layer.text.dynamic === on) return;
+    const text = { ...$state.snapshot(layer.text), ...(app.textEdit?.layerId === layer.id ? { content: app.textEdit.draft, runs: $state.snapshot(app.textEdit.runs) } : {}) };
+    const session = app.textEdit?.layerId === layer.id ? app.textEdit.id : `texte-dynamique-${layer.id}-${Date.now()}`;
+    editLatest(session, { op: "setText", id: layer.id, text: { ...text, dynamic: on ? (text.dynamic ?? { lines: 0, manual: false, gap: 0.12 }) : null }, session });
+  }
 </script>
 
 <div class="options">
   {#if app.quickMask}
     <button class="quick" title={t("Quitter le masque rapide (Q)")} onclick={() => (app.quickMask = false)}>{t("Masque rapide · peindre : sélectionner · Alt : désélectionner · Q : quitter")}</button>
   {/if}
-  <span class="tool"><Icon name={TOOL_ICON[app.tool]} /></span>
+  <span class="tool"><Icon name={toolIcon} /></span>
   <div class="rule"></div>
   {#if transformReadout}
     <span class="hint">{t("Transformation")}</span>
@@ -166,7 +192,7 @@
           gradientEditor = gradientEditor ? null : { x: rect.left, y: rect.bottom + 8 };
         }}
       >
-        <span style:background={toCss(resolveStops(app.gradient, app.foreground, app.background))}></span>
+        <span style:background={toCss(resolveStops(app.gradient, foregroundInMode(), backgroundInMode()))}></span>
       </button>
       <span class="hint">{t("Glisser sur l'image pour tracer le dégradé · Maj : pas de 45°")}</span>
     {:else}
@@ -190,7 +216,33 @@
     </span>
   {:else if app.tool === "move"}
     <label class="check"><input type="checkbox" bind:checked={app.autoSelect} /> {t("Sélection automatique")}</label>
+    <select class="auto-mode" bind:value={app.autoSelectMode} disabled={!app.autoSelect} aria-label={t("Sélection automatique")}>
+      <option value="layer">{t("Calque")}</option>
+      <option value="group">{t("Groupe")}</option>
+    </select>
     <span class="hint">{t("Glisser : déplacer · Maj + clic : ajouter un calque à la sélection (cadre commun) · Maj en glissant : contraindre à un axe · flèches : 1 px, Maj+flèches : 10 px")}</span>
+  {:else if app.tool === "rotateView"}
+    <label title={t("Angle de rotation de l'affichage, en degrés (sens horaire)")}>
+      {t("Angle de rotation")}
+      <input
+        type="number"
+        class="angle"
+        min="-180"
+        max="180"
+        step="1"
+        value={viewAngle}
+        disabled={!app.active?.camera}
+        onchange={(event) => setViewAngle(event.currentTarget.valueAsNumber)}
+        onkeydown={(event) => {
+          // Entrée valide et rend le clavier à l'image (Échap, lettres des outils…).
+          if (event.key !== "Enter") return;
+          setViewAngle(event.currentTarget.valueAsNumber);
+          event.currentTarget.blur();
+        }}
+      />°
+    </label>
+    <button onclick={() => runAction("view.resetRotation")} disabled={!app.active?.camera || viewAngle === 0}>{t("Réinitialiser la vue")}</button>
+    <span class="hint">{t("Glisser sur l'image pour faire tourner la vue (les pixels ne changent pas) · Maj : pas de 15° · Échap ou double-clic sur l'outil : 0°")}</span>
   {:else if app.tool === "wand"}
     <label>
       {t("Tolérance")}
@@ -210,6 +262,12 @@
     </label>
     <span class="hint">{t("Cliquer puis glisser à droite ou à gauche : régler la tolérance en direct · Maj+W : sélection rapide")}</span>
     <span class="hint">{t("Maj : ajouter · Alt : soustraire")}</span>
+  {:else if app.tool === "text"}
+    <label class="check" title={t("Glisser un cadre avec l'outil Texte : chaque ligne prend la taille qui remplit la largeur du cadre, les mots se répartissent pour en remplir la hauteur")}>
+      <input type="checkbox" checked={app.textDynamic} onchange={(event) => setTextDynamic(event.currentTarget.checked)} />
+      {t("Texte dynamique")}
+    </label>
+    <span class="hint">{t(app.textDynamic ? "Glisser : tracer le cadre du texte dynamique · ses poignées redistribuent les lignes · clic dans un texte : le modifier" : (HINT.text ?? ""))}</span>
   {:else}
     <span class="hint">{t(HINT[app.tool] ?? "")}</span>
   {/if}
@@ -244,7 +302,7 @@
     background: repeating-conic-gradient(#3a3a3e 0% 25%, #232326 0% 50%) 0 0 / 10px 10px;
   }
   .gradient:hover {
-    border-color: #fff;
+    border-color: var(--text-strong);
   }
   .gradient span {
     display: block;
@@ -324,7 +382,7 @@
   }
   .segmented button.on {
     background: var(--bg-active);
-    color: #fff;
+    color: var(--text-strong);
   }
   button {
     height: 26px;
@@ -351,5 +409,13 @@
   }
   button.primary:hover {
     color: var(--pill-text);
+  }
+  .auto-mode {
+    height: 24px;
+    margin-left: -4px;
+    padding: 0 6px;
+    border: 1px solid var(--border);
+    background: var(--bg-field);
+    color: var(--text);
   }
 </style>

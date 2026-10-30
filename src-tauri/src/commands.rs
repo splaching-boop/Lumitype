@@ -38,9 +38,21 @@ pub enum CommandError {
     Interrupted,
 }
 
-/// L'interface reçoit un message lisible, causes comprises.
+impl CommandError {
+    /// Code stable (voir `EngineError::code`) : `E-APP` pour les erreurs propres à la coque.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Engine(error) => error.code(),
+            Self::UnknownDocument(_) => "E-APP-001",
+            Self::Interrupted => "E-APP-002",
+        }
+    }
+}
+
+/// L'interface reçoit `{ code, message }` : un code stable, et un message lisible, causes comprises.
 impl Serialize for CommandError {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
         let mut message = self.to_string();
         let mut cause = self.source();
         while let Some(inner) = cause {
@@ -48,7 +60,10 @@ impl Serialize for CommandError {
             message.push_str(&inner.to_string());
             cause = inner.source();
         }
-        serializer.serialize_str(&message)
+        let mut out = serializer.serialize_struct("CommandError", 2)?;
+        out.serialize_field("code", self.code())?;
+        out.serialize_field("message", &message)?;
+        out.end()
     }
 }
 
@@ -74,20 +89,40 @@ pub struct LayerInfo {
     blend: BlendMode,
     locks: Locks,
     clipped: bool,
+    /// Comparaison (options de fusion), absente quand les plages sont entières.
+    blend_if: Option<engine::blend::BlendIf>,
     has_mask: bool,
     mask_enabled: bool,
+    /// Masque lié au calque (chaîne) : il le suit quand on déplace le calque.
+    mask_linked: bool,
     /// Présent pour un calque de texte : son contenu éditable.
     text: Option<TextData>,
     /// Présent pour un calque de réglage : son type et ses paramètres.
     adjustment: Option<Adjustment>,
     /// Présent pour un calque de forme : sa description réglable.
     shape: Option<ShapeData>,
+    /// Présent pour un calque de remplissage (couleur unie, dégradé, motif).
+    fill_layer: Option<engine::fill::FillContent>,
     /// Effets de calque (fx).
     effects: Vec<LayerEffect>,
     /// Couleur d'étiquette dans le panneau (`null` : aucune ; un dossier teinte ses enfants sans étiquette).
     label: Option<LayerLabel>,
     /// Présent pour un objet dynamique.
     smart: Option<SmartInfo>,
+    /// Présent pour un calque à filtres dynamiques.
+    filters: Option<FiltersInfo>,
+    /// Présent pour un plan de travail (groupe).
+    artboard: Option<engine::document::Artboard>,
+}
+
+/// Filtres dynamiques d'un calque, tels que le panneau Calques les liste.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FiltersInfo {
+    list: Vec<engine::smart_filters::SmartFilter>,
+    enabled: bool,
+    has_mask: bool,
+    mask_enabled: bool,
 }
 
 /// Objet dynamique, tel que l'interface l'affiche (panneau Calques, barre d'options de la transformation).
@@ -102,6 +137,8 @@ pub struct SmartInfo {
     path: Option<String>,
     /// Fichier lié introuvable à la dernière vérification : le dernier rendu reste affiché.
     missing: bool,
+    /// RAW « à redévelopper » : « Modifier le contenu » rouvre la fenêtre Développement RAW.
+    raw_develop: bool,
     /// Nom du contenu.
     name: String,
     /// Dimensions du contenu en pixels.
@@ -164,6 +201,15 @@ pub struct DocumentInfo {
     /// Présent si ce document est le contenu d'un objet dynamique ouvert par « Modifier le contenu » : Ctrl+S doit
     /// alors appeler `smart_content_commit` (et rien d'autre).
     smart_parent: Option<SmartParentInfo>,
+    /// Mode colorimétrique (Image › Mode) : `{ kind: "rgb" | "grayscale" | "bitmap" | "cmykWorkflow", profile? }`.
+    color_mode: engine::color_mode::ColorMode,
+    /// Styles de caractère du document.
+    text_styles: Vec<engine::text_styles::CharStyle>,
+    /// Format d'impression (fonds perdus, zone de sécurité, limite d'encrage), et format fini en pixels.
+    print: Option<engine::print::PrintSetup>,
+    trim: [u32; 4],
+    /// Temps de travail actif enregistré avec le projet, en secondes.
+    work_seconds: u64,
 }
 
 #[derive(Serialize, Default)]
@@ -218,6 +264,7 @@ fn describe_smart(layer: &engine::Layer, instances: &std::collections::HashMap<C
         linked: content.is_linked(),
         path,
         missing: content.missing(),
+        raw_develop: content.raw_develop().is_some(),
         name: content.name.clone(),
         width: content.width(),
         height: content.height(),
@@ -274,14 +321,24 @@ fn describe(id: DocId, entry: &OpenDocument, session: &Session) -> DocumentInfo 
                     blend: l.props.blend,
                     locks: l.props.locks,
                     clipped: l.props.clipped,
+                    blend_if: l.props.blend_if,
+                    artboard: l.artboard.clone(),
                     has_mask: l.mask.is_some(),
                     mask_enabled: l.mask.as_ref().is_some_and(|m| m.enabled),
+                    mask_linked: l.mask.as_ref().is_none_or(|m| m.linked),
                     text: l.text().cloned(),
                     adjustment: l.adjustment().cloned(),
                     shape: l.shape().cloned(),
+                    fill_layer: l.fill_content().cloned(),
                     effects: l.effects.clone(),
                     label: l.label,
                     smart: describe_smart(l, &instances),
+                    filters: l.filters.as_ref().map(|f| FiltersInfo {
+                        list: f.list.clone(),
+                        enabled: f.enabled,
+                        has_mask: f.mask.is_some(),
+                        mask_enabled: f.mask.as_ref().is_some_and(|m| m.enabled),
+                    }),
                 }
             })
             .collect(),
@@ -294,6 +351,11 @@ fn describe(id: DocId, entry: &OpenDocument, session: &Session) -> DocumentInfo 
         can_undo: session.can_undo(),
         can_redo: session.can_redo(),
         smart_parent: entry.smart_parent().map(|link| SmartParentInfo { doc_id: link.parent, content_id: link.content, name: link.name }),
+        color_mode: doc.color_mode(),
+        text_styles: doc.text_styles.clone(),
+        print: doc.print_setup(),
+        trim: doc.trim_rect(),
+        work_seconds: doc.work_seconds,
     }
 }
 
@@ -313,6 +375,42 @@ where
         None => work(),
     };
     tauri::async_runtime::spawn_blocking(run).await.map_err(|_| CommandError::Interrupted)?
+}
+
+/// Groupe de threads des préparations de fond (images du cache d'un groupe optimisé) : la moitié des cœurs au plus
+/// (au moins un), et jamais plus que le réglage « Cœurs utilisés ». Composées sur tous les cœurs, ces images
+/// affamaient l'affichage (tuiles, interface) : la fenêtre se figeait le temps de la préparation, surtout sur un
+/// portable. Ici elles avancent en fond, l'affichage garde des cœurs libres.
+fn background_pool() -> Arc<rayon::ThreadPool> {
+    static POOL: std::sync::OnceLock<Arc<rayon::ThreadPool>> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let available = std::thread::available_parallelism().map_or(1, usize::from);
+        let threads = (available / 2).max(1);
+        Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .thread_name(|i| format!("lumitype-fond-{i}"))
+                .build()
+                .unwrap_or_else(|_| rayon::ThreadPoolBuilder::new().num_threads(1).build().expect("groupe de threads de fond")),
+        )
+    })
+    .clone()
+}
+
+/// Comme `blocking`, dans le groupe de threads de fond (voir `background_pool`) : pour ce qui prépare l'avenir
+/// sans que l'utilisateur l'attende à l'instant.
+async fn background<T, F>(work: F) -> Result<T, CommandError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, CommandError> + Send + 'static,
+{
+    let workers = WORKERS.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+    let pool = match workers {
+        // Cœurs limités par l'utilisateur : le groupe réglé, s'il est plus petit.
+        Some(pool) if pool.current_num_threads() < background_pool().current_num_threads() => pool,
+        _ => background_pool(),
+    };
+    tauri::async_runtime::spawn_blocking(move || pool.install(work)).await.map_err(|_| CommandError::Interrupted)?
 }
 
 /// Montre la fenêtre principale et referme la bannière de lancement. Sans effet si c'est déjà fait.
@@ -457,10 +555,16 @@ fn recovery_path(app: &crate::rt::AppHandle, key: &str) -> Result<PathBuf, Comma
 /// bloquer. Les actions faites pendant l'écriture n'y figurent donc pas : elles seront dans la suivante.
 /// Avancement : événement `autosave-progress` (0 à 1).
 #[tauri::command]
-pub async fn autosave(app: crate::rt::AppHandle, state: State<'_, AppState>, doc_id: DocId, key: String) -> Result<(), CommandError> {
+pub async fn autosave(app: crate::rt::AppHandle, state: State<'_, AppState>, doc_id: DocId, key: String, work_seconds: Option<u64>) -> Result<(), CommandError> {
     use tauri::Emitter;
     let entry = lookup(state.inner(), doc_id)?;
     let path = recovery_path(&app, &key)?;
+    if let Some(seconds) = work_seconds {
+        entry.write().apply_silently(|doc| {
+            doc.work_seconds = seconds;
+            Ok(())
+        })?;
+    }
     let (history, project) = {
         let session = entry.read();
         (session.snapshot(), entry.project_path())
@@ -545,6 +649,13 @@ fn preview_path(app: &crate::rt::AppHandle, key: &str) -> Result<PathBuf, Comman
     Ok(previews_dir(app)?.join(format!("{key}.png")))
 }
 
+/// Copie du document prise sous le verrou puis relâchée aussitôt (les pixels sont partagés : la copie est
+/// instantanée). Les travaux longs (export, composition, analyse) se font sur cette copie, sans figer l'interface,
+/// qui garde la main sur le document pendant ce temps.
+fn snapshot(entry: &OpenDocument) -> Document {
+    entry.read().document().clone()
+}
+
 /// Enregistre un petit aperçu du document (320 px) sous la clé d'un fichier récent. Le document est copié sous
 /// verrou (instantané, les pixels sont partagés), l'aperçu est calculé ensuite sans rien bloquer.
 #[tauri::command]
@@ -558,6 +669,14 @@ pub async fn save_preview(app: crate::rt::AppHandle, state: State<'_, AppState>,
         Ok(())
     })
     .await
+}
+
+/// Image du document entier (PNG, côté le plus long ≤ `max_side`) : la planche de la fenêtre Plans de travail.
+#[tauri::command]
+pub async fn document_preview(state: State<'_, AppState>, doc_id: DocId, max_side: u32) -> Result<Response, CommandError> {
+    let entry = lookup(state.inner(), doc_id)?;
+    let doc = entry.read().document().clone();
+    blocking(move || Ok(Response::new(io::preview_png(&doc, max_side.clamp(64, 4096))?))).await
 }
 
 /// Aperçu d'un fichier récent (PNG), ou réponse vide s'il n'y en a pas.
@@ -576,8 +695,8 @@ pub fn delete_preview(app: crate::rt::AppHandle, key: String) -> Result<(), Comm
 
 // ------------------------------------------------------------------------- modèles
 
-/// Un modèle livré avec l'application : un projet `.graf` du dossier `modeles/`, copié dans les
-/// ressources à la construction (`export/sync-modeles.*`). Le nom vient du fichier, la description
+/// Un modèle livré avec l'application : un projet `.graf` du dossier `templates/`, copié dans les
+/// ressources à la construction (`packaging/lib/sync-templates.*`). Le nom vient du fichier, la description
 /// d'un `.txt` du même nom s'il existe.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -675,11 +794,16 @@ pub fn reveal_path(path: PathBuf) -> Result<(), CommandError> {
     if !path.exists() {
         return Err(EngineError::InvalidOperation("ce fichier n'existe plus à cet emplacement".into()).into());
     }
+    // Chemin absolu et propre : un chemin relatif ou mêlant « / » et « \\ » n'est pas compris par les explorateurs.
+    let path = std::fs::canonicalize(&path).map(|p| plain_path(&p)).unwrap_or(path);
     let folder = path.parent().unwrap_or(&path).to_path_buf();
     let spawned = {
         #[cfg(target_os = "windows")]
         {
-            std::process::Command::new("explorer").arg(format!("/select,{}", path.display())).spawn()
+            // `explorer /select,"C:\dossier\fichier"` : l'argument est passé tel quel (`raw_arg`) ; Rust le citerait en
+            // entier, et explorer, qui ne comprend alors plus « /select », ouvrirait le dossier Documents.
+            use std::os::windows::process::CommandExt;
+            std::process::Command::new("explorer").raw_arg(format!("/select,\"{}\"", path.display())).spawn()
         }
         #[cfg(target_os = "macos")]
         {
@@ -689,8 +813,10 @@ pub fn reveal_path(path: PathBuf) -> Result<(), CommandError> {
         {
             let shown = std::process::Command::new("dbus-send")
                 .args(["--session", "--print-reply", "--dest=org.freedesktop.FileManager1", "--type=method_call", "/org/freedesktop/FileManager1", "org.freedesktop.FileManager1.ShowItems"])
-                .arg(format!("array:string:file://{}", path.display()))
+                .arg(format!("array:string:{}", file_uri(&path)))
                 .arg("string:")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
                 .status()
                 .map(|status| status.success())
                 .unwrap_or(false);
@@ -703,10 +829,140 @@ pub fn reveal_path(path: PathBuf) -> Result<(), CommandError> {
     spawned.map(|_| ()).map_err(|error| EngineError::InvalidOperation(format!("impossible d'ouvrir {} : {error}", folder.display())).into())
 }
 
+/// Chemin sans le préfixe `\\?\` que `canonicalize` ajoute sous Windows (l'explorateur ne le comprend pas).
+pub(crate) fn plain_path(path: &std::path::Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    match text.strip_prefix(r"\\?\UNC\") {
+        Some(rest) => PathBuf::from(format!(r"\\{rest}")),
+        None => PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(&text).to_string()),
+    }
+}
+
+/// Adresse `file://` d'un chemin, caractères spéciaux encodés (espaces, accents, `#`…).
+#[cfg_attr(not(all(unix, not(target_os = "macos"))), allow(dead_code))]
+fn file_uri(path: &std::path::Path) -> String {
+    let mut out = String::from("file://");
+    for byte in path.to_string_lossy().bytes() {
+        if byte.is_ascii_alphanumeric() || b"/-_.~".contains(&byte) {
+            out.push(char::from(byte));
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+/// Adresse du dépôt du projet : les seuls liens web que l'interface peut faire ouvrir (rapport de bug…).
+const PROJECT_URL: &str = "https://github.com/splaching-boop/Lumitype/";
+
+/// Confie un lien ou un dossier au système (navigateur, gestionnaire de fichiers).
+fn open_with_system(target: &std::ffi::OsStr) -> std::io::Result<()> {
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        // `start` passe par cmd, qui interpréterait les `&` d'une adresse : le gestionnaire d'URL de Windows, non.
+        let mut command = std::process::Command::new("rundll32");
+        command.arg("url.dll,FileProtocolHandler");
+        command
+    };
+    #[cfg(target_os = "macos")]
+    let mut command = std::process::Command::new("open");
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut command = std::process::Command::new("xdg-open");
+    command.arg(target).spawn().map(|_| ())
+}
+
+/// Ouvre une page du dépôt du projet dans le navigateur (Aide > Signaler un bug). Toute autre adresse est
+/// refusée : l'interface ne peut pas s'en servir pour lancer n'importe quel programme ou site.
+#[tauri::command]
+pub fn open_project_link(url: String) -> Result<(), CommandError> {
+    if !url.starts_with(PROJECT_URL) || url.chars().any(char::is_control) {
+        return Err(EngineError::coded("E-APP-003", "seules les pages du projet Lumitype peuvent être ouvertes").into());
+    }
+    open_with_system(url.as_ref()).map_err(|error| EngineError::coded("E-APP-004", format!("impossible d'ouvrir le navigateur : {error}")).into())
+}
+
+/// Ce qu'un rapport de bug joint automatiquement : système, architecture, dossier des journaux.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BugReportContext {
+    os: String,
+    arch: &'static str,
+    logs_dir: String,
+}
+
+/// Nom lisible du système : sous Linux, la distribution (`/etc/os-release`), sinon le nom de la plateforme.
+fn os_name() -> String {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    if let Ok(release) = std::fs::read_to_string("/etc/os-release") {
+        if let Some(name) = release.lines().find_map(|line| line.strip_prefix("PRETTY_NAME=")) {
+            return format!("Linux ({})", name.trim_matches('"'));
+        }
+    }
+    match std::env::consts::OS {
+        "windows" => "Windows".into(),
+        "macos" => "macOS".into(),
+        other => other.into(),
+    }
+}
+
+/// Dossier des journaux : celui du cache de l'application, où Chromium écrit `chromium.log`.
+fn logs_dir(app: &crate::rt::AppHandle) -> Result<PathBuf, CommandError> {
+    use tauri::Manager;
+    let dir = app.path().app_cache_dir().map_err(|e| EngineError::coded("E-APP-005", e.to_string()))?;
+    std::fs::create_dir_all(&dir).map_err(EngineError::io(&dir))?;
+    Ok(dir)
+}
+
+#[tauri::command]
+pub fn bug_report_context(app: crate::rt::AppHandle) -> Result<BugReportContext, CommandError> {
+    Ok(BugReportContext { os: os_name(), arch: std::env::consts::ARCH, logs_dir: logs_dir(&app)?.to_string_lossy().into_owned() })
+}
+
+/// Aide > Ouvrir le dossier des journaux.
+#[tauri::command]
+pub fn open_logs_dir(app: crate::rt::AppHandle) -> Result<(), CommandError> {
+    let dir = logs_dir(&app)?;
+    open_with_system(dir.as_os_str()).map_err(|error| EngineError::coded("E-APP-004", format!("impossible d'ouvrir {} : {error}", dir.display())).into())
+}
+
 /// Contenu brut d'un fichier choisi par l'utilisateur (images AVIF : décodées par la webview, qui sait les lire).
 #[tauri::command]
 pub async fn read_file_bytes(path: PathBuf) -> Result<Response, CommandError> {
     blocking(move || Ok(Response::new(std::fs::read(&path).map_err(|e| EngineError::InvalidOperation(format!("{} : {e}", path.display())))?))).await
+}
+
+/// Taille maximale d'un fichier écrit par [`write_json_file`] : un export de formats personnels en fait quelques Ko.
+pub const MAX_JSON_FILE_BYTES: usize = 1024 * 1024;
+
+/// Écrit un fichier JSON à l'endroit choisi par l'utilisateur dans une fenêtre d'enregistrement (Formats › Exporter…
+/// les catégories personnelles). Commande volontairement étroite, pour que l'interface ne puisse pas s'en servir
+/// pour écrire n'importe quoi n'importe où : chemin absolu d'un fichier (pas d'un dossier), extension `.json`
+/// obligatoire (toute autre est refusée), contenu JSON valide, 1 Mo au plus. Écriture atomique (fichier temporaire
+/// voisin, puis renommage) : un fichier remplacé n'est jamais laissé à moitié écrit.
+#[tauri::command]
+pub async fn write_json_file(path: PathBuf, content: String) -> Result<(), CommandError> {
+    blocking(move || Ok(write_json_file_at(&path, &content)?)).await
+}
+
+fn write_json_file_at(path: &Path, content: &str) -> Result<(), EngineError> {
+    let refuse = |why: String| EngineError::coded("E-APP-006", why);
+    let shown = path.display();
+    if !path.is_absolute() || path.file_name().is_none() || path.is_dir() {
+        return Err(refuse(format!("{shown} : un fichier choisi dans la fenêtre d'enregistrement est attendu")));
+    }
+    if !path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("json")) {
+        return Err(refuse(format!("{shown} : seuls les fichiers .json peuvent être écrits ici")));
+    }
+    if content.len() > MAX_JSON_FILE_BYTES {
+        return Err(refuse(format!("fichier trop gros ({} Ko, 1024 Ko au plus)", content.len().div_ceil(1024))));
+    }
+    serde_json::from_str::<serde::de::IgnoredAny>(content).map_err(|e| refuse(format!("contenu JSON invalide : {e}")))?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, content).map_err(EngineError::io(&tmp))?;
+    std::fs::rename(&tmp, path).map_err(|error| {
+        let _ = std::fs::remove_file(&tmp);
+        EngineError::io(path)(error)
+    })
 }
 
 /// Le dossier existe-t-il encore ? (dossier d'enregistrement par défaut, sur un disque peut-être débranché)
@@ -971,11 +1227,17 @@ pub async fn new_document(
     height: u32,
     dpi: f32,
     transparent: bool,
+    print: Option<engine::print::PrintSetup>,
+    cmyk: Option<engine::cmyk::CmykSpace>,
 ) -> Result<DocumentInfo, CommandError> {
     let state = state.inner().clone();
     blocking(move || {
         let background = if transparent { Background::Transparent } else { Background::White };
-        let document = Document::with_background(name, width, height, dpi, background)?;
+        // Document d'impression : `width` × `height` est le format fini, les fonds perdus s'y ajoutent.
+        let document = match (print, cmyk) {
+            (None, None) => Document::with_background(name, width, height, dpi, background)?,
+            (print, cmyk) => Document::new_print(name, width, height, dpi, background, print.unwrap_or(engine::print::PrintSetup { bleed_mm: 0.0, safe_mm: 0.0, ink_limit: 0 }), cmyk)?,
+        };
         let (id, entry) = state.insert(document, "Nouveau", None);
         let info = describe(id, &entry, &entry.read());
         Ok(info)
@@ -1068,20 +1330,10 @@ pub async fn import_dropped(state: State<'_, AppState>, request: tauri::ipc::Req
 /// puis importée comme un fichier déposé (calque du document `doc_id`, ou nouveau document).
 #[tauri::command]
 pub async fn import_url(state: State<'_, AppState>, url: String, doc_id: Option<DocId>, above: Option<LayerId>) -> Result<EditResult, CommandError> {
-    const MAX_BYTES: u64 = 80 * 1024 * 1024;
     let state = state.inner().clone();
     blocking(move || {
-        if !(url.starts_with("https://") || url.starts_with("http://")) {
-            return Err(EngineError::InvalidOperation("seules les adresses http(s) peuvent être importées".into()).into());
-        }
-        let failed = |e: &dyn std::fmt::Display| EngineError::InvalidOperation(format!("téléchargement impossible : {e}"));
-        let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(20)).build();
-        let response = agent.get(&url).call().map_err(|e| failed(&e))?;
-        let mut bytes = Vec::new();
-        std::io::Read::read_to_end(&mut std::io::Read::take(response.into_reader(), MAX_BYTES), &mut bytes).map_err(|e| failed(&e))?;
-        // Nom du calque : dernier segment de l'adresse, sans ses paramètres.
-        let last = url.split(['?', '#']).next().unwrap_or_default().rsplit('/').next().unwrap_or_default();
-        let name = PathBuf::from(if last.is_empty() { "Image".to_owned() } else { percent_decode(last) });
+        // Téléchargement partagé avec My ref (net.rs). Nom du calque : dernier segment de l'adresse.
+        let crate::net::Downloaded { bytes, name } = crate::net::download_image(&url).map_err(EngineError::InvalidOperation)?;
         match doc_id {
             Some(doc_id) => {
                 let entry = lookup(&state, doc_id)?;
@@ -1100,6 +1352,301 @@ pub async fn import_url(state: State<'_, AppState>, url: String, doc_id: Option<
         }
     })
     .await
+}
+
+// ------------------------------------------------------------ développement RAW
+
+/// RAW ouverts dans la fenêtre « Développement RAW », par identifiant : lumière linéaire de l'appareil, gardée en
+/// mémoire le temps du dialogue (`raw_close` la libère, `raw_finish` aussi).
+static RAW_SESSIONS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<u32, Arc<engine::raw::RawSession>>>> =
+    std::sync::LazyLock::new(Default::default);
+static NEXT_RAW: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
+fn raw_sessions() -> std::sync::MutexGuard<'static, std::collections::HashMap<u32, Arc<engine::raw::RawSession>>> {
+    RAW_SESSIONS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn raw_session(id: u32) -> Result<Arc<engine::raw::RawSession>, CommandError> {
+    raw_sessions().get(&id).cloned().ok_or_else(|| EngineError::InvalidOperation(format!("développement RAW {id} introuvable (fenêtre déjà fermée)")).into())
+}
+
+/// RAW ouvert pour le développement : identifiant de session, en-tête (appareil, prise de vue, balance telle quelle et
+/// automatique) et taille de l'aperçu.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RawOpened {
+    id: u32,
+    info: engine::raw::RawInfo,
+    preview_width: u32,
+    preview_height: u32,
+}
+
+fn raw_register(bytes: Arc<Vec<u8>>, origin: &Path) -> Result<RawOpened, CommandError> {
+    let session = engine::raw::RawSession::open(bytes, origin)?;
+    let (preview_width, preview_height) = session.preview_size();
+    let info = session.info.clone();
+    let id = NEXT_RAW.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    raw_sessions().insert(id, Arc::new(session));
+    Ok(RawOpened { id, info, preview_width, preview_height })
+}
+
+/// Décode le capteur d'un RAW (une fois) pour la fenêtre « Développement RAW ».
+#[tauri::command]
+pub async fn raw_open(path: PathBuf) -> Result<RawOpened, CommandError> {
+    blocking(move || {
+        let bytes = std::fs::read(&path).map_err(EngineError::io(&path))?;
+        raw_register(Arc::new(bytes), &path)
+    })
+    .await
+}
+
+/// Comme `raw_open`, pour un fichier déposé dont la webview ne connaît que le contenu (corps binaire) et le nom
+/// (en-tête `x-file-name`, encodé URL).
+#[tauri::command]
+pub async fn raw_open_dropped(request: tauri::ipc::Request<'_>) -> Result<RawOpened, CommandError> {
+    let name = request.headers().get("x-file-name").and_then(|v| v.to_str().ok()).map_or_else(|| "Sans titre".into(), percent_decode);
+    let tauri::ipc::InvokeBody::Raw(bytes) = request.body() else {
+        return Err(EngineError::InvalidOperation("contenu du fichier manquant".into()).into());
+    };
+    let bytes = bytes.clone();
+    blocking(move || raw_register(Arc::new(bytes.to_vec()), Path::new(&name))).await
+}
+
+/// Aperçu réduit développé avec `params` : 8 octets (largeur, hauteur en u32), l'histogramme RVB (3 x 256 u32,
+/// rouge puis vert puis bleu), puis le JPEG. `clip` : zones écrêtées à la place de l'image (Alt pendant un réglage).
+#[tauri::command]
+pub async fn raw_preview(id: u32, params: engine::raw::RawParams, clip: Option<engine::raw::ClipView>) -> Result<Response, CommandError> {
+    let session = raw_session(id)?;
+    blocking(move || {
+        let developed = session.develop_preview(&params, clip.unwrap_or_default());
+        let jpeg = developed.to_jpeg(88)?;
+        let mut out = Vec::with_capacity(8 + 768 * 4 + jpeg.len());
+        out.extend_from_slice(&developed.width.to_le_bytes());
+        out.extend_from_slice(&developed.height.to_le_bytes());
+        for count in &developed.histogram {
+            out.extend_from_slice(&count.to_le_bytes());
+        }
+        out.extend_from_slice(&jpeg);
+        Ok(Response::new(out))
+    })
+    .await
+}
+
+/// Zoom de la fenêtre : zone `(x, y, width, height)` de l'image pleine taille développée avec `params`, réduite de
+/// `factor` (1 = pixels réels). 16 octets (x, y, largeur, hauteur de la zone couverte, en u32 pixels pleine taille),
+/// puis le JPEG.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn raw_region(id: u32, params: engine::raw::RawParams, clip: Option<engine::raw::ClipView>, x: u32, y: u32, width: u32, height: u32, factor: u32) -> Result<Response, CommandError> {
+    let session = raw_session(id)?;
+    blocking(move || {
+        let (region, developed) = session.develop_region(&params, clip.unwrap_or_default(), x, y, width, height, factor);
+        let jpeg = developed.to_jpeg(92)?;
+        let mut out = Vec::with_capacity(16 + jpeg.len());
+        for v in [region.x, region.y, region.width, region.height] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out.extend_from_slice(&jpeg);
+        Ok(Response::new(out))
+    })
+    .await
+}
+
+/// Pipette de la balance des blancs : température et teinte qui rendent neutre le point `(x, y)` (0 à 1 sur l'image).
+#[tauri::command]
+pub async fn raw_pick_white(id: u32, x: f32, y: f32) -> Result<Option<(f32, f32)>, CommandError> {
+    let session = raw_session(id)?;
+    blocking(move || Ok(session.pick_white(x, y))).await
+}
+
+/// Bouton « Auto » de la tonalité, à la balance des blancs de `params`.
+#[tauri::command]
+pub async fn raw_auto_tone(id: u32, params: engine::raw::RawParams) -> Result<engine::raw::AutoTone, CommandError> {
+    let session = raw_session(id)?;
+    blocking(move || Ok(session.auto_tone(&params))).await
+}
+
+/// Ce que devient le RAW développé.
+#[derive(Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum RawFinish {
+    /// Nouveau document (Ouvrir).
+    Open,
+    /// Calque du document `doc_id` (Importer comme calque, dépôt sur un document).
+    Layer,
+    /// Objet dynamique incorporé du document `doc_id` (Placer) : son contenu est l'image développée.
+    Smart,
+}
+
+/// Développe le RAW en pleine taille et en fait un document, un calque ou un objet dynamique. La session est ensuite
+/// libérée.
+///
+/// `keep_raw` (case « redévelopper plus tard ») : le RAW devient un objet dynamique qui garde le fichier et ses réglages
+/// — seul calque d'un nouveau document (`Open`), ou placé dans le document `doc_id` (`Layer`). `Smart` (Placer) le
+/// garde toujours.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn raw_finish(
+    state: State<'_, AppState>,
+    id: u32,
+    params: engine::raw::RawParams,
+    mode: RawFinish,
+    doc_id: Option<DocId>,
+    above: Option<LayerId>,
+    keep_raw: Option<bool>,
+) -> Result<EditResult, CommandError> {
+    let session = raw_session(id)?;
+    let state = state.inner().clone();
+    let result = blocking(move || {
+        let developed = session.develop_full(&params);
+        let origin = PathBuf::from(&session.info.file_name);
+        // Opaque : RGBA droit et prémultiplié se confondent.
+        let rgba = developed.to_rgba();
+        let (width, height) = (developed.width, developed.height);
+        drop(developed);
+        let keep_raw = keep_raw.unwrap_or(false) || mode == RawFinish::Smart;
+        let raw_content = || -> Result<smart::SmartContent, EngineError> {
+            let document = io::document_from_premultiplied(width, height, &rgba, &origin)?;
+            Ok(smart::content_from_raw(&session.info.file_name, Arc::clone(session.original()), params, document))
+        };
+        if keep_raw {
+            let content = raw_content()?;
+            return match (mode, doc_id) {
+                (RawFinish::Open, _) | (_, None) => {
+                    // Nouveau document à la taille de l'image, dont l'unique calque est l'objet dynamique (à 100 %).
+                    let mut document = Document::new(smart::name_of(&origin), width, height, 72.0)?;
+                    document.place_smart_object(content, None, 0)?;
+                    let (id, entry) = state.insert(document, "Ouvrir", None);
+                    let document = describe(id, &entry, &entry.read());
+                    Ok(EditResult { document, dirty: DirtyInfo::default() })
+                }
+                (_, Some(doc_id)) => {
+                    let entry = lookup(&state, doc_id)?;
+                    let mut session = entry.write();
+                    let (_, dirty) = session.apply("Placer un objet dynamique", None, |doc| {
+                        let (parent, index) = slot(doc, above)?;
+                        doc.place_smart_object(content, parent, index)
+                    })?;
+                    Ok(EditResult { document: describe(doc_id, &entry, &session), dirty: dirty.into() })
+                }
+            };
+        }
+        match (mode, doc_id) {
+            (RawFinish::Open, _) | (_, None) => {
+                let document = io::document_from_premultiplied(width, height, &rgba, &origin)?;
+                let (id, entry) = state.insert(document, "Ouvrir", None);
+                let document = describe(id, &entry, &entry.read());
+                Ok(EditResult { document, dirty: DirtyInfo::default() })
+            }
+            // Calque de pixels (le cas `Smart` a été traité plus haut : il garde toujours le RAW).
+            (_, Some(doc_id)) => {
+                let entry = lookup(&state, doc_id)?;
+                let mut session = entry.write();
+                let (_, dirty) = session.apply("Importer un calque", None, |doc| {
+                    let (parent, index) = slot(doc, above)?;
+                    io::layer_from_premultiplied(doc, width, height, &rgba, &origin, parent, index)
+                })?;
+                Ok(EditResult { document: describe(doc_id, &entry, &session), dirty: dirty.into() })
+            }
+        }
+    })
+    .await?;
+    raw_sessions().remove(&id);
+    Ok(result)
+}
+
+/// RAW d'un objet dynamique « à redévelopper » rouvert dans la fenêtre de développement (« Modifier le contenu ») :
+/// session neuve depuis le fichier gardé dans le contenu, et ses réglages.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RawReopened {
+    opened: RawOpened,
+    params: engine::raw::RawParams,
+}
+
+#[tauri::command]
+pub async fn raw_open_smart(state: State<'_, AppState>, doc_id: DocId, layer: LayerId) -> Result<RawReopened, CommandError> {
+    let entry = lookup(state.inner(), doc_id)?;
+    blocking(move || {
+        let content = entry.read().document().layer(layer)?.smart().cloned().ok_or_else(|| EngineError::InvalidOperation("ce calque n'est pas un objet dynamique".into()))?;
+        let (Some(original), Some(params)) = (content.original(), content.raw_develop()) else {
+            return Err(EngineError::InvalidOperation("cet objet dynamique ne contient pas de RAW à redévelopper".into()).into());
+        };
+        let opened = raw_register(Arc::clone(&original.bytes), Path::new(&original.name))?;
+        Ok(RawReopened { opened, params: *params })
+    })
+    .await
+}
+
+/// Validation de la fenêtre rouverte sur un objet dynamique RAW : le RAW est redéveloppé en pleine taille et remplace
+/// le contenu de toutes les instances, en une étape d'historique « Développer le RAW » (annulable). La session est
+/// ensuite libérée.
+#[tauri::command]
+pub async fn raw_redevelop(state: State<'_, AppState>, id: u32, params: engine::raw::RawParams, doc_id: DocId, layer: LayerId) -> Result<EditResult, CommandError> {
+    let session = raw_session(id)?;
+    let entry = lookup(state.inner(), doc_id)?;
+    let result = blocking(move || {
+        let current = entry.read().document().layer(layer)?.smart().cloned().ok_or_else(|| EngineError::InvalidOperation("ce calque n'est plus un objet dynamique".into()))?;
+        let developed = session.develop_full(&params);
+        let origin = PathBuf::from(&session.info.file_name);
+        let document = io::document_from_premultiplied(developed.width, developed.height, &developed.to_rgba(), &origin)?;
+        drop(developed);
+        let content = current.redeveloped(document, params)?;
+        let mut session = entry.write();
+        let (_, dirty) = session.apply("Développer le RAW", None, |doc| doc.update_smart_content(Arc::new(content), SmartFit::Centre).map(|_| ()))?;
+        Ok(EditResult { document: describe(doc_id, &entry, &session), dirty: dirty.into() })
+    })
+    .await?;
+    raw_sessions().remove(&id);
+    Ok(result)
+}
+
+/// Filtre › Filtre Camera Raw : la fenêtre de développement s'ouvre sur les pixels du calque `layer` (son contenu, à
+/// pleine taille) au lieu d'un capteur. Les curseurs se règlent sur l'aperçu de cette session (`raw_preview`,
+/// `raw_pick_white`, `raw_auto_tone`) ; la validation passe ensuite par l'opération ordinaire `applyFilter` (filtre
+/// `cameraRaw`) : une étape d'historique, limitée à la sélection, comme les autres filtres. `raw_close` libère la session.
+#[tauri::command]
+pub async fn raw_open_layer(state: State<'_, AppState>, doc_id: DocId, layer: LayerId, upto: Option<usize>) -> Result<RawOpened, CommandError> {
+    let entry = lookup(state.inner(), doc_id)?;
+    blocking(move || {
+        let (name, rgba, w, h) = {
+            let session = entry.read();
+            let target = session.document().layer(layer)?;
+            if target.pixels().is_none() {
+                return Err(EngineError::InvalidOperation("un groupe ou un calque de réglage ne se filtre pas".into()).into());
+            }
+            // Filtres dynamiques : la fenêtre part de ce que reçoit le filtre (rouvert : `upto` ; nouveau : toute la liste).
+            let pixels = session.document().filter_input(layer, upto)?;
+            let pixels = &pixels;
+            let Some((x0, y0, x1, y1)) = pixels.pixel_bounds(|px| px[3] > 0) else {
+                return Err(EngineError::InvalidOperation("ce calque est vide".into()).into());
+            };
+            let (w, h) = ((x1 - x0) as u32, (y1 - y0) as u32);
+            (target.props.name.clone(), pixels.read_rect(x0, y0, w, h), w, h)
+        };
+        let raw = engine::raw::RawSession::from_layer(&name, w, h, &rgba)?;
+        drop(rgba);
+        let (preview_width, preview_height) = raw.preview_size();
+        let info = raw.info.clone();
+        let id = NEXT_RAW.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        raw_sessions().insert(id, Arc::new(raw));
+        Ok(RawOpened { id, info, preview_width, preview_height })
+    })
+    .await
+}
+
+/// Ferme la fenêtre de développement (Annuler, ou après `raw_finish`) : la mémoire du RAW est libérée.
+#[tauri::command]
+pub fn raw_close(id: u32) {
+    raw_sessions().remove(&id);
+}
+
+/// Libère tous les RAW en cours de développement. Appelée au chargement de l'interface (ui/src/main.ts) : une webview
+/// rechargée (ou relancée après une panne) a perdu ses fenêtres de développement, leurs sessions ne seraient sinon
+/// jamais fermées et garderaient en mémoire la lumière de leur capteur (plusieurs centaines de Mo chacune).
+#[tauri::command]
+pub fn raw_close_all() {
+    raw_sessions().clear();
 }
 
 /// PNG des derniers pixels copiés, pour le presse-papiers du système. Vide si rien n'a été copié.
@@ -1131,12 +1678,64 @@ pub async fn stroke_begin_selection(state: State<'_, AppState>, doc_id: DocId, b
 pub async fn export_preview(state: State<'_, AppState>, doc_id: DocId, options: io::ExportOptions) -> Result<Response, CommandError> {
     let entry = lookup(state.inner(), doc_id)?;
     blocking(move || {
-        let encoded = io::export_encoded(entry.read().document(), options)?;
+        let encoded = io::export_encoded(&snapshot(&entry), options)?;
         let mut body = Vec::with_capacity(16 + encoded.display.len());
         body.extend_from_slice(&encoded.size.to_le_bytes());
         body.extend_from_slice(&encoded.width.to_le_bytes());
         body.extend_from_slice(&encoded.height.to_le_bytes());
         body.extend_from_slice(&encoded.display);
+        Ok(Response::new(body))
+    })
+    .await
+}
+
+/// Alerte d'encrage et vérification : zones de l'image aplatie au-delà de `limit` %, séparée dans `space`.
+#[tauri::command]
+pub async fn ink_report(state: State<'_, AppState>, doc_id: DocId, limit: u16, space: engine::cmyk::CmykSpace) -> Result<engine::print::InkReport, CommandError> {
+    let entry = lookup(state.inner(), doc_id)?;
+    background(move || Ok(engine::print::ink_report(&snapshot(&entry), space, limit.clamp(1, 400))?)).await
+}
+
+/// Vérification avant impression : encrage, fonds perdus remplis, textes hors de la zone de sécurité.
+#[tauri::command]
+pub async fn preflight(state: State<'_, AppState>, doc_id: DocId, limit: u16, space: engine::cmyk::CmykSpace) -> Result<engine::print::Preflight, CommandError> {
+    let entry = lookup(state.inner(), doc_id)?;
+    background(move || Ok(engine::print::preflight(&snapshot(&entry), space, limit.clamp(1, 400))?)).await
+}
+
+/// Encres d'une couleur sRGB dans `space` (pipette d'encrage) : C, M, J, N de 0 à 255.
+#[tauri::command]
+pub async fn cmyk_of(space: engine::cmyk::CmykSpace, color: [u8; 3]) -> Result<[u8; 4], CommandError> {
+    blocking(move || Ok(engine::cmyk::rgb_to_cmyk_pixel(space, color[0], color[1], color[2])?)).await
+}
+
+/// Séparations (Affichage › Impression › Séparations) : l'image aplatie réduite (côté long ≤ `max_side`), séparée
+/// dans `space`, une image par plaque teintée de son encre sur papier blanc. Réponse : largeur et hauteur (u32
+/// petit-boutistes), puis quatre fois (longueur u32, PNG) dans l'ordre C, M, J, N.
+#[tauri::command]
+pub async fn separations(state: State<'_, AppState>, doc_id: DocId, space: engine::cmyk::CmykSpace, max_side: u32) -> Result<Response, CommandError> {
+    let entry = lookup(state.inner(), doc_id)?;
+    background(move || {
+        let doc = snapshot(&entry);
+        let scale = (max_side.max(16) as f32 / doc.width().max(doc.height()) as f32).min(1.0);
+        let flat = io::flatten_for_export(&doc, scale)?;
+        let inks = engine::cmyk::rgba_to_cmyk(&flat.rgba, space)?;
+        const TINTS: [[u8; 3]; 4] = [[0, 174, 239], [236, 0, 140], [255, 242, 0], [35, 31, 32]];
+        let mut body = Vec::new();
+        body.extend_from_slice(&flat.width.to_le_bytes());
+        body.extend_from_slice(&flat.height.to_le_bytes());
+        for (plate, tint) in TINTS.iter().enumerate() {
+            let rgb: Vec<u8> = inks
+                .chunks_exact(4)
+                .flat_map(|px| {
+                    let a = u32::from(px[plate]);
+                    tint.map(|c| ((255 * (255 - a) + u32::from(c) * a + 127) / 255) as u8)
+                })
+                .collect();
+            let png = engine::png_parallel::encode(flat.width, flat.height, &rgb, 3, 3)?;
+            body.extend_from_slice(&(png.len() as u32).to_le_bytes());
+            body.extend_from_slice(&png);
+        }
         Ok(Response::new(body))
     })
     .await
@@ -1150,25 +1749,45 @@ struct ExportCache {
     doc_id: DocId,
     revision: u64,
     scale: u32,
+    artboard: Option<LayerId>,
     flat: Arc<io::Flattened>,
 }
 static EXPORT_CACHE: std::sync::Mutex<Option<ExportCache>> = std::sync::Mutex::new(None);
 
-fn export_flattened(entry: &OpenDocument, doc_id: DocId, scale: f32) -> Result<Arc<io::Flattened>, EngineError> {
+/// Une seule composition à la fois : la vue d'ensemble et le poids exact, demandés coup sur coup par la fenêtre
+/// d'export, composaient chacun l'image ; le second attend désormais le premier et trouve le résultat en cache.
+/// Verrou distinct du cache lui-même, qui n'est tenu qu'un instant (`export_preview_release` ne doit pas attendre
+/// une composition).
+static EXPORT_BUILD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn export_flattened(entry: &OpenDocument, doc_id: DocId, options: &io::ExportOptions) -> Result<Arc<io::Flattened>, EngineError> {
+    let scale = options.scale;
+    let artboard = options.artboard;
     let key = (scale.clamp(0.01, 8.0) * 10_000.0).round() as u32;
+    let _building = EXPORT_BUILD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let (revision, document) = {
         let session = entry.read();
         (session.revision(), session.document().clone())
     };
     {
         let cache = EXPORT_CACHE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(hit) = cache.as_ref().filter(|c| c.doc_id == doc_id && c.revision == revision && c.scale == key) {
+        if let Some(hit) = cache.as_ref().filter(|c| c.doc_id == doc_id && c.revision == revision && c.scale == key && c.artboard == artboard) {
             return Ok(Arc::clone(&hit.flat));
         }
     }
-    let flat = Arc::new(io::flatten_for_export(&document, scale)?);
-    *EXPORT_CACHE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ExportCache { doc_id, revision, scale: key, flat: Arc::clone(&flat) });
+    let view = io::export_view(&document, options)?;
+    let flat = Arc::new(io::flatten_for_export(&view, scale)?);
+    *EXPORT_CACHE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ExportCache { doc_id, revision, scale: key, artboard, flat: Arc::clone(&flat) });
     Ok(flat)
+}
+
+/// Code du format de l'image d'aperçu, pour l'interface : 0 = PNG, 1 = JPEG, 2 = WebP.
+fn preview_kind(kind: &str) -> u8 {
+    match kind {
+        "jpeg" => 1,
+        "webp" => 2,
+        _ => 0,
+    }
 }
 
 /// Libère l'image gardée pour l'aperçu (fenêtre d'export fermée).
@@ -1178,20 +1797,21 @@ pub fn export_preview_release() {
 }
 
 /// Vue d'ensemble de l'export et poids estimé. Réponse : taille du fichier (u32 × 2), taille de la vue (u32 × 2),
-/// poids (u64), poids exact ? (u8), 0 = PNG / 1 = JPEG (u8), puis l'image encodée. Tout en petit-boutiste.
+/// poids (u64), poids exact ? (u8), 0 = PNG / 1 = JPEG / 2 = WebP (u8), puis l'image encodée. Tout en petit-boutiste.
+/// En CMJN (PDF, TIFF, JPEG), l'image montrée est l'épreuve écran du profil choisi.
 #[tauri::command]
 pub async fn export_overview(state: State<'_, AppState>, doc_id: DocId, options: io::ExportOptions, max_side: u32) -> Result<Response, CommandError> {
     let entry = lookup(state.inner(), doc_id)?;
     blocking(move || {
-        let flat = export_flattened(&entry, doc_id, options.scale)?;
-        let (w, h, bytes, kind) = flat.overview(max_side.clamp(64, 4096), options.format, options.quality, options.lossless)?;
-        let (size, exact) = flat.estimate_size(options.format, options.quality, options.lossless, options.metadata.as_ref())?;
+        let flat = export_flattened(&entry, doc_id, &options)?;
+        let (w, h, bytes, kind) = flat.overview(max_side.clamp(64, 4096), &options)?;
+        let (size, exact) = flat.estimate_size(&options)?;
         let mut body = Vec::with_capacity(26 + bytes.len());
         for value in [flat.width, flat.height, w, h] {
             body.extend_from_slice(&value.to_le_bytes());
         }
         body.extend_from_slice(&size.to_le_bytes());
-        body.extend_from_slice(&[u8::from(exact), u8::from(kind == "jpeg")]);
+        body.extend_from_slice(&[u8::from(exact), preview_kind(kind)]);
         body.extend_from_slice(&bytes);
         Ok(Response::new(body))
     })
@@ -1199,17 +1819,17 @@ pub async fn export_overview(state: State<'_, AppState>, doc_id: DocId, options:
 }
 
 /// Zone visible de l'aperçu, à pleine résolution et encodée comme dans le fichier. `rect` en pixels du fichier.
-/// Réponse : largeur et hauteur (u32 × 2), 0 = PNG / 1 = JPEG (u8), puis l'image.
+/// Réponse : largeur et hauteur (u32 × 2), 0 = PNG / 1 = JPEG / 2 = WebP (u8), puis l'image.
 #[tauri::command]
 pub async fn export_region(state: State<'_, AppState>, doc_id: DocId, options: io::ExportOptions, rect: [u32; 4]) -> Result<Response, CommandError> {
     let entry = lookup(state.inner(), doc_id)?;
     blocking(move || {
-        let flat = export_flattened(&entry, doc_id, options.scale)?;
-        let (w, h, bytes, kind) = flat.region(rect, options.format, options.quality, options.lossless)?;
+        let flat = export_flattened(&entry, doc_id, &options)?;
+        let (w, h, bytes, kind) = flat.region(rect, &options)?;
         let mut body = Vec::with_capacity(9 + bytes.len());
         body.extend_from_slice(&w.to_le_bytes());
         body.extend_from_slice(&h.to_le_bytes());
-        body.push(u8::from(kind == "jpeg"));
+        body.push(preview_kind(kind));
         body.extend_from_slice(&bytes);
         Ok(Response::new(body))
     })
@@ -1220,7 +1840,7 @@ pub async fn export_region(state: State<'_, AppState>, doc_id: DocId, options: i
 #[tauri::command]
 pub async fn export_exact_size(state: State<'_, AppState>, doc_id: DocId, options: io::ExportOptions) -> Result<u64, CommandError> {
     let entry = lookup(state.inner(), doc_id)?;
-    blocking(move || Ok(export_flattened(&entry, doc_id, options.scale)?.exact_size(options.format, options.quality, options.lossless, options.metadata.as_ref())?)).await
+    blocking(move || Ok(export_flattened(&entry, doc_id, &options)?.exact_size(&options)?)).await
 }
 
 /// Export final. L'avancement est envoyé à l'interface (événement `export-progress`) : elle affiche une barre.
@@ -1237,17 +1857,173 @@ pub async fn export_image(app: crate::rt::AppHandle, state: State<'_, AppState>,
         let report = |progress: f32, label: &str| {
             let _ = app.emit("export-progress", Progress { progress, label });
         };
-        Ok(io::export_image_with_progress(entry.read().document(), &path, options, &report)?)
+        Ok(io::export_image_with_progress(&snapshot(&entry), &path, options, &report)?)
+    })
+    .await
+}
+
+// ------------------------------------------------------------- export d'un calque ou d'un groupe
+
+/// Un fichier à écrire : chemin complet et échelle (1 = taille réelle).
+#[derive(Debug, Deserialize)]
+pub struct LayerExportTarget {
+    pub path: PathBuf,
+    pub scale: f32,
+}
+
+/// Fenêtre « Exporter sous… » d'un calque : taille de la zone exportée (u32 × 2), taille de la vue (u32 × 2),
+/// 0 = PNG / 1 = JPEG / 2 = WebP (u8), puis l'aperçu. Petit-boutiste.
+#[tauri::command]
+pub async fn layer_export_overview(state: State<'_, AppState>, doc_id: DocId, ids: Vec<LayerId>, zone: engine::layer_export::ExportZone, margin: u32, options: io::ExportOptions, max_side: u32) -> Result<Response, CommandError> {
+    let entry = lookup(state.inner(), doc_id)?;
+    blocking(move || {
+        let doc = engine::layer_export::isolate(&snapshot(&entry), &ids, zone, margin)?;
+        let flat = io::flatten_for_export(&doc, 1.0)?;
+        let (w, h, bytes, kind) = flat.overview(max_side.clamp(64, 2048), &options)?;
+        let mut body = Vec::with_capacity(17 + bytes.len());
+        for value in [flat.width, flat.height, w, h] {
+            body.extend_from_slice(&value.to_le_bytes());
+        }
+        body.push(preview_kind(kind));
+        body.extend_from_slice(&bytes);
+        Ok(Response::new(body))
+    })
+    .await
+}
+
+/// Exporte les calques `ids` (ensemble) dans chacun des fichiers `targets`. L'avancement va à `export-progress`.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)] // une commande Tauri reçoit ses arguments un par un
+pub async fn export_layers(app: crate::rt::AppHandle, state: State<'_, AppState>, doc_id: DocId, ids: Vec<LayerId>, zone: engine::layer_export::ExportZone, margin: u32, options: io::ExportOptions, targets: Vec<LayerExportTarget>) -> Result<(), CommandError> {
+    use tauri::Emitter;
+    let entry = lookup(state.inner(), doc_id)?;
+    blocking(move || {
+        #[derive(Clone, Serialize)]
+        struct Progress<'a> {
+            progress: f32,
+            label: &'a str,
+        }
+        let doc = engine::layer_export::isolate(&snapshot(&entry), &ids, zone, margin)?;
+        let count = targets.len().max(1) as f32;
+        for (n, target) in targets.into_iter().enumerate() {
+            if let Some(folder) = target.path.parent() {
+                std::fs::create_dir_all(folder).map_err(|e| EngineError::InvalidOperation(format!("dossier {} : {e}", folder.display())))?;
+            }
+            let report = |progress: f32, label: &str| {
+                let _ = app.emit("export-progress", Progress { progress: (n as f32 + progress) / count, label });
+            };
+            io::export_image_with_progress(&doc, &target.path, io::ExportOptions { scale: target.scale, ..options.clone() }, &report)?;
+        }
+        Ok(())
+    })
+    .await
+}
+
+/// « Copier comme PNG » : le contenu des calques, seul et recadré, dans le presse-papiers du système.
+#[tauri::command]
+pub async fn copy_layers_png(state: State<'_, AppState>, doc_id: DocId, ids: Vec<LayerId>) -> Result<(), CommandError> {
+    let entry = lookup(state.inner(), doc_id)?;
+    blocking(move || {
+        let doc = engine::layer_export::isolate(&snapshot(&entry), &ids, engine::layer_export::ExportZone::Content, 0)?;
+        let flat = io::flatten_for_export(&doc, 1.0)?;
+        arboard::Clipboard::new()
+            .and_then(|mut c| c.set_image(arboard::ImageData { width: flat.width as usize, height: flat.height as usize, bytes: std::borrow::Cow::Owned(flat.rgba) }))
+            .map_err(|e| EngineError::InvalidOperation(format!("presse-papiers indisponible : {e}")))?;
+        Ok(())
+    })
+    .await
+}
+
+// ------------------------------------------------------------- sélection avancée
+
+/// Image réduite analysée par la fenêtre Sélection avancée (gardée le temps de la fenêtre).
+struct AdvancedCache {
+    rgba: Vec<u8>,
+    width: usize,
+    height: usize,
+    scale: f32,
+}
+static ADVANCED_CACHE: std::sync::Mutex<Option<AdvancedCache>> = std::sync::Mutex::new(None);
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdvancedInfo {
+    width: u32,
+    height: u32,
+    preview_width: usize,
+    preview_height: usize,
+    scale: f32,
+    /// Rouge, vert, bleu, luminosité.
+    scores: Vec<engine::select_advanced::ChannelScore>,
+}
+
+/// Ouvre la fenêtre : l'image (le calque `layer` seul, ou tout le visible) est réduite pour l'aperçu et ses quatre
+/// couches sont notées.
+#[tauri::command]
+pub async fn advanced_selection_open(state: State<'_, AppState>, doc_id: DocId, layer: Option<LayerId>, max_side: u32) -> Result<AdvancedInfo, CommandError> {
+    use engine::select_advanced as sa;
+    let entry = lookup(state.inner(), doc_id)?;
+    blocking(move || {
+        let (rgba, width, height, _) = sa::source(&snapshot(&entry), layer)?;
+        let (small, pw, ph, scale) = sa::downscale(&rgba, width as usize, height as usize, max_side.clamp(256, 2048) as usize);
+        let scores = sa::CHANNELS.iter().map(|mix| sa::score(&sa::mixed(&small, *mix), pw, ph)).collect();
+        *ADVANCED_CACHE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(AdvancedCache { rgba: small, width: pw, height: ph, scale });
+        Ok(AdvancedInfo { width, height, preview_width: pw, preview_height: ph, scale, scores })
+    })
+    .await
+}
+
+/// Image réduite (RGBA droit) de la fenêtre ouverte.
+#[tauri::command]
+pub fn advanced_selection_image() -> Response {
+    let cache = ADVANCED_CACHE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    Response::new(cache.as_ref().map(|c| c.rgba.clone()).unwrap_or_default())
+}
+
+/// Aperçu avec ces réglages : la carte finale puis la carte de départ (un octet par pixel chacune, taille réduite).
+#[tauri::command]
+pub async fn advanced_selection_preview(params: engine::select_advanced::Params) -> Result<Response, CommandError> {
+    blocking(move || {
+        let cache = ADVANCED_CACHE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(c) = cache.as_ref() else { return Err(EngineError::InvalidOperation("fenêtre de sélection fermée".into()).into()) };
+        let (mask, channel) = engine::select_advanced::compute(&c.rgba, c.width, c.height, &params, c.scale);
+        let mut body = mask;
+        body.extend_from_slice(&channel);
+        Ok(Response::new(body))
     })
     .await
 }
 
 #[tauri::command]
-pub async fn save_project(state: State<'_, AppState>, doc_id: DocId, path: PathBuf) -> Result<DocumentInfo, CommandError> {
+pub fn advanced_selection_close() {
+    *ADVANCED_CACHE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+}
+
+/// Styles de caractère d'un autre projet (« Importer d'un projet… »), sans l'ouvrir.
+#[tauri::command]
+pub async fn project_text_styles(path: PathBuf) -> Result<Vec<engine::text_styles::CharStyle>, CommandError> {
+    blocking(move || Ok(io::project_text_styles(&path)?)).await
+}
+
+/// Nom de fichier sûr tiré d'un nom de calque.
+#[tauri::command]
+pub fn layer_file_stem(name: String) -> String {
+    engine::layer_export::file_stem(&name)
+}
+
+#[tauri::command]
+pub async fn save_project(state: State<'_, AppState>, doc_id: DocId, path: PathBuf, work_seconds: Option<u64>) -> Result<DocumentInfo, CommandError> {
     let entry = lookup(state.inner(), doc_id)?;
     blocking(move || {
         let mut session = entry.write();
         session.finish_stroke();
+        // Temps de travail compté par l'interface : écrit dans le document (hors historique) avant l'enregistrement.
+        if let Some(seconds) = work_seconds {
+            session.apply_silently(|doc| {
+                doc.work_seconds = seconds;
+                Ok(())
+            })?;
+        }
         // Le document prend le nom du fichier : l'onglet, l'accueil (« Reprendre ») et le `.graf`
         // lui-même l'affichent ensuite, plutôt que « Sans titre ».
         if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
@@ -1263,7 +2039,7 @@ pub async fn save_project(state: State<'_, AppState>, doc_id: DocId, path: PathB
 #[tauri::command]
 pub async fn export_png(state: State<'_, AppState>, doc_id: DocId, path: PathBuf) -> Result<(), CommandError> {
     let entry = lookup(state.inner(), doc_id)?;
-    blocking(move || Ok(io::export_png(entry.read().document(), &path)?)).await
+    blocking(move || Ok(io::export_png(&snapshot(&entry), &path)?)).await
 }
 
 #[tauri::command]
@@ -1465,6 +2241,10 @@ pub struct CaretInfo {
     caret: [(f64, f64); 2],
     /// Un quadrilatère par ligne sélectionnée.
     highlights: Vec<[(f64, f64); 4]>,
+    /// Texte de paragraphe : les quatre coins de son cadre (haut gauche, haut droit, bas droit, bas gauche).
+    frame: Option<[(f64, f64); 4]>,
+    /// Texte de paragraphe dont une partie dépasse du cadre (non dessinée).
+    overflow: bool,
 }
 
 /// `start`, `end` : positions en unités UTF-16, celles d'un champ de saisie du navigateur.
@@ -1472,8 +2252,8 @@ pub struct CaretInfo {
 pub async fn text_caret(state: State<'_, AppState>, doc_id: DocId, layer: LayerId, start: usize, end: usize) -> Result<CaretInfo, CommandError> {
     let entry = lookup(state.inner(), doc_id)?;
     blocking(move || {
-        let (caret, highlights) = entry.read().document().text_caret(layer, start, end)?;
-        Ok(CaretInfo { caret, highlights })
+        let found = entry.read().document().text_caret(layer, start, end)?;
+        Ok(CaretInfo { caret: found.caret, highlights: found.highlights, frame: found.frame, overflow: found.overflow })
     })
     .await
 }
@@ -1505,12 +2285,12 @@ pub async fn sample_color(state: State<'_, AppState>, doc_id: DocId, x: i32, y: 
 /// Aperçu d'un filtre sur une réduction du calque : 8 octets d'en-tête (largeur, hauteur en u32
 /// petit-boutistes) puis les pixels RGBA à alpha droit. Ne modifie pas le document.
 #[tauri::command]
-pub async fn filter_preview(state: State<'_, AppState>, doc_id: DocId, layer: LayerId, filter: Filter, max_side: u32, in_context: Option<bool>) -> Result<Response, CommandError> {
+pub async fn filter_preview(state: State<'_, AppState>, doc_id: DocId, layer: LayerId, filter: Filter, max_side: u32, in_context: Option<bool>, edit: Option<usize>) -> Result<Response, CommandError> {
     let entry = lookup(state.inner(), doc_id)?;
     blocking(move || {
         let session = entry.read();
         // `in_context` : le calque filtré est recomposé avec tous les autres ; sinon, le calque seul.
-        let (width, height, rgba) = if in_context == Some(true) { session.filter_preview_in_context(layer, &filter, max_side)? } else { session.document().filter_preview(layer, &filter, max_side)? };
+        let (width, height, rgba) = if in_context == Some(true) { session.filter_preview_in_context(layer, &filter, max_side, edit)? } else { session.document().filter_preview(layer, &filter, max_side, edit)? };
         let mut body = Vec::with_capacity(8 + rgba.len());
         body.extend_from_slice(&width.to_le_bytes());
         body.extend_from_slice(&height.to_le_bytes());
@@ -1566,6 +2346,57 @@ pub async fn move_plan(state: State<'_, AppState>, doc_id: DocId, ids: Vec<Layer
     blocking(move || Ok(entry.read().document().move_preview_plan(&ids))).await
 }
 
+/// Aperçu de déplacement par images en cache (voir `engine::move_preview`) : découpage en couches, avec la révision
+/// du document pour laquelle il vaut.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MoveLayoutReply {
+    revision: u64,
+    #[serde(flatten)]
+    layout: engine::move_preview::MoveLayout,
+}
+
+#[tauri::command]
+pub async fn move_layout(state: State<'_, AppState>, doc_id: DocId, ids: Vec<LayerId>, max_packs: Option<usize>) -> Result<Option<MoveLayoutReply>, CommandError> {
+    let entry = lookup(state.inner(), doc_id)?;
+    let max_packs = max_packs.unwrap_or(engine::move_preview::MAX_PACKS);
+    blocking(move || {
+        let session = entry.read();
+        Ok(session.document().move_layout_packs(&ids, max_packs).map(|layout| MoveLayoutReply { revision: session.revision(), layout }))
+    })
+    .await
+}
+
+/// Image d'une couche de l'aperçu de déplacement : le rectangle `rect` = `[x, y, largeur, hauteur]` du niveau `level`
+/// (pixels de ce niveau, repère document). Réponse : 16 octets d'en-tête (x, y en i32, largeur, hauteur en u32,
+/// petit-boutistes), puis RGBA8 prémultiplié. Refusée si le document a changé depuis `revision` (découpage périmé).
+/// `own` : voir `TileRenderer::move_slice_tile`.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn move_slice(state: State<'_, AppState>, doc_id: DocId, ids: Vec<LayerId>, index: usize, level: u8, rect: [i32; 4], revision: u64, own: bool, max_packs: Option<usize>) -> Result<Response, CommandError> {
+    let entry = lookup(state.inner(), doc_id)?;
+    let max_packs = max_packs.unwrap_or(engine::move_preview::MAX_PACKS);
+    background(move || {
+        let session = entry.read();
+        if session.revision() != revision {
+            return Err(EngineError::InvalidOperation("le document a changé depuis le découpage".into()).into());
+        }
+        let document = session.document();
+        let layout = document.move_layout_packs(&ids, max_packs).ok_or_else(|| EngineError::InvalidOperation("déplacement sans aperçu par couches".into()))?;
+        let [x, y, w, h] = rect;
+        let (w, h) = (w.clamp(0, 16384) as u32, h.clamp(0, 16384) as u32);
+        let rgba = session.renderer().move_slice_region(document, &layout, index, level, (x, y, w, h), own);
+        let mut body = Vec::with_capacity(16 + rgba.len());
+        body.extend_from_slice(&x.to_le_bytes());
+        body.extend_from_slice(&y.to_le_bytes());
+        body.extend_from_slice(&w.to_le_bytes());
+        body.extend_from_slice(&h.to_le_bytes());
+        body.extend_from_slice(&rgba);
+        Ok(Response::new(body))
+    })
+    .await
+}
+
 /// Aperçu instantané d'un réglage : calques dessous et dessus (voir `adjustment_preview_plan`), ou rien.
 #[derive(Serialize)]
 pub struct AdjustPlan {
@@ -1598,6 +2429,133 @@ pub fn adjustment_lut(adjustment: engine::adjust::Adjustment, size: u32) -> Resp
         }
     }
     Response::new(out)
+}
+
+/// Aperçu de la fenêtre Bitmap : extrait central d'au plus `width × height` pixels de sortie, avant et après la
+/// conversion. Réponse : largeur et hauteur (u32 petit-boutistes), puis l'extrait gris (un octet par pixel), puis le
+/// même en noir et blanc (0 ou 255).
+#[tauri::command]
+pub async fn bitmap_preview(state: State<'_, AppState>, doc_id: DocId, options: engine::color_mode::BitmapOptions, width: u32, height: u32) -> Result<Response, CommandError> {
+    let entry = lookup(state.inner(), doc_id)?;
+    blocking(move || {
+        let session = entry.read();
+        let (w, h, before, after) = engine::color_mode::bitmap_preview(session.document(), session.renderer(), &options, (width.clamp(1, 2048), height.clamp(1, 2048)))?;
+        let mut body = Vec::with_capacity(8 + before.len() * 2);
+        body.extend_from_slice(&w.to_le_bytes());
+        body.extend_from_slice(&h.to_le_bytes());
+        body.extend_from_slice(&before);
+        body.extend_from_slice(&after);
+        Ok(Response::new(body))
+    })
+    .await
+}
+
+/// Gamme d'impression d'une couleur (sélecteur de couleur en mode CMJN) : son équivalent imprimable selon le profil,
+/// l'écart (ΔE 1976) et l'alerte hors gamme.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GamutInfo {
+    printable: [u8; 3],
+    delta_e: f32,
+    out_of_gamut: bool,
+}
+
+#[tauri::command]
+pub async fn cmyk_gamut(space: engine::cmyk::CmykSpace, color: [u8; 3]) -> Result<GamutInfo, CommandError> {
+    blocking(move || {
+        let (printable, delta_e, out_of_gamut) = engine::cmyk::gamut(space, color)?;
+        Ok(GamutInfo { printable, delta_e, out_of_gamut })
+    })
+    .await
+}
+
+/// Table de l'épreuve CMJN d'un espace (33³ × 3 octets, voir engine::cmyk), chargée en texture 3D par l'interface.
+/// Calculée au premier usage (quelques dizaines de millisecondes), puis gardée.
+#[tauri::command]
+pub async fn cmyk_proof_table(space: engine::cmyk::CmykSpace) -> Result<Response, CommandError> {
+    blocking(move || Ok(Response::new(engine::cmyk::proof_table(space)?))).await
+}
+
+/// Un profil CMJN de la liste des Paramètres de couleur, et d'où il vient.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CmykProfileEntry {
+    #[serde(flatten)]
+    info: engine::cmyk::ProfileInfo,
+    /// `builtin` (livré), `user` (chargé dans Lumitype), `system` (installé sur l'ordinateur, par Photoshop…).
+    origin: &'static str,
+    path: Option<PathBuf>,
+}
+
+/// Dossier où sont recopiés les profils CMJN chargés (Paramètres de couleur › Charger un profil ICC…).
+fn cmyk_profiles_dir(app: &crate::rt::AppHandle) -> Result<PathBuf, CommandError> {
+    use tauri::Manager;
+    let dir = app.path().app_config_dir().map_err(|e| EngineError::InvalidOperation(e.to_string()))?.join("profils-cmjn");
+    std::fs::create_dir_all(&dir).map_err(EngineError::io(&dir))?;
+    Ok(dir)
+}
+
+/// Profils CMJN disponibles : les cinq livrés, ceux chargés dans Lumitype, puis ceux installés sur l'ordinateur.
+/// Chacun devient utilisable (épreuve, mode, export).
+#[tauri::command]
+pub async fn cmyk_profiles(app: crate::rt::AppHandle) -> Result<Vec<CmykProfileEntry>, CommandError> {
+    let user = cmyk_profiles_dir(&app)?;
+    blocking(move || {
+        let mut out: Vec<CmykProfileEntry> = Vec::new();
+        for profile in engine::cmyk::CmykProfile::BUILTIN {
+            out.push(CmykProfileEntry { info: engine::cmyk::ProfileInfo::of(profile)?, origin: "builtin", path: None });
+        }
+        for (origin, dirs) in [("user", vec![user]), ("system", engine::cmyk::system_profile_dirs())] {
+            for (profile, path) in engine::cmyk::scan_profiles(&dirs) {
+                if out.iter().any(|e| e.info.id == profile) {
+                    continue;
+                }
+                if let Ok(info) = engine::cmyk::ProfileInfo::of(profile) {
+                    out.push(CmykProfileEntry { info, origin, path: Some(path) });
+                }
+            }
+        }
+        Ok(out)
+    })
+    .await
+}
+
+/// Charge un profil ICC CMJN choisi par l'utilisateur : vérifié, puis recopié dans le dossier des profils de Lumitype
+/// (il reste disponible aux lancements suivants, même si le fichier d'origine disparaît).
+#[tauri::command]
+pub async fn cmyk_import_profile(app: crate::rt::AppHandle, path: PathBuf) -> Result<engine::cmyk::ProfileInfo, CommandError> {
+    let user = cmyk_profiles_dir(&app)?;
+    blocking(move || {
+        let bytes = std::fs::read(&path).map_err(EngineError::io(&path))?;
+        let profile = engine::cmyk::register_icc(&bytes)?;
+        if !profile.is_builtin() {
+            let copy = user.join(format!("{}.icc", profile.id()));
+            if !copy.exists() {
+                std::fs::write(&copy, &bytes).map_err(EngineError::io(&copy))?;
+            }
+        }
+        Ok(engine::cmyk::ProfileInfo::of(profile)?)
+    })
+    .await
+}
+
+/// Nom d'un profil CMJN (celui d'un document, par exemple), s'il est connu.
+#[tauri::command]
+pub fn cmyk_profile_info(profile: engine::cmyk::CmykProfile) -> Result<engine::cmyk::ProfileInfo, CommandError> {
+    Ok(engine::cmyk::ProfileInfo::of(profile)?)
+}
+
+/// Bibliothèque de motifs (calques de remplissage Motif) : identifiant, nom et taille de cellule de chacun.
+#[tauri::command]
+pub fn pattern_catalog() -> Vec<engine::patterns::PatternInfo> {
+    engine::patterns::catalog()
+}
+
+/// Vignette d'un motif : `size` × `size` pixels RGBA à alpha droit, motif noir sur fond blanc à l'échelle `scale`
+/// (1 = 100 %). Vide si le motif n'existe pas.
+#[tauri::command]
+pub fn pattern_swatch(id: String, size: u32, scale: f32) -> Response {
+    Response::new(engine::patterns::swatch(&id, size.clamp(1, 512), scale.clamp(0.1, 10.0)).unwrap_or_default())
 }
 
 /// Réglage mis à plat pour la composition sur carte graphique de l'interface : son type (u32), puis ses valeurs
@@ -1762,7 +2720,9 @@ pub async fn thumbnail(
     let entry = lookup(state.inner(), doc_id)?;
     blocking(move || {
         let session = entry.read();
-        let Some((w, h, rgba)) = session.renderer().thumbnail(session.document(), layer, mask) else {
+        let doc = session.document();
+        // Calque d'un plan de travail : la miniature est cadrée sur son plan, pas sur tout l'espace de travail.
+        let Some((w, h, rgba)) = session.renderer().board_thumbnail(doc, layer, mask) else {
             return Ok(Response::new(Vec::new()));
         };
         let step = w.max(h).div_ceil(MAX_SIDE).max(1);
@@ -1826,6 +2786,16 @@ fn one() -> u32 {
     1
 }
 
+/// Un plan de la fenêtre Plans de travail : existant (`id`) ou nouveau.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtboardEdit {
+    #[serde(default)]
+    pub id: Option<LayerId>,
+    pub name: String,
+    pub board: engine::document::Artboard,
+}
+
 #[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum EditOp {
@@ -1846,11 +2816,32 @@ pub enum EditOp {
     AddMask { id: LayerId, reveal_all: bool },
     RemoveMask { id: LayerId },
     SetMaskEnabled { id: LayerId, enabled: bool },
+    SetMaskLinked { id: LayerId, linked: bool },
     Fill { id: LayerId, color: [u8; 3], on_mask: bool },
     /// Outil Texte : nouveau calque ancré en `(x, y)`.
     AddText { x: i32, y: i32, text: TextData, above: Option<LayerId> },
     /// `session` : les frappes d'une même séance d'édition ne font qu'un état d'historique.
     SetText { id: LayerId, text: TextData, session: String },
+    /// Plans de travail. `fit` : ajuster le document aux plans (fin de geste). `gesture` : un seul état d'historique.
+    AddArtboard { name: String, board: engine::document::Artboard },
+    SetArtboard { id: LayerId, board: engine::document::Artboard, fit: bool, gesture: Option<String> },
+    MoveArtboard { id: LayerId, dx: i32, dy: i32, fit: bool, gesture: Option<String> },
+    /// Copie d'un plan (avec ou sans son contenu) décalée de `dx`, `dy`.
+    DuplicateArtboard { id: LayerId, dx: i32, dy: i32, content: bool },
+    RemoveArtboard { id: LayerId },
+    /// Le plan prend l'étendue de son contenu (son fond géré mis à part).
+    FitArtboard { id: LayerId },
+    /// Fenêtre Plans de travail : toute la planche en un état d'historique.
+    ApplyArtboards { boards: Vec<ArtboardEdit>, #[serde(default)] removed: Vec<LayerId> },
+    /// Sélection avancée appliquée à l'image entière.
+    AdvancedSelection { layer: Option<LayerId>, params: engine::select_advanced::Params, output: engine::select_advanced::Output },
+    /// Styles de caractère : la liste entière, et les styles modifiés dont les textes doivent suivre (`update`).
+    SetTextStyles { list: Vec<engine::text_styles::CharStyle>, #[serde(default)] update: Vec<u32>, label: String },
+    /// Cadre d'un texte de paragraphe tiré par une poignée (`None` : texte de point) ; `shift` : déplacement de son
+    /// origine dans le repère du texte, total depuis le début du geste (`gesture` : un seul état d'historique).
+    SetTextFrame { id: LayerId, frame: Option<text::TextFrame>, shift: (f64, f64), gesture: String },
+    /// « Convertir en texte de paragraphe » (`paragraph`) ou « en texte de point ».
+    ConvertText { id: LayerId, paragraph: bool },
     /// Pixellise un texte, une forme ou un objet dynamique (rendu actuel).
     Rasterize { id: LayerId },
     /// « Convertir en objet dynamique » : les calques deviennent le contenu d'un objet dynamique qui prend leur place.
@@ -1920,14 +2911,53 @@ pub enum EditOp {
         #[serde(default)]
         gesture: Option<String>,
     },
+    /// Style de calque complet : effets et options de fusion (mode, opacité, opacité du fond) de chaque calque de
+    /// `ids`, en un seul état d'historique. Sert à la fenêtre des effets (`gesture` : un seul geste, comme
+    /// `SetEffects`, qu'Annuler retire en bloc) et à Coller / Effacer le style. Une option absente ne change pas.
+    SetStyle {
+        ids: Vec<LayerId>,
+        effects: Vec<LayerEffect>,
+        #[serde(default)]
+        blend: Option<BlendMode>,
+        #[serde(default)]
+        opacity: Option<f32>,
+        #[serde(default)]
+        fill: Option<f32>,
+        /// Comparaison : des plages entières la retirent.
+        #[serde(default)]
+        blend_if: Option<engine::blend::BlendIf>,
+        #[serde(default)]
+        gesture: Option<String>,
+    },
     /// Outil Forme : boîte de la forme en `(x, y)`.
     AddShape { x: i32, y: i32, shape: ShapeData, above: Option<LayerId> },
     /// Les réglages successifs d'une même forme ne font qu'un état d'historique.
     SetShape { id: LayerId, shape: ShapeData },
+    /// Calque de remplissage au-dessus de `above` (ou au sommet), avec un masque blanc. `gesture` : boîte de
+    /// dialogue ouverte — chaque envoi remplace le précédent, `CancelGesture` retire le calque si l'on annule.
+    AddFill {
+        fill: engine::fill::FillContent,
+        above: Option<LayerId>,
+        #[serde(default)]
+        gesture: Option<String>,
+    },
+    /// Modifie un calque de remplissage ; `gesture` comme pour `AddFill` (Annuler rend l'ancien remplissage).
+    SetFill {
+        id: LayerId,
+        fill: engine::fill::FillContent,
+        #[serde(default)]
+        gesture: Option<String>,
+    },
     /// Correcteur localisé : trait (pixels du document) dont la zone est reconstruite.
     Heal { id: LayerId, points: Vec<(f32, f32)>, size: f32, hardness: f32 },
     /// Recadrage (ou agrandissement de la zone de travail) : rectangle en pixels du document actuel.
     Crop { x: i32, y: i32, width: u32, height: u32 },
+    /// Plan de travail isolé (liste du panneau Calques) : rien ne change hors de lui. `None` : tous les plans.
+    SetWorkArea { board: Option<LayerId> },
+    /// Image › Format d'impression… (`None` : retire le format d'impression).
+    SetPrintSetup { setup: Option<engine::print::PrintSetup>, #[serde(default)] extend: bool, #[serde(default)] dpi: Option<f32> },
+    /// Image › Corriger l'encrage… : `layer` seul, ou tous les calques de pixels.
+    CorrectInk { limit: u16, space: engine::cmyk::CmykSpace, #[serde(default)] layer: Option<LayerId> },
     /// Ctrl+I : inverse les pixels du calque.
     Invert { id: LayerId },
     /// Les réglages successifs d'un même calque ne font qu'un état d'historique.
@@ -1935,6 +2965,23 @@ pub enum EditOp {
     /// `gesture` : aperçu en direct depuis la boîte de dialogue du filtre ; chaque appel repart
     /// de l'image d'avant, et `CancelGesture` retire tout si l'on annule.
     ApplyFilter { id: LayerId, filter: Filter, gesture: Option<String> },
+    /// Camera Raw sur un objet dynamique : pixellisation et filtre en un seul état d'historique (rien ne change si le filtre échoue).
+    RasterizeAndFilter { id: LayerId, filter: Filter },
+    /// Filtres dynamiques d'un calque : la liste remplacée (réglage rouvert, œil, ordre, options de fusion, retrait),
+    /// l'œil de l'ensemble et celui du masque de filtre. `gesture` : réglages successifs d'un même geste.
+    SetSmartFilters {
+        id: LayerId,
+        list: Vec<engine::smart_filters::SmartFilter>,
+        enabled: bool,
+        #[serde(default)]
+        mask_enabled: Option<bool>,
+        #[serde(default)]
+        gesture: Option<String>,
+    },
+    /// « Pixelliser les filtres » : le résultat devient les pixels du calque.
+    BakeFilters { id: LayerId },
+    /// Retire le masque de filtre.
+    DeleteFilterMask { id: LayerId },
     Select { shape: Shape, mode: CombineMode },
     MagicWand {
         layer: LayerId,
@@ -1980,13 +3027,27 @@ pub enum EditOp {
     PathToSelection { mode: CombineMode },
     FillPath { id: LayerId, color: [u8; 3] },
     StrokePath { id: LayerId, brush: BrushParams },
-    AddGuide { orientation: Orientation, position: f32 },
+    /// Repères : `board` = plan de travail visé (obligatoire dans un document à plans, absent sinon).
+    AddGuide {
+        orientation: Orientation,
+        position: f32,
+        #[serde(default)]
+        board: Option<LayerId>,
+    },
     /// Disposition de repères : colonnes, rangées, marges, posées d'un coup. `clear` : les repères existants sont d'abord retirés.
-    SetGuides { guides: Vec<Guide>, clear: bool },
+    SetGuides {
+        guides: Vec<Guide>,
+        clear: bool,
+        #[serde(default)]
+        board: Option<LayerId>,
+    },
     SetGuidesLocked { locked: bool },
     MoveGuide { index: usize, position: f32 },
     RemoveGuide { index: usize },
-    ClearGuides,
+    ClearGuides {
+        #[serde(default)]
+        board: Option<LayerId>,
+    },
     /// Ctrl+A. Avec un calque : son contenu opaque (ou tout le document s'il est vide) ; sans : tout le document.
     SelectAll {
         #[serde(default)]
@@ -1995,17 +3056,22 @@ pub enum EditOp {
     Deselect,
     InvertSelection,
     Feather { radius: f32 },
+    /// Image › Mode : conversion du document entier, en un seul état d'historique. `bitmap` : réglages de la fenêtre
+    /// Bitmap (exigés pour ce mode ; l'interface a fait confirmer l'aplatissement avant).
+    SetColorMode {
+        mode: engine::color_mode::ColorMode,
+        #[serde(default)]
+        bitmap: Option<engine::color_mode::BitmapOptions>,
+    },
     Undo,
     Redo,
     Jump { index: usize },
 }
 
 /// Emplacement d'insertion : au-dessus du calque donné, sinon au sommet du document.
+/// Emplacement d'un calque nouveau au-dessus de `above` ; dans un plan de travail, il y reste (voir `placement_slot`).
 fn slot(doc: &Document, above: Option<LayerId>) -> Result<(Option<LayerId>, usize), EngineError> {
-    match above {
-        Some(id) => doc.slot_above(id),
-        None => Ok((None, doc.children_of(None)?.len())),
-    }
+    doc.placement_slot(above)
 }
 
 /// « Calque 3 », « Groupe 2 »… d'après le nombre d'éléments existants du même genre.
@@ -2022,7 +3088,11 @@ fn apply(session: &mut Session, op: EditOp, clipboard: Option<Clip>) -> Result<D
         EditOp::Redo => Ok(session.redo()),
         EditOp::Jump { index } => Ok(session.jump(index)),
         EditOp::SetExpanded { id, expanded } => {
-            session.apply_silently(|doc| doc.set_expanded(id, expanded))?;
+            session.set_expanded(id, expanded)?;
+            Ok(Dirty::default())
+        }
+        EditOp::SetWorkArea { board } => {
+            session.set_work_area(board);
             Ok(Dirty::default())
         }
         EditOp::SetLabel { ids, label } => done(session.apply("Couleur du calque", None, |doc| ids.iter().try_for_each(|id| doc.set_label(*id, label)))),
@@ -2040,7 +3110,15 @@ fn apply(session: &mut Session, op: EditOp, clipboard: Option<Clip>) -> Result<D
             let (parent, index) = slot(doc, above)?;
             io::import_as_layer(doc, &path, parent, index).map(|_| ())
         })),
-        EditOp::Delete { ids } => done(session.apply("Supprimer le calque", None, |doc| doc.remove_layers(&ids))),
+        EditOp::Delete { ids } => done(session.apply("Supprimer le calque", None, |doc| {
+            let boards = ids.iter().any(|id| doc.layer(*id).is_ok_and(|l| l.artboard.is_some()));
+            doc.remove_layers(&ids)?;
+            // Un plan de travail supprimé l'est vraiment : le document se réajuste aux plans qui restent.
+            if boards {
+                doc.fit_to_artboards()?;
+            }
+            Ok(())
+        })),
         EditOp::Move { ids, parent, index } => {
             done(session.apply("Ordre des calques", None, |doc| doc.move_layers(&ids, parent, index)))
         }
@@ -2066,6 +3144,10 @@ fn apply(session: &mut Session, op: EditOp, clipboard: Option<Clip>) -> Result<D
                         props.locks = patch.locks.unwrap_or(props.locks);
                         props.clipped = patch.clipped.unwrap_or(props.clipped);
                     })?;
+                    // Cadenas retiré du fond d'un plan de travail : il devient un calque de pixels ordinaire.
+                    if patch.locks.is_some() {
+                        doc.release_artboard_background(*id)?;
+                    }
                 }
                 Ok(())
             };
@@ -2084,12 +3166,72 @@ fn apply(session: &mut Session, op: EditOp, clipboard: Option<Clip>) -> Result<D
             let label = if enabled { "Activer le masque de fusion" } else { "Désactiver le masque de fusion" };
             done(session.apply(label, None, |doc| doc.set_mask_enabled(id, enabled)))
         }
+        EditOp::SetMaskLinked { id, linked } => {
+            let label = if linked { "Lier le masque" } else { "Délier le masque" };
+            done(session.apply(label, None, |doc| doc.set_mask_linked(id, linked)))
+        }
         EditOp::AddText { x, y, text, above } => done(session.apply("Nouveau calque de texte", None, |doc| {
             let (parent, index) = slot(doc, above)?;
             doc.add_text_layer(text, (x, y), parent, index).map(|_| ())
         })),
         EditOp::SetText { id, text, session: editing } => {
             done(session.apply("Modifier le texte", Some(editing), |doc| doc.set_text(id, text)))
+        }
+        EditOp::ApplyArtboards { boards, removed } => done(session.apply("Plans de travail", None, |doc| {
+            doc.apply_artboards(boards.into_iter().map(|b| (b.id, b.name, b.board)).collect(), &removed).map(|_| ())
+        })),
+        EditOp::AddArtboard { name, board } => done(session.apply("Nouveau plan de travail", None, |doc| {
+            doc.add_artboard(name, board)?;
+            doc.fit_to_artboards()
+        })),
+        EditOp::SetArtboard { id, board, fit, gesture } => match gesture {
+            Some(g) => done(session.apply_gesture("Modifier le plan de travail", g, |doc| doc.set_artboard(id, board, fit))),
+            None => done(session.apply("Modifier le plan de travail", None, |doc| doc.set_artboard(id, board, fit))),
+        },
+        EditOp::MoveArtboard { id, dx, dy, fit, gesture } => match gesture {
+            Some(g) => done(session.apply_gesture("Déplacer le plan de travail", g, |doc| doc.move_artboard(id, dx, dy, fit))),
+            None => done(session.apply("Déplacer le plan de travail", None, |doc| doc.move_artboard(id, dx, dy, fit))),
+        },
+        EditOp::DuplicateArtboard { id, dx, dy, content } => done(session.apply("Dupliquer le plan de travail", None, |doc| {
+            let copy = doc.duplicate_layer(id)?;
+            if !content {
+                // Plan vide du même format : seul le fond géré reste.
+                let keep = doc.layer(copy)?.artboard.as_ref().and_then(|b| b.background_layer);
+                let others: Vec<LayerId> = doc.layer(copy)?.children().iter().copied().filter(|c| Some(*c) != keep).collect();
+                if !others.is_empty() {
+                    doc.remove_layers(&others)?;
+                }
+            }
+            // La copie est déjà posée à droite du dernier plan ; un décalage demandé en plus est appliqué.
+            if dx != 0 || dy != 0 {
+                doc.move_artboard(copy, dx, dy, true)?;
+            }
+            Ok(())
+        })),
+        EditOp::FitArtboard { id } => done(session.apply("Ajuster le plan au contenu", None, |doc| {
+            let board = doc.layer(id)?.artboard.clone().ok_or_else(|| EngineError::InvalidOperation("ce groupe n'est pas un plan de travail".into()))?;
+            let content: Vec<LayerId> = doc.layer(id)?.children().iter().copied().filter(|c| Some(*c) != board.background_layer).collect();
+            let bounds = if content.is_empty() { None } else { doc.content_bounds(&content)? };
+            let (x0, y0, x1, y1) = bounds.ok_or_else(|| EngineError::InvalidOperation("ce plan de travail est vide".into()))?;
+            let next = engine::document::Artboard { x: x0, y: y0, width: (x1 - x0).max(1) as u32, height: (y1 - y0).max(1) as u32, preset: None, ..board };
+            doc.set_artboard(id, next, true)
+        })),
+        EditOp::RemoveArtboard { id } => done(session.apply("Convertir le plan en groupe", None, |doc| doc.remove_artboard(id))),
+        EditOp::AdvancedSelection { layer, params, output } => {
+            let label = match output {
+                engine::select_advanced::Output::Selection => "Sélection avancée",
+                engine::select_advanced::Output::LayerMask => "Masque de fusion (sélection avancée)",
+                engine::select_advanced::Output::NewLayer => "Calque détouré (sélection avancée)",
+            };
+            done(session.apply(label, None, |doc| engine::select_advanced::apply(doc, layer, &params, output)))
+        }
+        EditOp::SetTextStyles { list, update, label } => done(session.apply(&label, None, |doc| doc.set_text_styles(list, &update).map(|_| ()))),
+        EditOp::SetTextFrame { id, frame, shift, gesture } => {
+            done(session.apply_gesture("Redimensionner le cadre du texte", gesture, |doc| doc.set_text_frame(id, frame, shift)))
+        }
+        EditOp::ConvertText { id, paragraph } => {
+            let label = if paragraph { "Convertir en texte de paragraphe" } else { "Convertir en texte de point" };
+            done(session.apply(label, None, |doc| doc.convert_text(id, paragraph)))
         }
         EditOp::Rasterize { id } => done(session.apply("Pixelliser le calque", None, |doc| doc.rasterize_layer(id))),
         EditOp::ConvertToSmart { ids } => done(session.apply("Convertir en objet dynamique", None, |doc| doc.convert_to_smart(&ids).map(|_| ()))),
@@ -2166,13 +3308,53 @@ fn apply(session: &mut Session, op: EditOp, clipboard: Option<Clip>) -> Result<D
             Some(gesture) => done(session.apply_gesture("Effets de calque", gesture, |doc| doc.set_effects(id, effects))),
             None => done(session.apply("Effets de calque", Some(format!("fx-{id}")), |doc| doc.set_effects(id, effects))),
         },
+        EditOp::SetStyle { ids, effects, blend, opacity, fill, blend_if, gesture } => {
+            let change = move |doc: &mut Document| {
+                for id in &ids {
+                    doc.set_effects(*id, effects.clone())?;
+                    doc.edit_props(*id, |props| {
+                        props.blend = blend.unwrap_or(props.blend);
+                        props.opacity = opacity.unwrap_or(props.opacity);
+                        props.fill = fill.unwrap_or(props.fill);
+                        if let Some(range) = blend_if {
+                            props.blend_if = Some(range);
+                        }
+                    })?;
+                }
+                Ok(())
+            };
+            match gesture {
+                Some(gesture) => done(session.apply_gesture("Style de calque", gesture, change)),
+                None => done(session.apply("Style de calque", None, change)),
+            }
+        }
         EditOp::AddShape { x, y, shape, above } => done(session.apply("Nouvelle forme", None, |doc| {
             let (parent, index) = slot(doc, above)?;
             doc.add_shape_layer(shape, (x, y), parent, index).map(|_| ())
         })),
         EditOp::SetShape { id, shape } => done(session.apply("Modifier la forme", Some(format!("shape-{id}")), |doc| doc.set_shape(id, shape))),
+        EditOp::AddFill { fill, above, gesture } => {
+            let label = format!("Calque de remplissage {}", fill.label());
+            let run = move |doc: &mut Document| {
+                let (parent, index) = slot(doc, above)?;
+                // Numérotés par type, comme Photoshop : « Couleur unie 1 », « Dégradé 1 »…
+                let same = doc.walk_top_down().iter().filter(|(_, l)| l.fill_content().is_some_and(|f| f.label() == fill.label())).count();
+                let name = format!("{} {}", fill.label(), same + 1);
+                doc.add_fill_layer(fill, name, parent, index).map(|_| ())
+            };
+            match gesture {
+                Some(gesture) => done(session.apply_gesture(label, gesture, run)),
+                None => done(session.apply(label, None, run)),
+            }
+        }
+        EditOp::SetFill { id, fill, gesture } => match gesture {
+            Some(gesture) => done(session.apply_gesture("Modifier le remplissage", gesture, |doc| doc.set_fill(id, fill))),
+            None => done(session.apply("Modifier le remplissage", Some(format!("fill-{id}")), |doc| doc.set_fill(id, fill))),
+        },
         EditOp::Heal { id, points, size, hardness } => done(session.apply("Correcteur localisé", None, |doc| doc.heal(id, &points, size, hardness))),
         EditOp::Crop { x, y, width, height } => done(session.apply("Recadrer", None, |doc| doc.crop(x, y, width, height))),
+        EditOp::SetPrintSetup { setup, extend, dpi } => done(session.apply("Format d'impression", None, |doc| doc.set_print_format(setup, extend, dpi))),
+        EditOp::CorrectInk { limit, space, layer } => done(session.apply("Corriger l'encrage", None, |doc| doc.correct_ink(space, limit, layer).map(|_| ()))),
         EditOp::Invert { id } => done(session.apply("Inverser", None, |doc| doc.invert_layer(id))),
         EditOp::SetAdjustment { id, adjustment } => {
             done(session.apply("Modifier le réglage", Some(format!("adjust-{id}")), |doc| doc.set_adjustment(id, adjustment)))
@@ -2181,6 +3363,16 @@ fn apply(session: &mut Session, op: EditOp, clipboard: Option<Clip>) -> Result<D
             Some(gesture) => done(session.apply_gesture(filter.label(), gesture, |doc| doc.apply_filter(id, &filter))),
             None => done(session.apply(filter.label(), None, |doc| doc.apply_filter(id, &filter))),
         },
+        EditOp::RasterizeAndFilter { id, filter } => done(session.apply(filter.label(), None, |doc| doc.rasterize_and_filter(id, &filter))),
+        EditOp::SetSmartFilters { id, list, enabled, mask_enabled, gesture } => {
+            let change = move |doc: &mut Document| doc.set_smart_filters(id, list.clone(), enabled, mask_enabled);
+            match gesture {
+                Some(gesture) => done(session.apply_gesture("Filtres dynamiques", gesture, change)),
+                None => done(session.apply("Filtres dynamiques", None, change)),
+            }
+        }
+        EditOp::BakeFilters { id } => done(session.apply("Pixelliser les filtres", None, |doc| doc.bake_filters(id))),
+        EditOp::DeleteFilterMask { id } => done(session.apply("Supprimer le masque de filtre", None, |doc| doc.delete_filter_mask(id))),
         EditOp::Select { shape, mode } => done(session.apply("Sélection", None, |doc| {
             let mask = shape.rasterize(doc.width(), doc.height());
             let combined = selection::combine(doc.selection().map(|s| &**s), mask, mode);
@@ -2271,11 +3463,8 @@ fn apply(session: &mut Session, op: EditOp, clipboard: Option<Clip>) -> Result<D
         EditOp::StrokePath { id, brush } => {
             done(session.apply("Contour du tracé", None, |doc| doc.stroke_path(id, brush.into())))
         }
-        EditOp::SetGuides { guides, clear } => done(session.apply("Disposition de repères", None, |doc| {
-            if clear {
-                doc.guides.clear();
-            }
-            doc.guides.extend(guides.into_iter().filter(|g| g.position.is_finite()));
+        EditOp::SetGuides { guides, clear, board } => done(session.apply("Disposition de repères", None, |doc| {
+            doc.set_guides(guides, board, clear)?;
             // Une disposition qu'on vient de poser se verrouille : elle ne bougera pas par accident.
             doc.guides_locked = true;
             Ok(())
@@ -2284,8 +3473,8 @@ fn apply(session: &mut Session, op: EditOp, clipboard: Option<Clip>) -> Result<D
             doc.guides_locked = locked;
             Ok(())
         })),
-        EditOp::AddGuide { orientation, position } => done(session.apply("Nouveau repère", None, |doc| {
-            doc.guides.push(Guide { orientation, position });
+        EditOp::AddGuide { orientation, position, board } => done(session.apply("Nouveau repère", None, |doc| {
+            doc.add_guide(orientation, position, board)?;
             Ok(())
         })),
         EditOp::MoveGuide { index, position } => done(session.apply("Déplacer le repère", None, |doc| {
@@ -2306,8 +3495,8 @@ fn apply(session: &mut Session, op: EditOp, clipboard: Option<Clip>) -> Result<D
             doc.guides.remove(index);
             Ok(())
         })),
-        EditOp::ClearGuides => done(session.apply("Effacer les repères", None, |doc| {
-            doc.guides.clear();
+        EditOp::ClearGuides { board } => done(session.apply("Effacer les repères", None, |doc| {
+            doc.clear_guides(board)?;
             Ok(())
         })),
         EditOp::SelectAll { layer } => done(session.apply("Tout sélectionner", None, |doc| match layer {
@@ -2334,6 +3523,7 @@ fn apply(session: &mut Session, op: EditOp, clipboard: Option<Clip>) -> Result<D
             doc.set_selection(Some(softened));
             Ok(())
         })),
+        EditOp::SetColorMode { mode, bitmap } => done(session.apply(mode.history_label(), None, |doc| doc.convert_color_mode(mode, bitmap.as_ref()))),
         EditOp::Fill { id, color, on_mask } => done(session.apply("Remplir", None, |doc| {
             if on_mask {
                 let [r, g, b] = color.map(u32::from);
@@ -2362,6 +3552,83 @@ pub async fn edit(state: State<'_, AppState>, doc_id: DocId, op: EditOp) -> Resu
     .await
 }
 
+/// Pixels envoyés au plus avec une rafale d'annulations (`history_step`) ; au-delà, l'interface relit elle-même.
+const HISTORY_PATCH_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Serialize)]
+struct HistoryPatch {
+    layer: LayerId,
+    rect: [i32; 4],
+}
+
+#[derive(Serialize)]
+struct HistoryStepHead {
+    document: DocumentInfo,
+    dirty: DirtyInfo,
+    patches: Vec<HistoryPatch>,
+}
+
+/// Annuler (`undo`) ou rétablir (`redo`) `count` fois d'un coup (Ctrl+Z en rafale), en renvoyant AVEC la réponse les
+/// pixels des zones repeintes des calques de pixels (sans effet de calque) : la composition sur carte graphique les
+/// pose directement dans ses textures, sans relire chaque calque ensuite. Un seul saut dans l'historique, quel que
+/// soit `count` : seule la différence entre l'état de départ et l'état d'arrivée est signalée.
+/// Réponse : `[u32 longueur][JSON {document, dirty, patches: [{layer, rect}]}][pixels RGBA prémultipliés des
+/// patches, à la suite, dans l'ordre]` (petit-boutiste ; repère de chaque calque).
+#[tauri::command]
+pub async fn history_step(state: State<'_, AppState>, doc_id: DocId, op: String, count: usize) -> Result<Response, CommandError> {
+    let entry = lookup(state.inner(), doc_id)?;
+    blocking(move || {
+        let mut session = entry.write();
+        let cursor = session.history().1;
+        let count = count.max(1);
+        let target = match op.as_str() {
+            "undo" => cursor.saturating_sub(count),
+            "redo" => cursor.saturating_add(count),
+            other => return Err(EngineError::InvalidOperation(format!("pas d'historique inconnu : {other}")).into()),
+        };
+        let dirty = session.jump(target);
+        // Zones repeintes des pixels, réunies par calque.
+        let mut union: Vec<(LayerId, [i32; 4])> = Vec::new();
+        if !dirty.all {
+            for area in dirty.areas.iter().filter(|a| !a.mask && a.rect[2] > 0 && a.rect[3] > 0) {
+                let [x, y, w, h] = area.rect;
+                match union.iter_mut().find(|(id, _)| *id == area.layer) {
+                    Some((_, r)) => {
+                        let (x0, y0) = (r[0].min(x), r[1].min(y));
+                        let (x1, y1) = ((r[0] + r[2]).max(x + w), (r[1] + r[3]).max(y + h));
+                        *r = [x0, y0, x1 - x0, y1 - y0];
+                    }
+                    None => union.push((area.layer, area.rect)),
+                }
+            }
+        }
+        let mut patches = Vec::new();
+        let mut pixels = Vec::new();
+        for (id, [x, y, w, h]) in union {
+            let Ok(layer) = session.document().layer(id) else { continue };
+            // Effets de calque : la texture porte le calque stylé, dont l'étendue dépasse les zones repeintes.
+            if engine::effects::any_enabled(&layer.effects) {
+                continue;
+            }
+            let Some(store) = layer.pixels() else { continue };
+            let bytes = w as usize * h as usize * 4;
+            if pixels.len() + bytes > HISTORY_PATCH_BYTES {
+                continue;
+            }
+            pixels.extend_from_slice(&store.read_rect(x, y, w as u32, h as u32));
+            patches.push(HistoryPatch { layer: id, rect: [x, y, w, h] });
+        }
+        let head = HistoryStepHead { document: describe(doc_id, &entry, &session), dirty: dirty.into(), patches };
+        let json = serde_json::to_vec(&head).map_err(|e| EngineError::InvalidOperation(e.to_string()))?;
+        let mut body = Vec::with_capacity(4 + json.len() + pixels.len());
+        body.extend_from_slice(&(json.len() as u32).to_le_bytes());
+        body.extend_from_slice(&json);
+        body.extend_from_slice(&pixels);
+        Ok(Response::new(body))
+    })
+    .await
+}
+
 // -------------------------------------------------------------------- pinceau
 
 #[derive(Deserialize)]
@@ -2385,10 +3652,109 @@ pub struct BrushParams {
     /// Le trait est esquissé à l'écran par la carte graphique : le moteur ne recompose le calque qu'à la fin.
     #[serde(default)]
     deferred: bool,
+    /// Pinceau double d'un préréglage importé.
+    #[serde(default)]
+    dual: Option<DualParam>,
+    /// Texture d'un préréglage importé.
+    #[serde(default)]
+    texture: Option<TextureParam>,
+}
+
+/// Voir `engine::paint::DualBrush` ; `tip` est l'identifiant d'une pointe de la bibliothèque.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DualParam {
+    tip: u32,
+    ratio: f32,
+    spacing: f32,
+    scatter: f32,
+    both_axes: bool,
+    count: u32,
+    mode: String,
+    flip: bool,
+}
+
+/// Voir `engine::paint::BrushTexture` ; `pattern` est l'identifiant d'un motif de la bibliothèque.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextureParam {
+    pattern: u32,
+    scale: f32,
+    depth: f32,
+    mode: String,
+    invert: bool,
+    brightness: f32,
+    contrast: f32,
+}
+
+fn blend_name(mode: engine::brushes::TipBlend) -> &'static str {
+    use engine::brushes::TipBlend as B;
+    match mode {
+        B::Multiply => "multiply",
+        B::Darken => "darken",
+        B::Lighten => "lighten",
+        B::Overlay => "overlay",
+        B::ColorDodge => "colorDodge",
+        B::ColorBurn => "colorBurn",
+        B::LinearBurn => "linearBurn",
+        B::HardMix => "hardMix",
+        B::Subtract => "subtract",
+        B::Height => "height",
+        B::LinearHeight => "linearHeight",
+        B::Screen => "screen",
+    }
+}
+
+fn blend_from_name(name: &str) -> engine::brushes::TipBlend {
+    use engine::brushes::TipBlend as B;
+    match name {
+        "darken" => B::Darken,
+        "lighten" => B::Lighten,
+        "overlay" => B::Overlay,
+        "colorDodge" => B::ColorDodge,
+        "colorBurn" => B::ColorBurn,
+        "linearBurn" => B::LinearBurn,
+        "hardMix" => B::HardMix,
+        "subtract" => B::Subtract,
+        "height" => B::Height,
+        "linearHeight" => B::LinearHeight,
+        "screen" => B::Screen,
+        _ => B::Multiply,
+    }
+}
+
+/// Pinceau double et texture d'un trait, résolus dans la bibliothèque.
+fn stroke_extras(state: &AppState, brush: &BrushParams) -> Result<(Option<engine::paint::DualBrush>, Option<engine::paint::BrushTexture>), CommandError> {
+    let dual = match &brush.dual {
+        Some(d) => Some(engine::paint::DualBrush {
+            tip: state.brush(d.tip).ok_or_else(|| EngineError::InvalidOperation("la pointe du pinceau double n'existe plus".into()))?,
+            ratio: d.ratio.clamp(0.01, 50.0),
+            spacing: d.spacing,
+            scatter: d.scatter,
+            both_axes: d.both_axes,
+            count: d.count,
+            mode: blend_from_name(&d.mode),
+            flip: d.flip,
+        }),
+        None => None,
+    };
+    let texture = match &brush.texture {
+        Some(t) => Some(engine::paint::BrushTexture {
+            pattern: state.pattern(t.pattern).ok_or_else(|| EngineError::InvalidOperation("la texture de ce pinceau n'existe plus".into()))?,
+            scale: t.scale,
+            depth: t.depth,
+            mode: blend_from_name(&t.mode),
+            invert: t.invert,
+            brightness: t.brightness,
+            contrast: t.contrast,
+        }),
+        None => None,
+    };
+    Ok((dual, texture))
 }
 
 /// Voir `engine::paint::BrushDynamics`.
-#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct DynamicsParam {
     spacing: f32,
@@ -2401,11 +3767,44 @@ pub struct DynamicsParam {
     flow: f32,
     paint: f32,
     stretch: f32,
+    roundness: f32,
+    roundness_jitter: f32,
+    min_roundness: f32,
+    flip_x: bool,
+    flip_y: bool,
+    min_size: f32,
+    scatter_perpendicular: bool,
+    count: u32,
+    opacity_jitter: f32,
+    flow_jitter: f32,
+    pressure_flow: bool,
 }
 
 impl From<DynamicsParam> for BrushDynamics {
     fn from(d: DynamicsParam) -> Self {
-        Self { spacing: d.spacing, angle: d.angle, follow_direction: d.follow_direction, scatter: d.scatter, size_jitter: d.size_jitter, angle_jitter: d.angle_jitter, amount: d.amount, flow: d.flow, paint: d.paint, stretch: d.stretch }
+        Self {
+            spacing: d.spacing,
+            angle: d.angle,
+            follow_direction: d.follow_direction,
+            scatter: d.scatter,
+            size_jitter: d.size_jitter,
+            angle_jitter: d.angle_jitter,
+            amount: d.amount,
+            flow: d.flow,
+            paint: d.paint,
+            stretch: d.stretch,
+            roundness: d.roundness,
+            roundness_jitter: d.roundness_jitter,
+            min_roundness: d.min_roundness,
+            flip_x: d.flip_x,
+            flip_y: d.flip_y,
+            min_size: d.min_size,
+            scatter_perpendicular: d.scatter_perpendicular,
+            count: d.count,
+            opacity_jitter: d.opacity_jitter,
+            flow_jitter: d.flow_jitter,
+            pressure_flow: d.pressure_flow,
+        }
     }
 }
 
@@ -2451,7 +3850,8 @@ pub async fn stroke_begin(
     };
     let dynamics = brush.dynamics.into();
     let deferred = brush.deferred;
-    blocking(move || Ok(entry.write().begin_stroke_with(layer, on_mask, brush.into(), kind, dynamics, deferred)?))
+    let (dual, texture) = stroke_extras(state.inner(), &brush)?;
+    blocking(move || Ok(entry.write().begin_stroke_styled(layer, on_mask, brush.into(), kind, dynamics, deferred, dual, texture)?))
     .await
 }
 
@@ -2483,7 +3883,7 @@ pub struct BrushTipInfo {
 }
 
 /// Les pointes intégrées occupent les premiers identifiants : ils sont stables d'un lancement à l'autre.
-const BUILTIN_TIPS: u32 = 5;
+const BUILTIN_TIPS: u32 = 18;
 
 fn tip_info((id, tip): &(u32, std::sync::Arc<engine::brushes::BrushTip>)) -> BrushTipInfo {
     BrushTipInfo { id: *id, name: tip.name.clone(), width: tip.width, height: tip.height, spacing: tip.spacing, builtin: *id <= BUILTIN_TIPS }
@@ -2510,11 +3910,27 @@ fn load_library(app: &crate::rt::AppHandle, state: &AppState) -> Result<(), Comm
     files.sort();
     for file in files {
         // Un fichier devenu illisible ne doit pas empêcher les autres de se charger.
-        if let Ok(tips) = std::fs::read(&file).map_err(|_| ()).and_then(|bytes| engine::brushes::load_tips(&bytes, &file).map_err(|_| ())) {
-            state.add_brushes(tips);
+        if let Ok(pack) = std::fs::read(&file).map_err(|_| ()).and_then(|bytes| engine::brushes::load_pack(&bytes, &file).map_err(|_| ())) {
+            add_pack(state, &file, pack);
         }
     }
     Ok(())
+}
+
+/// Range un fichier de pinceaux dans la bibliothèque : pointes, motifs, et ses préréglages reliés à leurs identifiants.
+fn add_pack(state: &AppState, file: &std::path::Path, pack: engine::brushes::BrushPack) -> Vec<(u32, std::sync::Arc<engine::brushes::BrushTip>)> {
+    let folder = file.file_stem().and_then(|s| s.to_str()).unwrap_or("Pinceaux").replace('_', " ");
+    let tips = state.add_brushes(pack.tips);
+    let patterns = state.add_patterns(pack.patterns);
+    state.add_preset_file(crate::state::PresetFile {
+        folder,
+        presets: pack.presets,
+        tips: tips.iter().filter(|(_, t)| !t.uid.is_empty()).map(|(id, t)| (t.uid.clone(), *id)).collect(),
+        patterns: patterns.iter().map(|(id, p)| (p.uid.clone(), *id)).collect(),
+        all_tips: tips.iter().map(|(id, _)| *id).collect(),
+        file: Some(file.to_path_buf()),
+    });
+    tips
 }
 
 /// Importe un fichier de pinceaux (.abr, .gbr ou image) : ses pointes rejoignent la bibliothèque, et
@@ -2524,15 +3940,236 @@ pub async fn import_brushes(app: crate::rt::AppHandle, state: State<'_, AppState
     let state = state.inner().clone();
     blocking(move || {
         let bytes = std::fs::read(&path).map_err(EngineError::io(&path))?;
-        let tips = engine::brushes::load_tips(&bytes, &path)?;
+        let pack = engine::brushes::load_pack(&bytes, &path)?;
         load_library(&app, &state)?; // les pointes intégrées et déjà importées gardent leurs identifiants
-        if let Some(name) = path.file_name() {
-            let copy = brushes_dir(&app)?.join(name);
-            if copy != path {
-                std::fs::write(&copy, &bytes).map_err(EngineError::io(&copy))?;
+        let copy = match path.file_name() {
+            Some(name) => {
+                let copy = brushes_dir(&app)?.join(name);
+                if copy != path {
+                    std::fs::write(&copy, &bytes).map_err(EngineError::io(&copy))?;
+                }
+                copy
+            }
+            None => path.clone(),
+        };
+        Ok(add_pack(&state, &copy, pack).iter().map(tip_info).collect())
+    })
+    .await
+}
+
+/// Pinceaux déposés dans la fenêtre (.abr, .gbr) : la webview ne connaît pas leur chemin, le contenu arrive en corps
+/// binaire et le nom (encodé URL) en en-tête `x-file-name`. Copiés dans le dossier des pinceaux, comme à l'import.
+#[tauri::command]
+pub async fn import_brushes_dropped(app: crate::rt::AppHandle, state: State<'_, AppState>, request: tauri::ipc::Request<'_>) -> Result<Vec<BrushTipInfo>, CommandError> {
+    let name = request.headers().get("x-file-name").and_then(|v| v.to_str().ok()).map(percent_decode).unwrap_or_else(|| "pinceaux.abr".into());
+    // Nom seul (jamais un chemin) : le fichier est écrit dans le dossier des pinceaux et nulle part ailleurs.
+    let name = std::path::Path::new(&name).file_name().map(|n| n.to_string_lossy().into_owned()).filter(|n| !n.is_empty()).unwrap_or_else(|| "pinceaux.abr".into());
+    let tauri::ipc::InvokeBody::Raw(bytes) = request.body() else {
+        return Err(EngineError::InvalidOperation("contenu du fichier manquant".into()).into());
+    };
+    let bytes = bytes.clone();
+    let state = state.inner().clone();
+    blocking(move || {
+        let copy = brushes_dir(&app)?.join(&name);
+        let pack = engine::brushes::load_pack(&bytes, &copy)?;
+        load_library(&app, &state)?;
+        std::fs::write(&copy, &bytes).map_err(EngineError::io(&copy))?;
+        Ok(add_pack(&state, &copy, pack).iter().map(tip_info).collect())
+    })
+    .await
+}
+
+/// Préréglage d'un fichier importé, prêt à être appliqué par l'interface.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrushPresetInfo {
+    /// `dossier#rang` : stable d'un lancement à l'autre (les dossiers favoris de l'interface s'en servent).
+    key: String,
+    folder: String,
+    name: String,
+    /// `round` (rond paramétrique) ou `tip`.
+    kind: &'static str,
+    tip: Option<u32>,
+    size: f32,
+    hardness: f32,
+    opacity: f32,
+    pressure_size: bool,
+    pressure_opacity: bool,
+    dynamics: DynamicsParam,
+    dual: Option<DualParam>,
+    texture: Option<TextureParam>,
+}
+
+/// Bibliothèque complète : pointes, et préréglages des fichiers importés (classés par fichier).
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrushLibrary {
+    tips: Vec<BrushTipInfo>,
+    presets: Vec<BrushPresetInfo>,
+}
+
+fn preset_info(file: &crate::state::PresetFile, index: usize, preset: &engine::brushes::BrushPreset) -> Option<BrushPresetInfo> {
+    use engine::brushes::PresetShape;
+    let tip_of = |uid: &str| file.tips.iter().find(|(u, _)| u == uid).map(|(_, id)| *id);
+    let (kind, tip, hardness) = match &preset.shape {
+        PresetShape::Sampled(uid) => ("tip", Some(tip_of(uid)?), 1.0),
+        PresetShape::Round { hardness } => ("round", None, *hardness),
+    };
+    let dual = preset.dual.as_ref().and_then(|d| {
+        Some(DualParam {
+            tip: tip_of(&d.tip_uid)?,
+            ratio: d.diameter / preset.diameter.max(1.0),
+            spacing: d.spacing,
+            scatter: d.scatter,
+            both_axes: d.both_axes,
+            count: d.count,
+            mode: blend_name(d.mode).to_owned(),
+            flip: d.flip,
+        })
+    });
+    let texture = preset.texture.as_ref().and_then(|t| {
+        Some(TextureParam {
+            pattern: file.patterns.iter().find(|(u, _)| *u == t.pattern_uid).map(|(_, id)| *id)?,
+            scale: t.scale,
+            depth: t.depth,
+            mode: blend_name(t.mode).to_owned(),
+            invert: t.invert,
+            brightness: t.brightness,
+            contrast: t.contrast,
+        })
+    });
+    Some(BrushPresetInfo {
+        key: format!("{}#{index}", file.folder),
+        folder: file.folder.clone(),
+        name: preset.name.clone(),
+        kind,
+        tip,
+        size: preset.diameter,
+        hardness,
+        opacity: preset.opacity,
+        pressure_size: preset.size_pressure,
+        pressure_opacity: preset.opacity_pressure,
+        dynamics: DynamicsParam {
+            spacing: preset.spacing,
+            angle: preset.angle,
+            follow_direction: preset.follow_direction,
+            scatter: preset.scatter,
+            size_jitter: preset.size_jitter,
+            angle_jitter: preset.angle_jitter,
+            flow: if preset.flow >= 1.0 { 0.0 } else { preset.flow },
+            roundness: preset.roundness,
+            roundness_jitter: preset.roundness_jitter,
+            min_roundness: preset.min_roundness,
+            flip_x: preset.flip_x,
+            flip_y: preset.flip_y,
+            min_size: preset.min_diameter,
+            scatter_perpendicular: !preset.scatter_both,
+            count: preset.count,
+            opacity_jitter: preset.opacity_jitter,
+            flow_jitter: preset.flow_jitter,
+            pressure_flow: preset.flow_pressure,
+            ..DynamicsParam::default()
+        },
+        dual,
+        texture,
+    })
+}
+
+#[tauri::command]
+pub async fn brush_library(app: crate::rt::AppHandle, state: State<'_, AppState>) -> Result<BrushLibrary, CommandError> {
+    let state = state.inner().clone();
+    blocking(move || {
+        load_library(&app, &state)?;
+        let tips = state.brushes();
+        let mut presets = Vec::new();
+        for file in state.preset_files() {
+            if file.presets.is_empty() {
+                // Fichier sans préréglages : chaque pointe est un pinceau, à son espacement propre.
+                for (index, id) in file.all_tips.iter().enumerate() {
+                    let Some((_, tip)) = tips.iter().find(|(tip_id, _)| tip_id == id) else { continue };
+                    presets.push(BrushPresetInfo {
+                        key: format!("{}#t{index}", file.folder),
+                        folder: file.folder.clone(),
+                        name: tip.name.clone(),
+                        kind: "tip",
+                        tip: Some(*id),
+                        size: 30.0,
+                        hardness: 1.0,
+                        opacity: 1.0,
+                        pressure_size: true,
+                        pressure_opacity: false,
+                        dynamics: DynamicsParam { spacing: tip.spacing, ..DynamicsParam::default() },
+                        dual: None,
+                        texture: None,
+                    });
+                }
+            } else {
+                presets.extend(file.presets.iter().enumerate().filter_map(|(i, p)| preset_info(&file, i, p)));
             }
         }
-        Ok(state.add_brushes(tips).iter().map(tip_info).collect())
+        Ok(BrushLibrary { tips: state.brushes().iter().map(tip_info).collect(), presets })
+    })
+    .await
+}
+
+/// Retire un pack importé de la bibliothèque et du dossier de l'application (il ne revient pas au prochain lancement).
+#[tauri::command]
+pub async fn remove_brush_pack(state: State<'_, AppState>, folder: String) -> Result<(), CommandError> {
+    if let Some(file) = state.remove_preset_file(&folder) {
+        let _ = std::fs::remove_file(&file);
+    }
+    Ok(())
+}
+
+/// Aperçu d'un pinceau : un trait en S, effilé aux deux bouts, tracé par le vrai moteur, encre blanche sur transparent.
+#[tauri::command]
+pub async fn brush_preview(state: State<'_, AppState>, brush: BrushParams, width: u32, height: u32, ramp: Option<bool>) -> Result<Response, CommandError> {
+    let ramp = ramp.unwrap_or(false);
+    let kind = match brush.kind {
+        BrushKindParam::Round => BrushKind::Round,
+        BrushKindParam::Spray => BrushKind::Spray,
+        BrushKindParam::Mixer => BrushKind::Mixer,
+        BrushKindParam::Tip { id } => BrushKind::Tip(state.brush(id).ok_or_else(|| EngineError::InvalidOperation("pointe inconnue".into()))?),
+    };
+    let (dual, texture) = stroke_extras(state.inner(), &brush)?;
+    let dynamics: BrushDynamics = brush.dynamics.into();
+    let (width, height) = (width.clamp(16, 1200), height.clamp(8, 400));
+    blocking(move || {
+        let mut doc = Document::new("aperçu", width, height, 72.0)?;
+        let layer = doc.add_pixel_layer("trait", engine::tiles::TileStore::new(), None, 0)?;
+        let mut params: Brush = brush.into();
+        params.color = [255, 255, 255];
+        params.mode = BrushMode::Paint;
+        params.size = params.size.clamp(1.0, height as f32 * 0.7);
+        let mut stroke = engine::paint::Stroke::begin(&doc, layer, false, params)?.with_kind(kind).with_dynamics(dynamics).with_dual(dual).with_texture(texture);
+        let margin = params.size * 0.5 + 4.0;
+        // `ramp` : coup bref en courbe, la pression montant de 0 à 100 % (on voit ce que fait la pression) ;
+        // sinon un S effilé aux deux bouts.
+        let points: Vec<StrokePoint> = (0..=96)
+            .map(|i| {
+                let t = i as f32 / 96.0;
+                let x = margin + t * (width as f32 - 2.0 * margin);
+                let amplitude = (height as f32 / 2.0 - margin).max(0.0);
+                if ramp {
+                    let y = height as f32 / 2.0 + (t * std::f32::consts::PI).cos() * amplitude * 0.45;
+                    StrokePoint { x, y, pressure: t.max(0.02) }
+                } else {
+                    let y = height as f32 / 2.0 + (t * std::f32::consts::TAU).sin() * amplitude * 0.55;
+                    StrokePoint { x, y, pressure: (t * std::f32::consts::PI).sin().max(0.08) }
+                }
+            })
+            .collect();
+        stroke.extend(&mut doc, &points)?;
+        stroke.finish(&mut doc)?;
+        let pixels = doc.layer(layer)?.pixels().cloned().ok_or_else(|| EngineError::InvalidOperation("aperçu".into()))?;
+        let mut sampler = engine::tiles::Sampler::new(&pixels);
+        let image = image::RgbaImage::from_fn(width, height, |x, y| {
+            let [_, _, _, a] = sampler.get(x as i32, y as i32);
+            image::Rgba([255, 255, 255, a])
+        });
+        let mut out = std::io::Cursor::new(Vec::new());
+        image.write_to(&mut out, image::ImageFormat::Png).map_err(|e| EngineError::Corrupt(e.to_string()))?;
+        Ok(Response::new(out.into_inner()))
     })
     .await
 }
@@ -2583,6 +4220,54 @@ pub async fn stroke_points(
     .await
 }
 
+/// Empreintes d'un trait de pointe calculées par l'interface (repère document) : `[x, y, diamètre, rotation, rondeur,
+/// retourné en x (0/1), retourné en y (0/1), force]`, et celles du pinceau double `[x, y, diamètre, retourné en x, retourné
+/// en y]`. Le moteur les pose telles quelles : le trait vu pendant le geste est le résultat (voir `engine::paint::Stamp`).
+#[tauri::command]
+pub async fn stroke_stamps(
+    state: State<'_, AppState>,
+    doc_id: DocId,
+    stamps: Vec<[f32; 8]>,
+    duals: Vec<[f32; 5]>,
+) -> Result<(u64, DirtyInfo), CommandError> {
+    let entry = lookup(state.inner(), doc_id)?;
+    blocking(move || {
+        let stamps: Vec<engine::paint::Stamp> = stamps
+            .iter()
+            .map(|s| engine::paint::Stamp { x: s[0], y: s[1], diameter: s[2], turn: s[3], roundness: s[4], flip_x: s[5] > 0.5, flip_y: s[6] > 0.5, strength: s[7] })
+            .collect();
+        let duals: Vec<engine::paint::DualStamp> = duals.iter().map(|d| engine::paint::DualStamp { x: d[0], y: d[1], diameter: d[2], flip_x: d[3] > 0.5, flip_y: d[4] > 0.5 }).collect();
+        let mut session = entry.write();
+        let dirty = session.extend_stroke_stamps(&stamps, &duals)?;
+        Ok((session.revision(), dirty.into()))
+    })
+    .await
+}
+
+/// Pointe d'un pinceau pour la carte graphique : largeur et hauteur (u32), espacement propre (f32), puis sa couverture
+/// (un octet par pixel).
+#[tauri::command]
+pub async fn brush_tip_image(state: State<'_, AppState>, id: u32) -> Result<Response, CommandError> {
+    let tip = state.brush(id).ok_or_else(|| EngineError::InvalidOperation("pointe inconnue".into()))?;
+    let mut bytes = Vec::with_capacity(12 + tip.mask.len());
+    bytes.extend_from_slice(&tip.width.to_le_bytes());
+    bytes.extend_from_slice(&tip.height.to_le_bytes());
+    bytes.extend_from_slice(&tip.spacing.to_le_bytes());
+    bytes.extend_from_slice(&tip.mask);
+    Ok(Response::new(bytes))
+}
+
+/// Motif d'une texture de pinceau pour la carte graphique : largeur et hauteur (u32), puis ses gris (un octet par pixel).
+#[tauri::command]
+pub async fn brush_pattern_image(state: State<'_, AppState>, id: u32) -> Result<Response, CommandError> {
+    let pattern = state.pattern(id).ok_or_else(|| EngineError::InvalidOperation("motif inconnu".into()))?;
+    let mut bytes = Vec::with_capacity(8 + pattern.gray.len());
+    bytes.extend_from_slice(&pattern.width.to_le_bytes());
+    bytes.extend_from_slice(&pattern.height.to_le_bytes());
+    bytes.extend_from_slice(&pattern.gray);
+    Ok(Response::new(bytes))
+}
+
 #[tauri::command]
 pub async fn stroke_end(state: State<'_, AppState>, doc_id: DocId) -> Result<EditResult, CommandError> {
     let entry = lookup(state.inner(), doc_id)?;
@@ -2598,6 +4283,58 @@ pub async fn stroke_end(state: State<'_, AppState>, doc_id: DocId) -> Result<Edi
 mod tests {
     use super::*;
     use engine::selection::Shape;
+
+    #[test]
+    fn reloading_the_interface_releases_every_raw_session() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../crates/engine/tests/fixtures/mire.dng");
+        let bytes = Arc::new(std::fs::read(&path).expect("mire"));
+        let ids: Vec<u32> = (0..2).map(|_| raw_register(Arc::clone(&bytes), &path).expect("RAW").id).collect();
+        assert!(ids.iter().all(|&id| raw_session(id).is_ok()), "sessions ouvertes");
+        raw_close_all();
+        assert!(ids.iter().all(|&id| raw_session(id).is_err()), "plus aucune session après le rechargement");
+    }
+
+    #[test]
+    fn only_project_pages_can_be_opened_and_errors_reach_the_ui_with_their_code() {
+        for url in ["https://exemple.com/", "file:///etc/passwd", "https://github.com/splaching-boop/Lumitype.evil/", "https://github.com/splaching-boop/Lumitype/issues\n--x"] {
+            let error = open_project_link(url.to_owned()).expect_err(url);
+            assert_eq!(error.code(), "E-APP-003", "{url}");
+        }
+        // Forme reçue par l'interface : { code, message }, causes comprises dans le message.
+        let missing = CommandError::from(EngineError::io("/nulle/part")(std::io::Error::from(std::io::ErrorKind::NotFound)));
+        let json = serde_json::to_value(&missing).expect("json");
+        assert_eq!(json["code"], "E-IO-001");
+        assert!(json["message"].as_str().is_some_and(|m| m.starts_with("accès au fichier impossible : /nulle/part — ")), "{json}");
+        assert_eq!(serde_json::to_value(CommandError::Interrupted).expect("json")["code"], "E-APP-002");
+    }
+
+    #[test]
+    fn json_files_are_the_only_thing_the_export_command_writes() {
+        let dir = tempfile::tempdir().expect("dossier temporaire");
+        let good = dir.path().join("formats.JSON");
+        let content = r#"{"version":1,"categories":[{"id":"perso-cat-a","label":"Client","formats":[]}]}"#;
+        write_json_file_at(&good, content).expect("export");
+        assert_eq!(std::fs::read_to_string(&good).expect("relu"), content);
+        assert!(!good.with_extension("json.tmp").exists(), "pas de fichier temporaire laissé");
+        // Remplacement : le nouveau contenu, entier.
+        write_json_file_at(&good, "[]").expect("remplacement");
+        assert_eq!(std::fs::read_to_string(&good).expect("relu"), "[]");
+
+        let refused = |path: &Path, content: &str| write_json_file_at(path, content).expect_err("refus").code();
+        for other in ["formats.txt", "formats.json.exe", "formats", ".bashrc"] {
+            assert_eq!(refused(&dir.path().join(other), "[]"), "E-APP-006", "{other}");
+            assert!(!dir.path().join(other).exists(), "{other} : rien n'est écrit");
+        }
+        assert_eq!(refused(Path::new("relatif.json"), "[]"), "E-APP-006", "chemin relatif");
+        assert_eq!(refused(dir.path(), "[]"), "E-APP-006", "un dossier");
+        let broken = dir.path().join("cassé.json");
+        assert_eq!(refused(&broken, "{ pas du json"), "E-APP-006", "JSON invalide");
+        assert_eq!(refused(&broken, ""), "E-APP-006", "vide");
+        let huge = format!("[{}0]", "0,".repeat(MAX_JSON_FILE_BYTES / 2));
+        assert!(huge.len() > MAX_JSON_FILE_BYTES);
+        assert_eq!(refused(&broken, &huge), "E-APP-006", "trop gros");
+        assert!(!broken.exists(), "rien n'est écrit quand c'est refusé");
+    }
 
     /// Rejoue ce que l'interface envoie : sélection d'une zone peinte puis glisser avec l'outil Déplacement.
     #[test]

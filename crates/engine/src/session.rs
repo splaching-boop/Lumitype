@@ -62,6 +62,27 @@ pub struct LayerArea {
     pub rect: [i32; 4],
 }
 
+/// Le stockage visé par le trait (sélection, masque ou pixels du calque) a-t-il changé entre l'état de départ et le
+/// document du trait ? Même `Arc` ou même version : rien n'a été peint.
+fn stroke_changed(base: &Document, painted: &Document, stroke: &Stroke) -> bool {
+    fn differs<const C: usize>(a: Option<&Arc<crate::tiles::Store<C>>>, b: Option<&Arc<crate::tiles::Store<C>>>) -> bool {
+        match (a, b) {
+            (Some(a), Some(b)) => !Arc::ptr_eq(a, b) && a.version() != b.version(),
+            (None, None) => false,
+            _ => true,
+        }
+    }
+    if stroke.on_selection() {
+        return differs(base.selection(), painted.selection());
+    }
+    let (Ok(before), Ok(after)) = (base.layer(stroke.layer()), painted.layer(stroke.layer())) else { return true };
+    if stroke.on_mask() {
+        differs(before.mask.as_ref().map(|m| &m.pixels), after.mask.as_ref().map(|m| &m.pixels))
+    } else {
+        differs(before.pixels(), after.pixels())
+    }
+}
+
 /// Rectangle couvert par des tuiles du repère d'un calque, ou rien.
 fn tiles_area(layer: LayerId, mask: bool, coords: &[TileCoord]) -> Option<LayerArea> {
     let size = crate::tiles::TILE_SIZE as i32;
@@ -134,6 +155,8 @@ pub struct Session {
     scratch: Option<crate::scratch::SharedScratch>,
     /// Réglages du disque de travail propres à cette session (tests) ; `None` : ceux de l'application.
     scratch_config: Option<crate::scratch::Config>,
+    /// Plan de travail isolé (module `work_area`) : les modifications hors de lui sont refusées.
+    work_area: Option<crate::document::LayerId>,
 }
 
 /// Ce qu'une révision a changé.
@@ -181,6 +204,7 @@ impl Session {
             changes: std::collections::VecDeque::new(),
             scratch: None,
             scratch_config: None,
+            work_area: None,
         }
     }
 
@@ -194,6 +218,7 @@ impl Session {
             changes: std::collections::VecDeque::new(),
             scratch: None,
             scratch_config: None,
+            work_area: None,
         }
     }
 
@@ -229,21 +254,23 @@ impl Session {
     /// Le calque `id` réduit au niveau demandé puis filtré, replacé dans le repère du document à cette
     /// échelle. C'est la brique commune de l'aperçu d'un filtre : dans la fenêtre du filtre comme sur la
     /// zone de travail, on compose ensuite l'image en substituant ces pixels à ceux du calque.
-    pub fn filtered_layer_at_level(&self, id: LayerId, filter: &crate::filters::Filter, level: u8) -> Result<crate::tiles::TileStore, EngineError> {
+    pub fn filtered_layer_at_level(&self, id: LayerId, filter: &crate::filters::Filter, level: u8, edit: Option<usize>) -> Result<crate::tiles::TileStore, EngineError> {
         use crate::transform::{Matrix, Quality, transform_store};
         let doc = self.document();
         let layer = doc.layer(id)?;
         if layer.smart().is_some() {
             return Err(EngineError::InvalidOperation(crate::smart::NOT_PAINTABLE.into()));
         }
-        let pixels = layer.pixels().ok_or_else(|| EngineError::InvalidOperation("un groupe ne se filtre pas".into()))?;
+        // Filtres dynamiques : l'origine, et la liste rejouée avec le filtre réglé (voir `Document::preview_list`).
+        let (pixels, list) = doc.preview_list(id, filter, edit)?;
+        let pixels = &pixels;
         let Some((x0, y0, _, _)) = pixels.pixel_bounds(|px| px[3] > 0) else {
             return Err(EngineError::InvalidOperation("ce calque est vide".into()));
         };
         let k = 1.0 / f64::from(1u32 << level);
         let origin = pixels.translated(-x0, -y0);
         let small = if level > 0 { transform_store(&origin, &Matrix::scaling(k), Quality::Final)? } else { origin };
-        let filtered = crate::filters::apply(&small, &filter.scaled(k as f32))?;
+        let filtered = crate::smart_filters::apply_list(&small, &list, k as f32)?;
         let (ox, oy) = layer.offset;
         Ok(filtered.translated((f64::from(x0 + ox) * k).round() as i32, (f64::from(y0 + oy) * k).round() as i32))
     }
@@ -262,11 +289,11 @@ impl Session {
     /// Aperçu d'un filtre DANS l'image : le calque `id` filtré, recomposé avec tous les autres calques, à une
     /// échelle réduite (puissance de deux) telle que le plus grand côté tienne dans `max_side`. Retourne
     /// largeur, hauteur et pixels RGBA à alpha droit. Le document n'est pas modifié.
-    pub fn filter_preview_in_context(&self, id: LayerId, filter: &crate::filters::Filter, max_side: u32) -> Result<(u32, u32, Vec<u8>), EngineError> {
+    pub fn filter_preview_in_context(&self, id: LayerId, filter: &crate::filters::Filter, max_side: u32, edit: Option<usize>) -> Result<(u32, u32, Vec<u8>), EngineError> {
         use crate::tiles::{TileCoord, TileStore, tiles_for};
         let doc = self.document();
         let level = self.level_for_side(max_side);
-        let placed = self.filtered_layer_at_level(id, filter, level)?;
+        let placed = self.filtered_layer_at_level(id, filter, level, edit)?;
 
         let (w, h) = ((doc.width() >> level).max(1), (doc.height() >> level).max(1));
         let mut flat = TileStore::new();
@@ -352,6 +379,11 @@ impl Session {
         (self.entries.iter().map(|e| e.label.as_str()).collect(), self.cursor)
     }
 
+    /// Plan de travail isolé (`None` : tous les plans), voir le module `work_area`.
+    pub fn set_work_area(&mut self, board: Option<crate::document::LayerId>) {
+        self.work_area = board;
+    }
+
     /// Applique une modification. En cas d'erreur, rien ne change.
     pub fn apply<T>(
         &mut self,
@@ -390,6 +422,9 @@ impl Session {
         self.ensure_resident(base)?;
         let mut next = self.entries[base].doc().clone();
         let value = edit(&mut next)?;
+        if let Some(board) = self.work_area {
+            next.confine_to_board(self.entries[base].doc(), board);
+        }
         let dirty = self.refresh(self.entries[self.cursor].doc(), &next);
         self.bump(&dirty);
 
@@ -403,7 +438,13 @@ impl Session {
             }
             self.cursor = self.entries.len() - 1;
         }
-        self.enforce_memory_cap();
+        // Un pas de geste qui fusionne avec l'état précédent (déplacement, transformation, curseur…) ne fait pas
+        // grossir l'historique : l'état qu'il remplace a déjà été compté quand il a été créé. Le plafond n'est
+        // donc fait respecter qu'à la création d'un état — jamais au milieu d'un geste, où serrer les caches et
+        // surtout écrire l'historique sur le disque de travail gelaient l'image sous la souris.
+        if !merge {
+            self.enforce_memory_cap();
+        }
         Ok((value, dirty))
     }
 
@@ -550,11 +591,43 @@ impl Session {
         dirty
     }
 
-    /// Modification hors historique (repli d'un groupe dans le panneau).
-    pub fn apply_silently(&mut self, edit: impl FnOnce(&mut Document) -> Result<(), EngineError>) -> Result<(), EngineError> {
+    /// Modification hors historique (repli d'un groupe dans le panneau, temps de travail). Elle vaut aussi pour le
+    /// document du trait en cours, sinon la fin du trait la perdrait en poussant un état pris avant elle.
+    pub fn apply_silently(&mut self, edit: impl Fn(&mut Document) -> Result<(), EngineError>) -> Result<(), EngineError> {
         let mut next = self.entries[self.cursor].doc().clone();
         edit(&mut next)?;
         self.entries[self.cursor].state = State::Resident(next);
+        if let Some((document, _)) = self.live.as_mut() {
+            edit(document)?;
+        }
+        Ok(())
+    }
+
+    /// Groupe déplié ou replié dans le panneau Calques. Ce n'est pas une modification de l'image : l'état est porté par
+    /// TOUS les états de l'historique (et le trait en cours), sinon un Ctrl+Z, ou un geste qui repart de l'état d'avant
+    /// lui (déplacement en cours de chargement), repliait de lui-même le groupe qu'on venait de déplier.
+    pub fn set_expanded(&mut self, id: LayerId, expanded: bool) -> Result<(), EngineError> {
+        self.entries[self.cursor].doc().layer(id)?;
+        let mut current = self.entries[self.cursor].doc().clone();
+        current.set_expanded(id, expanded)?;
+        self.entries[self.cursor].state = State::Resident(current);
+        for (i, entry) in self.entries.iter_mut().enumerate() {
+            if i == self.cursor {
+                continue;
+            }
+            // Un état où le calque n'existe pas encore (ou plus) n'a rien à retenir.
+            match &mut entry.state {
+                State::Resident(doc) => {
+                    let _ = doc.set_expanded(id, expanded);
+                }
+                State::Spilled(spilled) => {
+                    let _ = spilled.skeleton_mut().set_expanded(id, expanded);
+                }
+            }
+        }
+        if let Some((doc, _)) = &mut self.live {
+            let _ = doc.set_expanded(id, expanded);
+        }
         Ok(())
     }
 
@@ -607,9 +680,25 @@ impl Session {
 
     /// `deferred` : le trait est esquissé à l'écran par la carte graphique ; le calque n'est recomposé qu'à la fin.
     pub fn begin_stroke_with(&mut self, layer: LayerId, on_mask: bool, brush: Brush, kind: BrushKind, dynamics: BrushDynamics, deferred: bool) -> Result<(), EngineError> {
+        self.begin_stroke_styled(layer, on_mask, brush, kind, dynamics, deferred, None, None)
+    }
+
+    /// Comme `begin_stroke_with`, avec le pinceau double et la texture d'un préréglage.
+    #[allow(clippy::too_many_arguments)]
+    pub fn begin_stroke_styled(
+        &mut self,
+        layer: LayerId,
+        on_mask: bool,
+        brush: Brush,
+        kind: BrushKind,
+        dynamics: BrushDynamics,
+        deferred: bool,
+        dual: Option<crate::paint::DualBrush>,
+        texture: Option<crate::paint::BrushTexture>,
+    ) -> Result<(), EngineError> {
         self.finish_stroke();
         let document = self.entries[self.cursor].doc().clone();
-        let stroke = Stroke::begin(&document, layer, on_mask, brush)?.with_kind(kind).with_dynamics(dynamics).with_deferred(deferred);
+        let stroke = Stroke::begin(&document, layer, on_mask, brush)?.with_kind(kind).with_dynamics(dynamics).with_dual(dual).with_texture(texture).with_deferred(deferred);
         self.live = Some((document, stroke));
         Ok(())
     }
@@ -639,23 +728,50 @@ impl Session {
         Ok(dirty)
     }
 
+    /// Empreintes de pointe calculées par l'interface (voir `Stroke::extend_stamps`), posées telles quelles.
+    pub fn extend_stroke_stamps(&mut self, stamps: &[crate::paint::Stamp], duals: &[crate::paint::DualStamp]) -> Result<Dirty, EngineError> {
+        let (document, stroke) =
+            self.live.as_mut().ok_or_else(|| EngineError::InvalidOperation("aucun trait en cours".into()))?;
+        let local = stroke.extend_stamps(document, stamps, duals)?;
+        let tiles = self.renderer.invalidate_tiles(document, stroke.layer(), stroke.on_mask(), &local);
+        let areas = tiles_area(stroke.layer(), stroke.on_mask(), &local).into_iter().collect();
+        let dirty = Dirty { all: false, tiles, layers: vec![stroke.layer()], selection: false, repainted: vec![stroke.layer()], areas };
+        self.bump(&dirty);
+        Ok(dirty)
+    }
+
     /// Termine le trait : il devient un état de l'historique. Sans effet s'il n'y en a pas.
     /// Retourne les tuiles du dernier bout de trait (le lissage garde un demi-segment d'avance).
     pub fn finish_stroke(&mut self) -> Dirty {
         let Some((mut document, mut stroke)) = self.live.take() else { return Dirty::default() };
         // Une erreur ici ne peut venir que d'un calque disparu entre-temps : le trait déjà peint est conservé.
         let local = stroke.finish(&mut document).unwrap_or_default();
+        // Plan isolé : ce que le trait a posé hors de lui (sur un calque d'un autre plan) est retiré. Les tuiles
+        // concernées sont celles du trait, déjà invalidées ci-dessous.
+        if let Some(board) = self.work_area {
+            document.confine_to_board(self.entries[self.cursor].doc(), board);
+        }
         let dirty = if stroke.on_selection() {
             if document.selection().is_some_and(|s| s.tile_count() == 0) {
                 document.set_selection(None); // tout a été gommé : plus de sélection du tout
             }
             Dirty { selection: true, ..Dirty::default() }
         } else {
+            // Pendant le trait, les effets du calque n'étaient recalculés qu'autour des tuiles peintes (voir
+            // `TileRenderer::styled_stores`) ; le trait fini, ils sont refaits en entier, exactement, une fois.
+            let effects = !stroke.on_mask() && document.layer(stroke.layer()).is_ok_and(|l| crate::effects::any_enabled(&l.effects));
+            if effects {
+                self.renderer.forget_layer(stroke.layer());
+            }
             let tiles = self.renderer.invalidate_tiles(&document, stroke.layer(), stroke.on_mask(), &local);
             let areas = tiles_area(stroke.layer(), stroke.on_mask(), &local).into_iter().collect();
-            Dirty { all: false, tiles, layers: vec![stroke.layer()], selection: false, repainted: vec![stroke.layer()], areas }
+            Dirty { all: effects, tiles, layers: vec![stroke.layer()], selection: false, repainted: vec![stroke.layer()], areas }
         };
         self.bump(&dirty);
+        // Trait sans effet (aucun point, pinceau refusé à chaque point…) : pas d'état vide dans l'historique.
+        if !stroke_changed(self.entries[self.cursor].doc(), &document, &stroke) {
+            return dirty;
+        }
         let label = if stroke.on_selection() { "Masque rapide" } else if stroke.on_mask() { "Pinceau (masque)" } else { "Pinceau" };
         self.entries.truncate(self.cursor + 1);
         self.entries.push(Entry::new(label, document, None));
@@ -681,14 +797,16 @@ impl Session {
                 if previous.offset == layer.offset {
                     continue;
                 }
-                // Un calque à effets déborde de ses pixels (ombre, halo) : on ne sait pas borner la zone touchée.
-                if crate::effects::any_enabled(&layer.effects) {
-                    dirty.all = true;
-                }
+                // Un calque à effets déborde de ses pixels (ombre, halo) : au plus de la portée de ses effets.
+                // Le rendu stylé, en repère du calque, ne change pas quand il se déplace : seule sa place change,
+                // donc l'emprise élargie d'autant suffit, sans recomposer toute l'image (un groupe de plusieurs
+                // calques à effets recomposait tout le document à chaque pas du déplacement).
+                let reach = crate::effects::reach_enabled(&layer.effects);
+                let grow = |(x0, y0, x1, y1): (i32, i32, i32, i32)| (x0 - reach, y0 - reach, x1 + reach, y1 + reach);
                 // Emprise des pixels, et celle du masque : il suit la position du calque, donc ce qu'il cache
                 // change de place aussi. Un groupe n'a pas de pixels (ses enfants, décalés avec lui, ont les
                 // leurs) : seule l'emprise de son masque compte.
-                let pixels = layer.pixels().and_then(|p| p.bounds());
+                let pixels = layer.pixels().and_then(|p| p.bounds()).map(grow);
                 let mask = layer.mask.as_ref().and_then(|m| m.pixels.bounds());
                 for bounds in pixels.into_iter().chain(mask) {
                     for offset in [previous.offset, layer.offset] {
@@ -713,7 +831,8 @@ impl Session {
                 dirty.layers.push(layer.id); // miniature cadrée sur le document : elle change avec la position
             }
             if let (Some(a), Some(b)) = (previous.pixels(), layer.pixels()) {
-                if !std::sync::Arc::ptr_eq(a, b) {
+                // Même version : mêmes pixels, même ailleurs en mémoire (état relu du disque de travail).
+                if !std::sync::Arc::ptr_eq(a, b) && a.version() != b.version() {
                     // Pixels modifiés sous des effets : l'ombre ou le halo changent aussi, bien au-delà des tuiles peintes.
                     if crate::effects::any_enabled(&layer.effects) {
                         self.renderer.forget_layer(layer.id);
@@ -733,7 +852,7 @@ impl Session {
                     dirty.layers.push(layer.id);
                     dirty.repainted.push(layer.id);
                 }
-                (Some(a), Some(b)) if !std::sync::Arc::ptr_eq(&a.pixels, &b.pixels) => {
+                (Some(a), Some(b)) if !std::sync::Arc::ptr_eq(&a.pixels, &b.pixels) && a.pixels.version() != b.pixels.version() => {
                     let coords = a.pixels.changed_coords(&b.pixels);
                     dirty.tiles.extend(self.renderer.invalidate_tiles(new, layer.id, true, &coords));
                     dirty.areas.extend(tiles_area(layer.id, true, &coords));
@@ -874,6 +993,33 @@ mod tests {
         assert_eq!(rendered(&session, 40, 50), [255, 0, 0, 255]);
     }
 
+    /// Un trait sans effet (aucun point) ne laisse pas d'état vide ; un calque à filtres dynamiques est refusé dès
+    /// le début du trait ; une modification hors historique pendant un trait est gardée à la fin du trait.
+    #[test]
+    fn empty_strokes_leave_no_state_and_silent_edits_survive_a_stroke() {
+        let (mut session, id) = session();
+        let before = session.history().0.len();
+        session.begin_stroke(id, false, red(), BrushKind::Round, BrushDynamics::default()).expect("début");
+        session.finish_stroke();
+        assert_eq!(session.history().0.len(), before, "trait vide : aucun état");
+
+        session.begin_stroke(id, false, red(), BrushKind::Round, BrushDynamics::default()).expect("début");
+        session.apply_silently(|doc| {
+            doc.work_seconds = 42;
+            Ok(())
+        })
+        .expect("hors historique");
+        session.extend_stroke(&[StrokePoint { x: 20.0, y: 50.0, pressure: 1.0 }]).expect("trait");
+        session.finish_stroke();
+        assert_eq!(session.history().0.len(), before + 1);
+        assert_eq!(session.document().work_seconds, 42, "la modification silencieuse survit au trait");
+
+        session.apply("Filtres", None, |doc| doc.apply_filter(id, &crate::filters::Filter::GaussianBlur { radius: 2.0 })).expect("filtres");
+        let refused = session.begin_stroke(id, false, red(), BrushKind::Round, BrushDynamics::default());
+        assert!(refused.is_err(), "calque à filtres dynamiques : refusé au début du trait");
+        assert!(session.live.is_none());
+    }
+
     #[test]
     fn a_low_memory_cap_prunes_the_oldest_states_but_never_below_the_minimum() {
         let (mut session, id) = session();
@@ -926,6 +1072,46 @@ mod tests {
             expected.push(pixels(&session));
         }
         (session, id, expected, dir)
+    }
+
+    /// Un état relu du disque de travail garde la version de ses pixels : les caches de rendu (contenu figé des
+    /// groupes, effets) le reconnaissent, et rien n'est signalé comme repeint au Ctrl+Z.
+    #[test]
+    fn a_state_read_back_from_the_scratch_disk_keeps_its_pixel_versions() {
+        let (mut session, id, _, _dir) = spilling_session(true, crate::scratch::DEFAULT_QUOTA);
+        let version = |doc: &Document| doc.layer(id).ok().and_then(|l| l.pixels().map(|p| p.version()));
+        let before: Vec<Option<u64>> = session.entries.iter().map(|e| version(e.doc())).collect();
+        let cap = session.resident_tile_bytes() / 3;
+        session.fit_history(&move |s: &Session| s.resident_tile_bytes() > cap);
+        assert!(session.entries.iter().any(|e| e.resident().is_none()), "des états sont partis sur le disque");
+        for index in (1..session.entries.len()).rev() {
+            assert_eq!(version(session.document()), before[index], "état {index}");
+            session.undo();
+        }
+        // Retour à un état relu, puis à son voisin déjà en mémoire : les pixels relus ne comptent pas comme repeints.
+        session.jump(3);
+        let dirty = session.jump(4);
+        assert!(dirty.repainted.contains(&id), "un vrai changement reste signalé");
+        let again = session.refresh(session.document(), session.document());
+        assert!(again.repainted.is_empty());
+    }
+
+    /// Déplier un groupe vaut pour tout l'historique : ni un Ctrl+Z ni un geste qui repart de l'état d'avant ne le
+    /// replient.
+    #[test]
+    fn expanding_a_group_survives_undo_and_gestures() {
+        let (mut session, _) = session();
+        let (group, _) = session.apply("Nouveau groupe", None, |doc| doc.add_group("G", None, 1)).expect("groupe");
+        let expanded = |s: &Session| matches!(s.document().layer(group).expect("groupe").kind, crate::document::LayerKind::Group { expanded: true, .. });
+        session.set_expanded(group, false).expect("replié");
+        session.apply_gesture("Déplacer", "g".into(), |doc| doc.translate_layers(&[group], 5, 0)).expect("pas 1");
+        session.set_expanded(group, true).expect("déplié");
+        // Pas suivant du même geste : il repart de l'état d'avant le geste.
+        session.apply_gesture("Déplacer", "g".into(), |doc| doc.translate_layers(&[group], 9, 0)).expect("pas 2");
+        assert!(expanded(&session), "toujours déplié après le geste");
+        session.undo();
+        assert!(expanded(&session), "toujours déplié après Ctrl+Z");
+        assert!(session.set_expanded(9999, true).is_err());
     }
 
     #[test]
@@ -1055,6 +1241,23 @@ mod tests {
     }
 
     #[test]
+    fn deleting_every_layer_leaves_one_empty_layer_in_one_step() {
+        let (mut session, id) = session();
+        session.apply("Remplir", None, |doc| doc.pixels_mut(id).map(|p| p.fill(512, 256, [0, 0, 255, 255]))).expect("remplir");
+        let all: Vec<_> = session.document().walk_top_down().into_iter().map(|(_, l)| l.id).collect();
+        let states = session.history().0.len();
+        session.apply("Supprimer", None, |doc| doc.remove_layers(&all)).expect("le dernier calque devient un calque vide");
+        let left: Vec<_> = session.document().walk_top_down().into_iter().map(|(_, l)| l).collect();
+        assert_eq!(left.len(), 1);
+        assert!(!all.contains(&left[0].id), "identifiant neuf");
+        assert_eq!(left[0].props.name, "Calque 1");
+        assert_eq!(rendered(&session, 5, 5)[3], 0, "transparent");
+        assert_eq!(session.history().0.len(), states + 1);
+        session.undo();
+        assert_eq!(rendered(&session, 5, 5), [0, 0, 255, 255]);
+    }
+
+    #[test]
     fn a_drag_gesture_is_one_state_and_never_accumulates() {
         let (mut session, id) = session();
         let states = session.history().0.len();
@@ -1087,6 +1290,33 @@ mod tests {
         assert!(!dirty.all, "un déplacement ne périme pas toute l'image");
         assert_eq!(dirty.tiles, vec![TileCoord::new(0, 0), TileCoord::new(4, 2)]);
         assert_eq!((tile(&session, 0, 0), tile(&session, 4, 2)), ([255; 4], [255, 0, 0, 255]), "cache de rendu à jour");
+    }
+
+    #[test]
+    fn moving_a_layer_with_effects_only_dirties_its_reach_not_the_whole_image() {
+        use crate::blend::BlendMode;
+        use crate::effects::LayerEffect;
+        let document = Document::with_background("x", 2048, 2048, 72.0, Background::White).expect("document");
+        let mut session = Session::new(document, "Nouveau");
+        let mut pixels = TileStore::new();
+        pixels.fill(100, 100, [255, 0, 0, 255]);
+        let (id, _) = session.apply("Calque", None, |doc| doc.add_pixel_layer("rouge", pixels, None, 1)).expect("calque");
+        let shadow = LayerEffect::DropShadow { enabled: true, color: [0, 0, 0], opacity: 1.0, angle: 120.0, distance: 20.0, size: 10.0, blend: BlendMode::Normal };
+        session.apply("Effets de calque", None, |doc| doc.set_effects(id, vec![shadow])).expect("effet");
+        let tile = |session: &Session, x, y| session.renderer().tile(session.document(), 0, TileCoord::new(x, y)).expect("tuile").pixel(10, 10);
+        assert_eq!(tile(&session, 0, 0), [255, 0, 0, 255]);
+        assert_eq!(tile(&session, 7, 7), [255; 4]);
+
+        let (_, dirty) = session.apply("Déplacer", None, |doc| doc.translate_layers(&[id], 1024, 512)).expect("déplacement");
+        assert!(!dirty.all, "un calque à effets qui se déplace ne périme pas toute l'image");
+        // L'emprise est à la tuile près (la tuile (0, 0) du calque) + la portée de l'ombre (20 + 16 + 2 = 38 px) :
+        // au départ comme à l'arrivée, la tuile et ses voisines débordées — jamais les 64 tuiles du document.
+        assert!(!dirty.tiles.is_empty() && dirty.tiles.len() <= 16, "tuiles périmées : {:?}", dirty.tiles);
+        assert!(dirty.tiles.contains(&TileCoord::new(0, 0)) && dirty.tiles.contains(&TileCoord::new(4, 2)));
+        assert_eq!((tile(&session, 0, 0), tile(&session, 4, 2)), ([255; 4], [255, 0, 0, 255]), "cache de rendu à jour");
+        // L'ombre a suivi : sous le carré déplacé, à (1024 + 100 + 10, 512 + 100 + 10), il y a de l'ombre, pas du blanc.
+        let under = session.renderer().tile(session.document(), 0, TileCoord::new(4, 2)).expect("tuile").pixel(118, 118);
+        assert!(under[0] < 255, "ombre portée sous le carré déplacé : {under:?}");
     }
 
     #[test]
@@ -1165,7 +1395,7 @@ mod tests {
         document.translate_layers(&[green], 300, 300).expect("position");
         let session = Session::new(document, "Nouveau");
 
-        let (w, h, rgba) = session.filter_preview_in_context(red, &Filter::GaussianBlur { radius: 40.0 }, 512).expect("aperçu");
+        let (w, h, rgba) = session.filter_preview_in_context(red, &Filter::GaussianBlur { radius: 40.0 }, 512, None).expect("aperçu");
         assert_eq!((w, h), (512, 512), "document réduit de moitié");
         let at = |x: usize, y: usize| [rgba[(y * 512 + x) * 4], rgba[(y * 512 + x) * 4 + 1], rgba[(y * 512 + x) * 4 + 2]];
         assert_eq!(at(10, 10), [255, 255, 255], "le fond est là");

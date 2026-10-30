@@ -23,13 +23,14 @@ if (!process.env.PARITY_DIR) {
 
 // Modules de l'interface, transpilés tels quels (imports relatifs réécrits en .js).
 const modules = {};
-for (const [name, file] of [["gpu-plan.js", "lib/gpu-plan.ts"], ["gpu-layers.js", "viewport/gpu-layers.ts"], ["shaders.js", "viewport/shaders.ts"]]) {
+for (const [name, file] of [["gpu-plan.js", "lib/gpu-plan.ts"], ["gpu-layers.js", "viewport/gpu-layers.ts"], ["shaders.js", "viewport/shaders.ts"], ["move-cache.js", "viewport/move-cache.ts"], ["camera.js", "viewport/camera.ts"], ["paced.js", "viewport/paced.ts"]]) {
   const source = fs.readFileSync(path.join(here, "../src", file), "utf8");
   const out = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 } }).outputText;
   modules[name] = out.replace(/from "\.\.\/lib\/gpu-plan"/g, 'from "./gpu-plan.js"').replace(/from "\.\/(\w[\w-]*)"/g, 'from "./$1.js"');
 }
 modules["harness.js"] = `
 import { GpuLayers } from "./gpu-layers.js";
+import { MoveCache } from "./move-cache.js";
 import { VERTEX_SHADER } from "./shaders.js";
 const bytes = (b64) => Uint8Array.from(atob(b64), (c) => c.charCodeAt(0)).buffer;
 window.compose = async (info, files, scale) => {
@@ -95,12 +96,75 @@ window.compose = async (info, files, scale) => {
     for (let i = 0; i < first.length; i++) partialGap = Math.max(partialGap, Math.abs(first[i] - second[i]));
     gl.clear(gl.COLOR_BUFFER_BIT);
   }
+  // Aperçu de transformation (cadre) : une homographie qui n'est qu'une translation doit donner exactement l'image du
+  // décalage de déplacement (même texture, même échantillonnage, pixels et masque), par la pile comme par le programme.
+  let matrixGap = null;
+  if (moved) {
+    const read = (overrides) => { gl.clear(gl.COLOR_BUFFER_BIT); gpu.draw(view, overrides); const out = new Uint8Array(canvas.width * canvas.height * 4); gl.readPixels(0, 0, canvas.width, canvas.height, gl.RGBA, gl.UNSIGNED_BYTE, out); return out; };
+    const translation = { forward: [1, 0, 37, 0, 1, -23, 0, 0, 1], inverse: [1, 0, -37, 0, 1, 23, 0, 0, 1] };
+    const byShift = read({ shift: (id) => (id === moved.id ? [37, -23] : [0, 0]), opacity: (id, opacity) => opacity });
+    const byMatrix = read({ shift: () => [0, 0], opacity: (id, opacity) => opacity, matrix: (id) => (id === moved.id ? translation : null) });
+    matrixGap = 0;
+    for (let i = 0; i < byShift.length; i++) matrixGap = Math.max(matrixGap, Math.abs(byShift[i] - byMatrix[i]));
+    gl.clear(gl.COLOR_BUFFER_BIT);
+  }
+  // Déplacement d'un groupe (document « groupe-deplace ») : par images en cache (couches du moteur assemblées ici), par
+  // l'aplat du groupe à la place de son sous-programme, et par le décalage de chacun de ses calques. Chaque image est
+  // comparée à celle du moteur après le déplacement (moved.bin).
+  let moveGaps = null;
+  if (files.layout) {
+    const layout = JSON.parse(new TextDecoder().decode(bytes(files.layout)));
+    const want = new Uint8Array(bytes(files.moved));
+    const [dx, dy] = [37, -23];
+    const gap = () => {
+      const out = new Uint8Array(canvas.width * canvas.height * 4);
+      gl.readPixels(0, 0, canvas.width, canvas.height, gl.RGBA, gl.UNSIGNED_BYTE, out);
+      const stride = canvas.width * 4;
+      let worst = 0;
+      for (let y = 0; y < canvas.height; y++) {
+        const row = (canvas.height - 1 - y) * stride;
+        for (let i = 0; i < stride; i++) worst = Math.max(worst, Math.abs(out[row + i] - want[y * stride + i]));
+      }
+      return worst;
+    };
+    const size = { width: info.width, height: info.height, maxLevel: 0 };
+    const source = (prefix) => ({ layout: async () => layout, slice: async (_ids, index) => bytes(files[prefix + index]), adjust: async (adjustment) => fetchAdjust(adjustment) });
+    const cached = new MoveCache(gl, source("s"), info.id, layout.moving, size, view, () => 1e12, "layers", () => {});
+    const flat = new MoveCache(gl, source("c"), info.id, layout.moving, size, view, () => 1e12, "collapse", () => {});
+    await cached.whenReady();
+    await flat.whenReady();
+    for (let i = 0; i < 100 && (cached.level !== 0 || flat.level !== 0); i++) await new Promise((r) => setTimeout(r, 5));
+    const group = layout.moving[0];
+    const inside = new Set([group]);
+    for (let grew = true; grew; ) {
+      grew = false;
+      for (const l of info.layers) {
+        if (l.parent === null || !inside.has(l.parent) || inside.has(l.id)) continue;
+        inside.add(l.id);
+        grew = true;
+      }
+    }
+    const moving = { shift: (id) => (inside.has(id) ? [dx, dy] : [0, 0]), opacity: (id, opacity) => opacity };
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gpu.drawCached(view, info, cached.slices, [dx, dy]);
+    const layers = gap();
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gpu.setCollapse(group, flat.slices[0]);
+    gpu.draw(view, moving);
+    const collapsed = gap();
+    gpu.setCollapse(null, null);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gpu.draw(view, moving);
+    const shifted = gap();
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    moveGaps = { layers, collapsed, shifted, slices: cached.slices.length };
+  }
   // Lignes de bas en haut -> de haut en bas.
   const rows = [];
   const stride = canvas.width * 4;
   for (let y = canvas.height - 1; y >= 0; y--) rows.push(...pixels.subarray(y * stride, (y + 1) * stride));
   const floatTargets = gpu["floatTargets"];
-  return { pixels: rows, glError: error, floatTargets, simple: gpu["plan"].simple, partialGap };
+  return { pixels: rows, glError: error, floatTargets, simple: gpu["plan"].simple, partialGap, matrixGap, moveGaps, moveError: gl.getError() };
 };
 window.harnessReady = true;
 `;
@@ -125,7 +189,8 @@ await page.goto("http://parity.test/index.html");
 await page.waitForFunction(() => window.harnessReady === true);
 
 /** Tolérance (valeurs 0-255) : arrondis des demi-flottants ; puissances et exponentielles des réglages. */
-const tolerance = (name) => (name.startsWith("reglage") ? 3 : 2);
+// « mode-couleur-gris » contient un réglage Teinte/Saturation : même tolérance que les documents de réglages.
+const tolerance = (name) => (name.startsWith("reglage") || name === "mode-couleur-gris" ? 3 : 2);
 const names = JSON.parse(fs.readFileSync(path.join(data, "index.json"), "utf8"));
 let failures = 0;
 let worstOverall = 0;
@@ -156,8 +221,17 @@ for (const name of names) {
   const verdict = over === 0 ? "ok" : `ÉCHEC, ${over} valeurs hors tolérance`;
   // Aperçu de déplacement : deux images de suite identiques, au pixel près.
   const partial = result.partialGap === null ? "" : result.partialGap === 0 ? "  déplacement : stable" : `  déplacement : ÉCART ${result.partialGap}`;
-  console.log(`${name.padEnd(28)} écart max ${String(worst).padStart(3)}  ${result.simple ? "direct  " : "programme"}  ${verdict}${over ? where : ""}${result.glError ? ` erreur GL ${result.glError}` : ""}${partial}`);
-  if (over > 0 || result.glError || (result.partialGap !== null && result.partialGap !== 0)) failures += 1;
+  // Aperçu de transformation : translation par matrice = décalage de déplacement (à un arrondi près).
+  const matrix = result.matrixGap === null ? "" : result.matrixGap <= 1 ? "  matrice : ok" : `  matrice : ÉCART ${result.matrixGap}`;
+  console.log(`${name.padEnd(28)} écart max ${String(worst).padStart(3)}  ${result.simple ? "direct  " : "programme"}  ${verdict}${over ? where : ""}${result.glError ? ` erreur GL ${result.glError}` : ""}${partial}${matrix}`);
+  if (over > 0 || result.glError || (result.partialGap !== null && result.partialGap !== 0) || (result.matrixGap !== null && result.matrixGap > 1)) failures += 1;
+  // Groupe déplacé : images en cache, aplat du groupe, décalage des calques — contre le moteur après déplacement.
+  if (result.moveGaps) {
+    const g = result.moveGaps;
+    const bad = g.layers > 3 || g.collapsed > 3 || g.shifted > 3 || result.moveError;
+    console.log(`${"  groupe déplacé".padEnd(28)} images en cache (${g.slices} couches) ${g.layers}, aplat ${g.collapsed}, calques décalés ${g.shifted}  ${bad ? "ÉCHEC" : "ok"}${result.moveError ? ` erreur GL ${result.moveError}` : ""}`);
+    if (bad) failures += 1;
+  }
 }
 // Zoom à 200 % : chaque pixel du document couvre 2 × 2 pixels d'écran (pixels nets) ; même image, agrandie. Vérifie
 // le placement des calques, des masques et du bruit de Dissoudre à une autre échelle que 1.

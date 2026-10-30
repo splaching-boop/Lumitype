@@ -1,4 +1,5 @@
-//! Effets de calque (« fx ») : ombre portée, ombre interne, lueurs, contour, incrustation de couleur.
+//! Effets de calque (« fx ») : ombre portée, ombre interne, lueurs, contour, incrustations (couleur, dégradé,
+//! motif), satin, biseautage et estampage.
 //!
 //! Non destructifs : le calque garde ses pixels et la liste de ses effets. Le compositeur ne voit
 //! que le résultat, un « calque stylé » — effets du dessous, pixels, effets du dessus — calculé une
@@ -16,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::EngineError;
 use crate::filters::gaussian;
 use crate::tiles::TileStore;
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -26,10 +28,100 @@ pub enum StrokePosition {
     Center,
 }
 
+/// Style du biseautage (comme Photoshop) : où se trouve le relief par rapport au bord du calque.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BevelStyle {
+    /// Le relief est taillé à l'extérieur du calque (le calque semble posé sur un socle).
+    OuterBevel,
+    /// Le relief est taillé dans le calque, depuis son bord vers l'intérieur.
+    #[default]
+    InnerBevel,
+    /// Le relief est à cheval sur le bord : le calque semble sortir du fond.
+    Emboss,
+    /// Estampage paysager : le bord s'enfonce dans le fond, comme une couture de coussin.
+    PillowEmboss,
+}
+
+/// Technique du biseautage : profil arrondi (Lisse) ou taillé net (Ciselé dur).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BevelTechnique {
+    #[default]
+    Smooth,
+    ChiselHard,
+}
+
+/// Direction du relief : bombé vers le haut (vers la lumière) ou creusé vers le bas.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BevelDirection {
+    #[default]
+    Up,
+    Down,
+}
+
+/// Identifiant d'un motif de la bibliothèque (`crate::patterns`), gardé dans un tableau fixe pour que les effets
+/// restent copiables (`Copy`) ; enregistré dans les fichiers comme une simple chaîne.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct PatternId {
+    bytes: [u8; 24],
+    len: u8,
+}
+
+impl PatternId {
+    /// Identifiant `id` (tronqué à 24 octets, à une frontière de caractère : aucun motif livré n'en approche).
+    pub fn new(id: &str) -> Self {
+        let mut end = id.len().min(24);
+        while !id.is_char_boundary(end) {
+            end -= 1;
+        }
+        let mut bytes = [0u8; 24];
+        bytes[..end].copy_from_slice(&id.as_bytes()[..end]);
+        Self { bytes, len: end as u8 }
+    }
+
+    pub fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.bytes[..self.len as usize]).unwrap_or("")
+    }
+}
+
+impl Default for PatternId {
+    fn default() -> Self {
+        Self::new("pois")
+    }
+}
+
+impl std::fmt::Debug for PatternId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self.as_str())
+    }
+}
+
+impl Serialize for PatternId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for PatternId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let id = String::deserialize(deserializer)?;
+        Ok(Self::new(&id))
+    }
+}
+
+const fn hundred() -> f32 {
+    100.0
+}
+
 /// Un effet. `opacity` de 0 à 1 ; longueurs en pixels ; `angle` en degrés : direction d'où vient la
 /// lumière (120° = en haut à gauche, l'ombre part donc en bas à droite).
+///
+/// Champs en camelCase dans les fichiers et l'interface (`highlightOpacity`…) ; les anciens champs, d'un seul mot,
+/// ne changent pas : les fichiers d'avant s'ouvrent tels quels.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "camelCase")]
+#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum LayerEffect {
     // `blend` : mode de fusion de l'effet (Normal pour les fichiers d'avant son apparition). Ombre portée et lueur
     // externe se fondent dans ce qui est SOUS le calque ; les autres, dans le calque lui-même (comme Photoshop).
@@ -42,6 +134,48 @@ pub enum LayerEffect {
     /// Incrustation de dégradé : de `from` à `to` à travers le contenu du calque, dans la direction
     /// `angle` (0° = vers la droite, 90° = vers le haut), ou du centre vers les bords si `radial`.
     GradientOverlay { enabled: bool, from: [u8; 3], to: [u8; 3], opacity: f32, angle: f32, radial: bool, #[serde(default)] blend: BlendMode },
+    /// Incrustation de motif : un motif bicolore de la bibliothèque (`crate::patterns`), `color` pour le dessin et
+    /// `background` pour le fond, à l'échelle `scale` (en %, 100 = taille d'origine), lié au calque (il le suit
+    /// quand on le déplace), limité à sa forme.
+    PatternOverlay {
+        enabled: bool,
+        pattern: PatternId,
+        #[serde(default = "hundred")]
+        scale: f32,
+        color: [u8; 3],
+        background: [u8; 3],
+        opacity: f32,
+        #[serde(default)]
+        blend: BlendMode,
+    },
+    /// Satin : ombrage intérieur ondulé, différence de deux copies floutées de la forme décalées de part et d'autre
+    /// (`distance` dans la direction `angle`), limité à la forme ; `invert` en prend le complément.
+    Satin { enabled: bool, color: [u8; 3], opacity: f32, angle: f32, distance: f32, size: f32, #[serde(default)] invert: bool, #[serde(default)] blend: BlendMode },
+    /// Biseautage et estampage : relief tiré de la forme du calque (carte de hauteur sur `size` pixels autour du
+    /// bord), éclairé depuis `angle` (degrés) et `altitude` (degrés au-dessus de l'horizon) ; les pentes tournées
+    /// vers la lumière reçoivent les hautes lumières (`highlight`, en Écran par défaut), les autres les ombres
+    /// (`shadow`, en Produit). `depth` : 1 = 100 % (pente de 45° pour un profil droit). `soften` adoucit le relief.
+    BevelEmboss {
+        enabled: bool,
+        #[serde(default)]
+        style: BevelStyle,
+        #[serde(default)]
+        technique: BevelTechnique,
+        depth: f32,
+        #[serde(default)]
+        direction: BevelDirection,
+        size: f32,
+        #[serde(default)]
+        soften: f32,
+        angle: f32,
+        altitude: f32,
+        highlight: [u8; 3],
+        highlight_opacity: f32,
+        highlight_blend: BlendMode,
+        shadow: [u8; 3],
+        shadow_opacity: f32,
+        shadow_blend: BlendMode,
+    },
 }
 
 impl LayerEffect {
@@ -53,7 +187,11 @@ impl LayerEffect {
             | Self::InnerGlow { blend, .. }
             | Self::Stroke { blend, .. }
             | Self::ColorOverlay { blend, .. }
-            | Self::GradientOverlay { blend, .. } => blend,
+            | Self::GradientOverlay { blend, .. }
+            | Self::PatternOverlay { blend, .. }
+            | Self::Satin { blend, .. } => blend,
+            // Deux modes (hautes lumières, ombres) : celui des hautes lumières représente l'effet.
+            Self::BevelEmboss { highlight_blend, .. } => highlight_blend,
         }
     }
 
@@ -65,7 +203,16 @@ impl LayerEffect {
 
     pub(crate) fn enabled(&self) -> bool {
         match *self {
-            Self::DropShadow { enabled, .. } | Self::InnerShadow { enabled, .. } | Self::OuterGlow { enabled, .. } | Self::InnerGlow { enabled, .. } | Self::Stroke { enabled, .. } | Self::ColorOverlay { enabled, .. } | Self::GradientOverlay { enabled, .. } => enabled,
+            Self::DropShadow { enabled, .. }
+            | Self::InnerShadow { enabled, .. }
+            | Self::OuterGlow { enabled, .. }
+            | Self::InnerGlow { enabled, .. }
+            | Self::Stroke { enabled, .. }
+            | Self::ColorOverlay { enabled, .. }
+            | Self::GradientOverlay { enabled, .. }
+            | Self::PatternOverlay { enabled, .. }
+            | Self::Satin { enabled, .. }
+            | Self::BevelEmboss { enabled, .. } => enabled,
         }
     }
 
@@ -77,6 +224,12 @@ impl LayerEffect {
             Self::DropShadow { distance, size, .. } | Self::InnerShadow { distance, size, .. } => distance.abs() + size * 1.6 + 2.0,
             Self::OuterGlow { size, .. } | Self::InnerGlow { size, .. } => size * 1.6 + 2.0,
             Self::Stroke { width, position, .. } if position != StrokePosition::Inside => width + 2.0,
+            // Le satin floute la forme décalée : comme une ombre interne, il doit voir le vide autour.
+            Self::Satin { distance, size, .. } => distance.abs() + size * 1.6 + 2.0,
+            // Biseau interne : le relief reste dans la forme. Les autres styles la débordent de toute leur taille, plus
+            // le flou qui arrondit le profil et celui de l'adoucissement.
+            Self::BevelEmboss { style: BevelStyle::InnerBevel, .. } => 2.0,
+            Self::BevelEmboss { size, soften, .. } => size * 1.5 + soften * 1.6 + 2.0,
             _ => 0.0,
         }
     }
@@ -85,6 +238,12 @@ impl LayerEffect {
 /// Vrai si au moins un effet est actif : sinon le calque se compose tel quel, sans aucun surcoût.
 pub fn any_enabled(effects: &[LayerEffect]) -> bool {
     effects.iter().any(LayerEffect::enabled)
+}
+
+/// De combien de pixels, au plus, les effets actifs débordent du contenu du calque (0 sans effet actif).
+/// Sert à borner la zone à recomposer quand un calque à effets se déplace sans changer.
+pub fn reach_enabled(effects: &[LayerEffect]) -> i32 {
+    effects.iter().filter(|e| e.enabled()).map(|e| e.reach().ceil() as i32).max().unwrap_or(0)
 }
 
 const MAX_AREA: i64 = 80_000_000;
@@ -236,6 +395,130 @@ fn place(
     Ok(())
 }
 
+/// Pose un effet du dessus dont la couleur varie d'un pixel à l'autre (`colour_at`, 0..255), à travers `coverage` :
+/// dans le calque selon son mode, ou seul dans son propre tampon dans un mode autre que Normal (comme `place`).
+fn place_varying(
+    out: &mut [f32],
+    over: &mut Option<&mut Vec<(BlendMode, TileStore)>>,
+    coverage: &[f32],
+    opacity: f32,
+    blend: BlendMode,
+    colour_at: &(dyn Fn(usize) -> [f32; 3] + Sync),
+    to_store: &dyn Fn(&[f32]) -> Result<TileStore, EngineError>,
+) -> Result<(), EngineError> {
+    let separate = apart(blend, over).is_some();
+    let mode = if separate || blend == BlendMode::PassThrough { BlendMode::Normal } else { blend };
+    let mut alone = if separate { vec![0.0f32; out.len()] } else { Vec::new() };
+    let target: &mut [f32] = if separate { &mut alone } else { out };
+    target.par_chunks_mut(4).enumerate().for_each(|(i, px)| {
+        let a = (coverage[i] * opacity).clamp(0.0, 1.0);
+        if a <= 0.0 {
+            return;
+        }
+        let colour = colour_at(i);
+        let src = [colour[0] / 255.0 * a, colour[1] / 255.0 * a, colour[2] / 255.0 * a, a];
+        let dst = [px[0] / 255.0, px[1] / 255.0, px[2] / 255.0, px[3] / 255.0];
+        let mixed = crate::blend::blend_premultiplied(mode, src, dst);
+        for c in 0..4 {
+            px[c] = mixed[c] * 255.0;
+        }
+    });
+    if separate {
+        let store = to_store(&alone)?;
+        if let Some(list) = over.as_deref_mut() {
+            list.push((blend, store));
+        }
+    }
+    Ok(())
+}
+
+/// Couverture du satin : deux copies de la forme floutées (écart-type `size / 2`), décalées de `shift` de part et
+/// d'autre ; leur différence, limitée à la forme (son complément si `invert`).
+fn satin_coverage(alpha: &[f32], w: usize, h: usize, (dx, dy): (i32, i32), size: f32, invert: bool) -> Vec<f32> {
+    let one = blur(&shifted(alpha, w, h, dx, dy, 0.0), w, h, size / 2.0);
+    let other = blur(&shifted(alpha, w, h, -dx, -dy, 0.0), w, h, size / 2.0);
+    one.par_iter()
+        .zip(other.par_iter())
+        .zip(alpha.par_iter())
+        .map(|((a, b), inside)| {
+            let d = (a - b).abs().min(1.0);
+            (if invert { 1.0 - d } else { d }) * inside
+        })
+        .collect()
+}
+
+/// Ombrage du biseautage : couvertures (hautes lumières, ombres), de 0 à 1, pour chaque pixel du tampon.
+///
+/// 1. Distance signée au bord (positive dans la forme), tirée des distances exactes (`distance_to`), affinée sur
+///    les pixels du bord par leur alpha (un bord antialiasé donne un relief lisse, sans escaliers).
+/// 2. Profil selon le style : de 0 à 1 sur `size` pixels, dans la forme (biseau interne), hors de la forme (biseau
+///    externe), à cheval sur le bord (estampage) ou en creux sur le bord (estampage paysager). Lisse : profil en
+///    quart de cercle (raide au bord, plat au sommet) puis arrondi par un flou ; Ciselé dur : pente droite, arêtes nettes.
+/// 3. Hauteur = profil × taille × profondeur (négative vers le Bas) ; `soften` la floute encore.
+/// 4. Normale de la surface par différences centrées ; éclairage de Lambert depuis la direction de la lumière. Une
+///    surface plane reçoit l'éclairage de référence (sinus de l'altitude) : ce qui l'excède devient haute lumière,
+///    ce qui lui manque devient ombre, rapportés à l'écart maximal possible.
+fn bevel_shading(effect: &LayerEffect, alpha: &[f32], solid: &[bool], inside: &[f32], outside: &[f32], w: usize, h: usize) -> (Vec<f32>, Vec<f32>) {
+    let LayerEffect::BevelEmboss { style, technique, depth, direction, size, soften, angle, altitude, .. } = *effect else {
+        return (Vec::new(), Vec::new());
+    };
+    let size = size.max(1.0);
+    let smooth = technique == BevelTechnique::Smooth;
+    let profile = |t: f32| -> f32 {
+        let t = t.clamp(0.0, 1.0);
+        if smooth { (t * std::f32::consts::FRAC_PI_2).sin() } else { t }
+    };
+    let sign = if direction == BevelDirection::Up { 1.0 } else { -1.0 };
+    let height: Vec<f32> = (0..w * h)
+        .into_par_iter()
+        .map(|i| {
+            let a = alpha[i];
+            // Distance signée au bord, positive dedans (même convention de demi-pixel que le contour).
+            let mut s = if solid[i] { inside[i] - 0.5 } else { 0.5 - outside[i] };
+            if a > 0.0 && a < 1.0 && s.abs() < 1.0 {
+                s = a - 0.5;
+            }
+            let t = match style {
+                BevelStyle::InnerBevel => profile(s / size),
+                BevelStyle::OuterBevel => profile((s + size) / size),
+                BevelStyle::Emboss => profile((s + size / 2.0) / size),
+                // Creux sur le bord, plat de part et d'autre : le plat est à hauteur 0 (le flou du profil, nul hors du
+                // tampon, ne doit pas faire apparaître une marche sur le bord du tampon).
+                BevelStyle::PillowEmboss => profile(s.abs() * 2.0 / size) - 1.0,
+            };
+            t * size * depth.max(0.0) * sign
+        })
+        .collect();
+    // Lisse : le profil est arrondi (arêtes adoucies) ; Ciselé dur : juste de quoi éviter les escaliers.
+    let round = if smooth { (size / 8.0).max(0.8) } else { 0.6 };
+    let sigma = (round * round + (soften / 2.0).powi(2)).sqrt();
+    let height = blur(&height, w, h, sigma);
+
+    let (angle, altitude) = (angle.to_radians(), altitude.clamp(0.0, 90.0).to_radians());
+    // Vers la lumière, l'axe vertical de l'écran pointant vers le bas.
+    let light = [altitude.cos() * angle.cos(), -altitude.cos() * angle.sin(), altitude.sin()];
+    let gain = 1.0 / (1.0 - light[2]).max(0.15);
+    let at = |x: usize, y: usize| height[y * w + x];
+    let shading: Vec<(f32, f32)> = (0..w * h)
+        .into_par_iter()
+        .map(|i| {
+            let (x, y) = (i % w, i / w);
+            let gx = (at((x + 1).min(w - 1), y) - at(x.saturating_sub(1), y)) / 2.0;
+            let gy = (at(x, (y + 1).min(h - 1)) - at(x, y.saturating_sub(1))) / 2.0;
+            let lambert = (-gx * light[0] - gy * light[1] + light[2]) / (gx * gx + gy * gy + 1.0).sqrt();
+            let shade = (lambert - light[2]) * gain;
+            // Où l'ombrage s'applique : dans la forme (biseau interne), hors d'elle (biseau externe), partout sinon.
+            let mask = match style {
+                BevelStyle::InnerBevel => alpha[i],
+                BevelStyle::OuterBevel => 1.0 - alpha[i],
+                BevelStyle::Emboss | BevelStyle::PillowEmboss => 1.0,
+            };
+            (shade.clamp(0.0, 1.0) * mask, (-shade).clamp(0.0, 1.0) * mask)
+        })
+        .collect();
+    shading.into_iter().unzip()
+}
+
 /// Calque stylé : le calque et ses effets (`main`), plus à part les effets du dessous qui se fondent dans l'image
 /// sous le calque avec un mode autre que Normal (`under`, de bas en haut), en repère local.
 pub struct Styled {
@@ -250,6 +533,30 @@ pub struct Styled {
 pub fn styled(pixels: &TileStore, effects: &[LayerEffect]) -> Result<TileStore, EngineError> {
     let mut under = Vec::new();
     styled_into(pixels, effects, &mut under, None)
+}
+
+/// Les effets peuvent-ils se recalculer sur une partie seulement du calque ? Non pour l'incrustation en dégradé,
+/// tendue sur l'emprise ENTIÈRE du contenu : un morceau du calque n'a pas la même emprise.
+pub fn locally_recomputable(effects: &[LayerEffect]) -> bool {
+    !effects.iter().any(|e| e.enabled() && matches!(e, LayerEffect::GradientOverlay { .. }))
+}
+
+/// Effets recalculés sur la fenêtre `(x0, y0, x1, y1)` (repère local, bornes hautes exclues) seulement : les tuiles
+/// du calque qui touchent la fenêtre élargie de la portée des effets sont stylées comme un petit calque à part.
+/// Dans la fenêtre, le résultat est celui du calque entier (chaque effet ne voit pas plus loin que sa portée) ;
+/// en dehors, il n'a pas de sens et n'est pas à reprendre. Voir [`locally_recomputable`].
+pub fn restyle_region(pixels: &TileStore, effects: &[LayerEffect], (x0, y0, x1, y1): (i32, i32, i32, i32)) -> Result<Styled, EngineError> {
+    let margin = reach_enabled(effects) + 2;
+    let size = crate::tiles::TILE_SIZE as i32;
+    let (wx0, wy0, wx1, wy1) = (x0 - margin, y0 - margin, x1 + margin, y1 + margin);
+    let mut part = TileStore::new();
+    for (coord, tile) in pixels.iter() {
+        let (ox, oy) = coord.origin();
+        if ox < wx1 && ox + size > wx0 && oy < wy1 && oy + size > wy0 {
+            part.restore(coord, Some(Arc::clone(tile)));
+        }
+    }
+    styled_parts(&part, effects)
 }
 
 /// Calque stylé : pixels du calque entourés de ses effets, en repère local.
@@ -273,7 +580,7 @@ fn styled_into(pixels: &TileStore, effects: &[LayerEffect], under: &mut Vec<(Ble
     // Direction de l'ombre : à l'opposé de la lumière (l'axe vertical de l'écran pointe vers le bas).
     let offset = |angle: f32, distance: f32| ((-angle.to_radians().cos() * distance).round() as i32, (angle.to_radians().sin() * distance).round() as i32);
     // Distances au bord, calculées seulement si un contour le demande.
-    let needs_distance = effects.iter().any(|e| matches!(e, LayerEffect::Stroke { enabled: true, .. }));
+    let needs_distance = effects.iter().any(|e| matches!(e, LayerEffect::Stroke { enabled: true, .. } | LayerEffect::BevelEmboss { enabled: true, .. }));
     let solid: Vec<bool> = alpha.iter().map(|a| *a >= 0.5).collect();
     let (outside, inside) = if needs_distance { (distance_to(&solid, w, h), distance_to(&solid.iter().map(|s| !s).collect::<Vec<_>>(), w, h)) } else { (Vec::new(), Vec::new()) };
 
@@ -316,13 +623,26 @@ fn styled_into(pixels: &TileStore, effects: &[LayerEffect], under: &mut Vec<(Ble
             px[i] = layer[i] + px[i] * keep;
         }
     });
-    // Dessus du calque, limités à sa forme, dans l'ordre de Photoshop quel que soit celui de la liste :
-    // incrustation de couleur, puis lueur interne, puis ombre interne ; le contour vient en dernier.
+    // Dessus du calque, limités à sa forme, dans l'ordre de Photoshop quel que soit celui de la liste (de bas en
+    // haut) : incrustation de motif, incrustations de couleur et de dégradé (entre elles, dans l'ordre de la liste),
+    // satin, lueur interne, ombre interne ; puis les contours, et le biseautage tout en haut.
     let empty: Vec<f32> = alpha.iter().map(|a| 1.0 - a).collect();
-    for pass in 0..3 {
+    for pass in 0..5 {
         for effect in effects.iter().filter(|e| e.enabled()) {
             match (pass, *effect) {
-                (0, LayerEffect::ColorOverlay { color, opacity, blend, .. }) => {
+                (0, LayerEffect::PatternOverlay { pattern, scale, color, background, opacity, blend, .. }) => {
+                    // Motif inconnu (fichier venu d'une version plus récente) : l'effet est ignoré.
+                    let Some(pattern) = crate::patterns::find(pattern.as_str()) else { continue };
+                    let scale = (scale / 100.0).clamp(0.01, 100.0);
+                    // Lié au calque : le motif est ancré sur l'origine du repère du calque, il le suit quand on le déplace.
+                    let colour_at = |i: usize| -> [f32; 3] {
+                        let (x, y) = ((i % w) as i32 + left, (i / w) as i32 + top);
+                        let k = pattern.coverage(x as f32, y as f32, scale);
+                        std::array::from_fn(|c| f32::from(background[c]) + (f32::from(color[c]) - f32::from(background[c])) * k)
+                    };
+                    place_varying(&mut out, &mut over, &alpha, opacity, blend, &colour_at, &to_store)?;
+                }
+                (1, LayerEffect::ColorOverlay { color, opacity, blend, .. }) => {
                     if let Some(list) = apart(blend, &mut over) {
                         let mut alone = vec![0.0f32; source.len()];
                         paint_over(&mut alone, &alpha, color, opacity);
@@ -331,7 +651,7 @@ fn styled_into(pixels: &TileStore, effects: &[LayerEffect], under: &mut Vec<(Ble
                         paint_blend(&mut out, &alpha, color, opacity, blend);
                     }
                 }
-                (0, LayerEffect::GradientOverlay { from, to, opacity, angle, radial, blend, .. }) => {
+                (1, LayerEffect::GradientOverlay { from, to, opacity, angle, radial, blend, .. }) => {
                     let separate = apart(blend, &mut over).is_some();
                     let mut alone = if separate { vec![0.0f32; source.len()] } else { Vec::new() };
                     let target: &mut Vec<f32> = if separate { &mut alone } else { &mut out };
@@ -364,11 +684,15 @@ fn styled_into(pixels: &TileStore, effects: &[LayerEffect], under: &mut Vec<(Ble
                         }
                     }
                 }
-                (1, LayerEffect::InnerGlow { color, opacity, size, blend, .. }) => {
+                (2, LayerEffect::Satin { color, opacity, angle, distance, size, invert, blend, .. }) => {
+                    let satin = satin_coverage(&alpha, w, h, offset(angle, distance), size, invert);
+                    place(&mut out, &mut over, &satin, color, opacity, blend, &to_store)?;
+                }
+                (3, LayerEffect::InnerGlow { color, opacity, size, blend, .. }) => {
                     let glow: Vec<f32> = blur(&empty, w, h, size / 2.0).iter().zip(&alpha).map(|(g, a)| (g * 1.8).min(1.0) * a).collect();
                     place(&mut out, &mut over, &glow, color, opacity, blend, &to_store)?;
                 }
-                (2, LayerEffect::InnerShadow { color, opacity, angle, distance, size, blend, .. }) => {
+                (4, LayerEffect::InnerShadow { color, opacity, angle, distance, size, blend, .. }) => {
                     let (dx, dy) = offset(angle, distance);
                     let shadow: Vec<f32> = blur(&shifted(&empty, w, h, dx, dy, 1.0), w, h, size / 2.0).iter().zip(&alpha).map(|(s, a)| s * a).collect();
                     place(&mut out, &mut over, &shadow, color, opacity, blend, &to_store)?;
@@ -395,6 +719,14 @@ fn styled_into(pixels: &TileStore, effects: &[LayerEffect], under: &mut Vec<(Ble
                 })
                 .collect();
             place(&mut out, &mut over, &band, color, opacity, blend, &to_store)?;
+        }
+    }
+    // Biseautage et estampage, au-dessus de tout : ombres puis hautes lumières, chacune dans son mode.
+    for effect in effects.iter().filter(|e| e.enabled()) {
+        if let LayerEffect::BevelEmboss { highlight, highlight_opacity, highlight_blend, shadow, shadow_opacity, shadow_blend, .. } = *effect {
+            let (lit, dark) = bevel_shading(effect, &alpha, &solid, &inside, &outside, w, h);
+            place(&mut out, &mut over, &dark, shadow, shadow_opacity, shadow_blend, &to_store)?;
+            place(&mut out, &mut over, &lit, highlight, highlight_opacity, highlight_blend, &to_store)?;
         }
     }
 
@@ -493,6 +825,129 @@ mod tests {
         assert_eq!(gradient.pixel_bounds(|px| px[3] > 0), Some((100, 100, 200, 200)), "limité à la forme du calque");
         let up = styled2(&[LayerEffect::GradientOverlay { enabled: true, from: [0, 0, 0], to: [255, 255, 255], opacity: 1.0, angle: 90.0, radial: false, blend: crate::blend::BlendMode::Normal }]);
         assert!(at(&up, 150, 103)[0] > 240 && at(&up, 150, 197)[0] < 15, "90° : vers le haut");
+    }
+
+    /// Biseau par défaut de la fenêtre des effets (celui de Photoshop) : interne, lisse, 100 %, 5 px, lumière à 120°.
+    fn bevel(style: BevelStyle, enabled: bool) -> LayerEffect {
+        LayerEffect::BevelEmboss {
+            enabled,
+            style,
+            technique: BevelTechnique::Smooth,
+            depth: 1.0,
+            direction: BevelDirection::Up,
+            size: 10.0,
+            soften: 0.0,
+            angle: 120.0,
+            altitude: 30.0,
+            highlight: [255, 255, 255],
+            highlight_opacity: 0.75,
+            highlight_blend: BlendMode::Screen,
+            shadow: [0, 0, 0],
+            shadow_opacity: 0.75,
+            shadow_blend: BlendMode::Multiply,
+        }
+    }
+
+    fn satin(enabled: bool) -> LayerEffect {
+        LayerEffect::Satin { enabled, color: [0, 0, 0], opacity: 1.0, angle: 19.0, distance: 11.0, size: 14.0, invert: false, blend: BlendMode::Normal }
+    }
+
+    fn pattern(enabled: bool) -> LayerEffect {
+        LayerEffect::PatternOverlay { enabled, pattern: PatternId::new("damier"), scale: 100.0, color: [0, 0, 0], background: [255, 255, 255], opacity: 1.0, blend: BlendMode::Normal }
+    }
+
+    #[test]
+    fn new_effects_disabled_change_nothing() {
+        let plain = square();
+        for effect in [bevel(BevelStyle::InnerBevel, false), bevel(BevelStyle::Emboss, false), satin(false), pattern(false)] {
+            assert!(!any_enabled(&[effect]) && reach_enabled(&[effect]) == 0);
+            let styled = styled2(&[effect]);
+            assert_eq!(styled.pixel_bounds(|px| px[3] > 0), plain.pixel_bounds(|px| px[3] > 0));
+            for (x, y) in [(100, 100), (150, 150), (199, 120), (90, 150)] {
+                assert_eq!(at(&styled, x, y), at(&plain, x, y), "{effect:?} en ({x}, {y})");
+            }
+        }
+    }
+
+    #[test]
+    fn bevel_lights_the_edge_facing_the_light_and_darkens_the_other() {
+        // Lumière à 120° (en haut à gauche) : bords haut et gauche éclaircis, bas et droit assombris ; centre intact.
+        let parts = styled_parts(&square(), &[bevel(BevelStyle::InnerBevel, true)]).expect("rendu");
+        // Hautes lumières en Écran, ombres en Produit : rendues à part (ombres d'abord), fondues par le compositeur.
+        assert_eq!(parts.over.iter().map(|(m, _)| *m).collect::<Vec<_>>(), [BlendMode::Multiply, BlendMode::Screen]);
+        let (dark, lit) = (&parts.over[0].1, &parts.over[1].1);
+        // La lumière vient surtout d'en haut (120°) : le bord du haut reçoit plus que celui de gauche.
+        assert!(at(lit, 150, 102)[3] > at(lit, 102, 150)[3], "haut plus éclairé que gauche");
+        for (x, y) in [(102, 150), (150, 102)] {
+            assert!(at(lit, x, y)[3] > 40 && at(dark, x, y)[3] < 10, "bord éclairé en ({x}, {y}) : {:?} / {:?}", at(lit, x, y), at(dark, x, y));
+        }
+        for (x, y) in [(197, 150), (150, 197)] {
+            assert!(at(dark, x, y)[3] > 40 && at(lit, x, y)[3] < 10, "bord à l'ombre en ({x}, {y}) : {:?} / {:?}", at(lit, x, y), at(dark, x, y));
+        }
+        assert_eq!((at(lit, 150, 150)[3], at(dark, 150, 150)[3]), (0, 0), "le plat du centre ne bouge pas");
+        // Biseau interne : rien hors de la forme. En un seul tampon (Normal), le bord éclairé est plus clair que l'autre.
+        assert!(lit.pixel_bounds(|px| px[3] > 0).is_some_and(|(x0, y0, x1, y1)| x0 >= 100 && y0 >= 100 && x1 <= 200 && y1 <= 200));
+        let flat = styled2(&[bevel(BevelStyle::InnerBevel, true)]);
+        let (bright, shade) = (at(&flat, 150, 102), at(&flat, 150, 197));
+        assert!(bright[1] > 100 && shade[0] < 120, "haut-gauche clair, bas-droit sombre : {bright:?} {shade:?}");
+        // Vers le Bas : l'inverse.
+        let mut down = bevel(BevelStyle::InnerBevel, true);
+        if let LayerEffect::BevelEmboss { direction, .. } = &mut down {
+            *direction = BevelDirection::Down;
+        }
+        let sunk = styled2(&[down]);
+        assert!(at(&sunk, 150, 102)[0] < 120 && at(&sunk, 150, 197)[1] > 100, "vers le bas, les bords s'inversent");
+        // Biseau externe et estampage débordent de la forme ; leur portée le dit (invalidation).
+        let outer = styled_parts(&square(), &[bevel(BevelStyle::OuterBevel, true)]).expect("rendu");
+        assert!(at(&outer.over[1].1, 96, 150)[3] > 50 && at(&outer.over[0].1, 204, 150)[3] > 50, "socle éclairé à gauche, ombré à droite");
+        assert!(reach_enabled(&[bevel(BevelStyle::Emboss, true)]) >= 10 && reach_enabled(&[bevel(BevelStyle::InnerBevel, true)]) <= 2);
+        for style in [BevelStyle::Emboss, BevelStyle::PillowEmboss] {
+            let parts = styled_parts(&square(), &[bevel(style, true)]).expect("rendu");
+            assert!(parts.over.iter().any(|(_, s)| at(s, 96, 150)[3] > 20) && parts.over.iter().any(|(_, s)| at(s, 104, 150)[3] > 20), "{style:?} : des deux côtés du bord");
+        }
+    }
+
+    #[test]
+    fn satin_stays_inside_the_shape() {
+        let styled = styled2(&[satin(true)]);
+        assert_eq!(styled.pixel_bounds(|px| px[3] > 0), Some((100, 100, 200, 200)), "rien ne déborde");
+        let darkened = (100..200).flat_map(|y| (100..200).map(move |x| (x, y))).filter(|(x, y)| at(&styled, *x, *y)[0] < 200).count();
+        assert!(darkened > 200, "des bandes sombres dans la forme : {darkened} pixels");
+        assert_eq!(at(&styled, 150, 150), [255, 0, 0, 255], "loin des bords, les deux copies se compensent");
+        // Inversé : le centre s'assombrit.
+        let LayerEffect::Satin { color, opacity, angle, distance, size, blend, .. } = satin(true) else { unreachable!() };
+        let inverted = styled2(&[LayerEffect::Satin { enabled: true, color, opacity, angle, distance, size, invert: true, blend }]);
+        assert_eq!(at(&inverted, 150, 150), [0, 0, 0, 255]);
+        assert_eq!(inverted.pixel_bounds(|px| px[3] > 0), Some((100, 100, 200, 200)));
+    }
+
+    #[test]
+    fn pattern_overlay_tiles_inside_the_shape() {
+        // Damier de cases de 8 px, ancré sur l'origine du calque : noir sur les cases paires, blanc sur les autres.
+        let styled = styled2(&[pattern(true)]);
+        assert_eq!(styled.pixel_bounds(|px| px[3] > 0), Some((100, 100, 200, 200)), "limité à la forme");
+        assert_eq!((at(&styled, 104, 104), at(&styled, 112, 104)), ([0, 0, 0, 255], [255, 255, 255, 255]));
+        for (x, y) in [(103, 101), (110, 117), (125, 130)] {
+            assert_eq!(at(&styled, x, y), at(&styled, x + 16, y), "se répète tous les 16 px ({x}, {y})");
+            assert_eq!(at(&styled, x, y), at(&styled, x + 32, y + 48));
+        }
+        // Échelle 200 % : des cases de 16 px.
+        let big = styled2(&[LayerEffect::PatternOverlay { enabled: true, pattern: PatternId::new("damier"), scale: 200.0, color: [0, 0, 0], background: [255, 255, 255], opacity: 1.0, blend: BlendMode::Normal }]);
+        assert_eq!((at(&big, 104, 104), at(&big, 108, 104), at(&big, 120, 104), at(&big, 136, 104)), ([0, 0, 0, 255], [0, 0, 0, 255], [255; 4], [0, 0, 0, 255]));
+        // Motif inconnu : ignoré.
+        let unknown = styled2(&[LayerEffect::PatternOverlay { enabled: true, pattern: PatternId::new("inconnu"), scale: 100.0, color: [0; 3], background: [0; 3], opacity: 1.0, blend: BlendMode::Normal }]);
+        assert_eq!(at(&unknown, 150, 150), [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn new_effects_round_trip_and_old_files_still_open() {
+        let list = vec![bevel(BevelStyle::PillowEmboss, true), satin(true), pattern(true)];
+        let text = serde_json::to_string(&list).expect("json");
+        assert!(text.contains("\"type\":\"bevelEmboss\"") && text.contains("\"highlightOpacity\"") && text.contains("\"pillow_emboss\"") && text.contains("\"pattern\":\"damier\""), "{text}");
+        assert_eq!(serde_json::from_str::<Vec<LayerEffect>>(&text).expect("relu"), list);
+        // Un fichier d'avant (champs d'un mot, sans mode) s'ouvre toujours.
+        let old = r#"[{"type":"dropShadow","enabled":true,"color":[0,0,0],"opacity":0.5,"angle":120,"distance":5,"size":5}]"#;
+        assert!(matches!(serde_json::from_str::<Vec<LayerEffect>>(old).expect("ancien")[0], LayerEffect::DropShadow { blend: BlendMode::Normal, .. }));
     }
 
     #[test]

@@ -13,6 +13,9 @@
 //  - Contour : distance euclidienne exacte au bord (seuil d'alpha 0,5, comme le moteur), par deux passes séparables
 //    bornées à l'épaisseur du contour (au-delà, le contour est nul : la distance exacte n'importe plus).
 // Les poses en mode Normal se font par la carte (ONE, ONE_MINUS_SRC_ALPHA), comme `paint_over`.
+//  - Satin : deux cartes floutées (décalées de part et d'autre), leur différence posée dans la forme.
+//  - Biseautage et incrustation de motif ne sont pas calculés ici (relief et dessins des motifs) : tant qu'un de ces
+//    effets est actif, `canPreview` répond faux et chaque pas passe par le moteur (voir `GpuLayers.previewEffects`).
 import type { BlendMode, LayerEffect } from "../lib/ipc";
 
 type Linker = (fragment: string) => { program: WebGLProgram; uniform: (name: string) => WebGLUniformLocation | null };
@@ -69,9 +72,21 @@ function reach(effect: LayerEffect): number {
       return f32(f32(f32(effect.size) * f32(1.6)) + 2);
     case "stroke":
       return effect.position !== "inside" ? f32(f32(effect.width) + 2) : 0;
+    case "satin":
+      return f32(f32(f32(Math.abs(f32(effect.distance))) + f32(f32(effect.size) * f32(1.6))) + 2);
+    case "bevelEmboss":
+      return effect.style === "inner_bevel" ? 2 : f32(f32(f32(f32(effect.size) * f32(1.5)) + f32(f32(effect.soften) * f32(1.6))) + 2);
     default:
       return 0;
   }
+}
+
+/**
+ * Vrai si la carte graphique sait calculer ces effets. Biseautage et incrustation de motif restent au moteur, comme un
+ * satin sans flou (ses deux cartes décalées demanderaient deux décalages dans la même passe).
+ */
+export function canPreview(effects: readonly LayerEffect[]): boolean {
+  return effects.every((e) => !e.enabled || (e.type !== "bevelEmboss" && e.type !== "patternOverlay" && !(e.type === "satin" && f32(f32(e.size) / 2) < 0.3)));
 }
 
 /** Marge du tampon de calcul autour du contenu du calque (comme `styled_into`). */
@@ -225,10 +240,12 @@ void main() {
 
 // Pose d'une couche (comme `paint_over`) : le calque lui-même, ou une couleur à travers sa couverture.
 const PAINT_SHADER = `${PRELUDE}
-uniform int u_kind;        // 0 calque, 1 carte (ombres, lueurs), 2 contour, 3 incrustation de couleur, 4 de dégradé,
+uniform int u_kind;        // 0 calque, 1 carte (ombres, lueurs), 2 contour, 3 incrustation de couleur, 4 de dégradé, 6 satin,
                            // 5 recopie du calque stylé (demi-flottants) en RGBA8, bornée comme to_store
 uniform int u_mapMode;     // 0 carte pleine résolution, 1 carte réduite (bilinéaire), 2 carte calculée ici (sans flou)
 uniform highp sampler2D u_map;
+uniform highp sampler2D u_map2;  // satin : seconde carte floutée (même format, même réduction que u_map)
+uniform int u_invertCover; // satin inversé
 uniform float u_factor;
 uniform vec2 u_mapSize;
 uniform float u_gain;      // lueurs : min(carte × 1,8 ; 1) ; 0 : aucun
@@ -261,6 +278,12 @@ void main() {
       : sourceAt(p);
     if (u_gain > 0.0) m = min(m * u_gain, 1.0);
     c = u_inner == 1 ? m * alpha : m;
+  } else if (u_kind == 6) {
+    vec2 uv = (vec2(p) + 0.5) / u_factor / u_mapSize;
+    float m1 = u_mapMode == 0 ? texelFetch(u_map, p, 0).r : texture(u_map, uv).r;
+    float m2 = u_mapMode == 0 ? texelFetch(u_map2, p, 0).r : texture(u_map2, uv).r;
+    float d = min(abs(m1 - m2), 1.0);
+    c = (u_invertCover == 1 ? 1.0 - d : d) * alpha;
   } else if (u_kind == 2) {
     float d = texelFetch(u_map, p, 0).r;
     c = min(clamp(u_band.x - d + 0.5, 0.0, 1.0), clamp(d + u_band.y + 0.5, 0.0, 1.0));
@@ -308,16 +331,22 @@ export class GpuEffects {
     this.columnsProgram = link(EDT_COLUMNS_SHADER);
     this.rowsProgram = link(EDT_ROWS_SHADER);
     this.paintProgram = link(PAINT_SHADER);
-    // Unités : 0 pixels du calque, 1 carte lue, 2 noyau.
+    // Unités : 0 pixels du calque, 1 carte lue, 2 noyau, 3 seconde carte (satin).
     for (const program of [this.blurProgram, this.reduceProgram, this.columnsProgram, this.rowsProgram, this.paintProgram]) {
       gl.useProgram(program.program);
       gl.uniform1i(program.uniform("u_raw"), 0);
       gl.uniform1i(program.uniform("u_in"), 1);
       gl.uniform1i(program.uniform("u_map"), 1);
       gl.uniform1i(program.uniform("u_kernel"), 2);
+      gl.uniform1i(program.uniform("u_map2"), 3);
     }
     this.kernel = gl.createTexture();
     this.framebuffer = gl.createFramebuffer();
+  }
+
+  /** Vrai si ces effets se calculent ici (voir `canPreview`). */
+  handles(effects: readonly LayerEffect[]): boolean {
+    return canPreview(effects);
   }
 
   /**
@@ -348,7 +377,7 @@ export class GpuEffects {
     const [tw, th] = [padded(w), padded(h)];
 
     // État partagé : aucun échantillonneur ne doit remplacer le filtrage des textures, pas de ciseaux, pas de fusion.
-    for (let unit = 0; unit < 3; unit++) gl.bindSampler(unit, null);
+    for (let unit = 0; unit < 4; unit++) gl.bindSampler(unit, null);
     gl.disable(gl.SCISSOR_TEST);
     gl.disable(gl.BLEND);
     gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
@@ -392,7 +421,7 @@ export class GpuEffects {
     bind(0, raw.texture);
 
     /** Carte floutée d'une ombre ou d'une lueur (`blur(shifted(...), size / 2)`). */
-    const blurred = (size: number, shift: [number, number], outside: number, invert: boolean): Coverage => {
+    const blurred = (size: number, shift: [number, number], outside: number, invert: boolean, slot = ""): Coverage => {
       const sigma = f32(f32(size) / 2);
       if (sigma < 0.3) return { mode: 2, map: null, factor: 1, mapSize: [w, h] };
       const full = blurKernel(sigma);
@@ -412,7 +441,8 @@ export class GpuEffects {
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
       const first = this.scratchTexture(factor === 1 ? "rows" : "small-a", factor === 1 ? gl.RG16F : gl.R16F, factor === 1 ? tw : padded(mw), factor === 1 ? th : padded(mh));
-      const second = this.scratchTexture(factor === 1 ? "map" : "small-b", factor === 1 ? gl.R32F : gl.R16F, factor === 1 ? tw : padded(mw), factor === 1 ? th : padded(mh));
+      // `slot` : une seconde carte gardée en même temps que la première (satin).
+      const second = this.scratchTexture((factor === 1 ? "map" : "small-b") + slot, factor === 1 ? gl.R32F : gl.R16F, factor === 1 ? tw : padded(mw), factor === 1 ? th : padded(mh));
       let input: Scratch | null = null;
       if (factor > 1) {
         // Carte réduite dans `second`, floutée en lignes dans `first`, puis en colonnes de nouveau dans `second`.
@@ -443,7 +473,7 @@ export class GpuEffects {
     };
 
     /** Pose une couche dans `into` (fondue par-dessus ce qu'il contient). */
-    const paint = (into: WebGLTexture, kind: number, setup: (u: ReturnType<Linker>["uniform"]) => void, cover?: Coverage, shift: [number, number] = [0, 0], outside = 0, invert = false) => {
+    const paint = (into: WebGLTexture, kind: number, setup: (u: ReturnType<Linker>["uniform"]) => void, cover?: Coverage, shift: [number, number] = [0, 0], outside = 0, invert = false, cover2?: Coverage) => {
       setCommon(this.paintProgram, shift, outside, invert);
       const u = this.paintProgram.uniform;
       gl.uniform1i(u("u_kind"), kind);
@@ -452,7 +482,13 @@ export class GpuEffects {
       gl.uniform2f(u("u_mapSize"), cover?.mapSize[0] ?? 1, cover?.mapSize[1] ?? 1);
       gl.uniform1f(u("u_gain"), 0);
       gl.uniform1i(u("u_inner"), 0);
+      gl.uniform1i(u("u_invertCover"), 0);
       setup(u);
+      bind(3, cover2?.map ?? null);
+      if (cover2?.mode === 1 && cover2.map) {
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      }
       bind(1, cover?.map ?? null);
       if (cover?.mode === 1 && cover.map) {
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
@@ -463,6 +499,7 @@ export class GpuEffects {
       gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
       gl.disable(gl.BLEND);
+      bind(3, null);
       bind(1, null);
     };
     const tint = (color: readonly number[], opacity: number, gain = 0, inner = false) => (u: ReturnType<Linker>["uniform"]) => {
@@ -517,6 +554,28 @@ export class GpuEffects {
           }),
         );
       }
+    }
+    // Satin : entre les incrustations et la lueur interne.
+    for (const effect of active) {
+      if (effect.type !== "satin") continue;
+      const [dx, dy] = offset(effect.angle, effect.distance);
+      const one = blurred(effect.size, [dx, dy], 0, false);
+      const other = blurred(effect.size, [-dx, -dy], 0, false, "-2");
+      place(blendOf(effect), (into) =>
+        paint(
+          into,
+          6,
+          (u) => {
+            tint(effect.color, effect.opacity)(u);
+            gl.uniform1i(u("u_invertCover"), effect.invert ? 1 : 0);
+          },
+          one,
+          [0, 0],
+          0,
+          false,
+          other,
+        ),
+      );
     }
     for (const effect of active) {
       if (effect.type !== "innerGlow") continue;
@@ -573,7 +632,7 @@ export class GpuEffects {
       bind(0, texture);
       gl.generateMipmap(gl.TEXTURE_2D);
     }
-    for (let unit = 2; unit >= 0; unit--) bind(unit, null);
+    for (let unit = 3; unit >= 0; unit--) bind(unit, null);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     let bytes = (1 + under.length + over.length) * Math.round(tw * th * 4 * (4 / 3));
     for (const s of this.scratch.values()) bytes += s.bytes;

@@ -1,5 +1,6 @@
 <script lang="ts">
   import { t } from "../lib/i18n.svelte";
+  import { formatBytes } from "../lib/format-bytes";
   import { recover } from "../lib/autosave.svelte";
   import { api } from "../lib/ipc";
   import { app } from "../state/app.svelte";
@@ -15,7 +16,7 @@
   });
 
   const when = (ms: number) => new Date(ms).toLocaleString("fr-FR", { dateStyle: "medium", timeStyle: "short" });
-  const size = (bytes: number) => (bytes > 1048576 ? `${(bytes / 1048576).toFixed(1)} Mo` : `${Math.max(1, Math.round(bytes / 1024))} Ko`);
+  const size = formatBytes;
 
   async function restore(key: string): Promise<void> {
     busy = key;
@@ -96,7 +97,7 @@
     gap: 8px;
     padding: 10px 12px;
     border-radius: var(--radius-l);
-    background: rgba(255, 255, 255, 0.04);
+    background: rgb(var(--ink) / 0.04);
     border: 1px solid var(--border);
   }
   .what {

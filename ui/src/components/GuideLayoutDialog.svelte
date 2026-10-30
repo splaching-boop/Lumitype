@@ -2,6 +2,7 @@
   import { t } from "../lib/i18n.svelte";
   import { untrack } from "svelte";
   import { edit } from "../lib/engine";
+  import { guideTarget, guidesOf } from "../lib/artboards.svelte";
   import { CORNERS, GROUPS, TEMPLATES, templateById, type Corner, type Hints, type Layout } from "../lib/guide-templates";
   import { loadSavedLayouts, removeLayout, saveLayout, savedLayouts } from "../lib/guide-layouts.svelte";
   import type { Guide } from "../lib/ipc";
@@ -11,7 +12,11 @@
   // créés ; à droite, les modèles prédéfinis et, tout en haut, le mode sur mesure (colonnes, rangées,
   // marges). Tous les modèles sont décrits en proportions : la même disposition suit n'importe quel format.
   const info = untrack(() => app.active?.info);
-  const [W, H] = [info?.width ?? 1, info?.height ?? 1];
+  // Cadre de la disposition : le plan de travail actif (ses dimensions, ses repères), sinon le document entier.
+  const frame = untrack(() => guideTarget()) ?? { board: null, x: 0, y: 0, width: info?.width ?? 1, height: info?.height ?? 1 };
+  const [W, H] = [frame.width, frame.height];
+  /** Repères du cadre, en pixels DU CADRE (0 = son bord gauche ou haut). */
+  const frameGuides = (): Guide[] => guidesOf(info?.guides ?? [], frame.board).map((g) => ({ ...g, position: g.position - (g.orientation === "vertical" ? frame.x : frame.y) }));
 
   let dialog = $state<HTMLDialogElement>();
   let chosen = $state<string>("thirds");
@@ -26,7 +31,7 @@
   const CURRENT = "current";
   const template = $derived(chosen === CUSTOM || chosen === CURRENT ? undefined : templateById(chosen));
   const saved = $derived(savedLayouts.all.find((item) => item.id === chosen));
-  const hasCurrent = (info?.guides.length ?? 0) > 0;
+  const hasCurrent = frameGuides().length > 0;
 
   /** Enregistrement d'une disposition : le nom, saisi en place. */
   let naming = $state<string | null>(null);
@@ -77,8 +82,8 @@
 
   /** Les repères actuels du document, en pixels. */
   const currentGuides = () => ({
-    vertical: (info?.guides ?? []).filter((g) => g.orientation === "vertical").map((g) => g.position),
-    horizontal: (info?.guides ?? []).filter((g) => g.orientation === "horizontal").map((g) => g.position),
+    vertical: frameGuides().filter((g) => g.orientation === "vertical").map((g) => g.position),
+    horizontal: frameGuides().filter((g) => g.orientation === "horizontal").map((g) => g.position),
   });
 
   const guides = $derived.by(() => {
@@ -91,7 +96,7 @@
 
   const scale = Math.min(460 / W, 330 / H);
   const [pw, ph] = [W * scale, H * scale];
-  const existing = $derived(clear ? [] : (info?.guides ?? []));
+  const existing = $derived(clear ? [] : frameGuides());
 
   /** Chemin d'une suite d'arcs, mis à l'échelle d'un aperçu `w × h`. */
   function spiral(list: NonNullable<Hints["arcs"]>, w: number, h: number): string {
@@ -108,8 +113,9 @@
   function close(apply: boolean): void {
     app.guideLayoutOpen = false;
     if (!apply) return;
-    const list: Guide[] = [...guides.vertical.map((position): Guide => ({ orientation: "vertical", position })), ...guides.horizontal.map((position): Guide => ({ orientation: "horizontal", position }))];
-    void edit({ op: "setGuides", guides: list, clear });
+    // Positions ramenées en pixels du document (le cadre peut être un plan posé ailleurs qu'en 0, 0).
+    const list: Guide[] = [...guides.vertical.map((position): Guide => ({ orientation: "vertical", position: position + frame.x })), ...guides.horizontal.map((position): Guide => ({ orientation: "horizontal", position: position + frame.y }))];
+    void edit({ op: "setGuides", guides: list, clear, board: frame.board });
     app.guidesVisible = true;
   }
 </script>

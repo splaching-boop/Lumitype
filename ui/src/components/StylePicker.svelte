@@ -246,7 +246,7 @@
   }
   .style-list button.current {
     background: var(--bg-active);
-    color: #fff;
+    color: var(--text-strong);
   }
   p {
     margin: 0;

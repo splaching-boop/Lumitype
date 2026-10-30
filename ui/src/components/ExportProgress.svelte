@@ -52,7 +52,7 @@
   .bar {
     height: 6px;
     border-radius: var(--radius-xs);
-    background: rgba(255, 255, 255, 0.12);
+    background: rgb(var(--ink) / 0.12);
     overflow: hidden;
   }
   .bar div {

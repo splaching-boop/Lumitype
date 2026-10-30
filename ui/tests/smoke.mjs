@@ -11,8 +11,10 @@ const assets = path.join(path.dirname(fileURLToPath(import.meta.url)), "../../di
 const bundle = fs.readdirSync(assets).find((file) => file.startsWith("main") && file.endsWith(".js"));
 
 /**
- * Les deux pages partagent un petit morceau de code, que le paquet principal importe. `eval` ne sait pas
- * importer : chaque morceau est donc inséré sur place, enfermé dans une fonction qui rend ses exportations.
+ * Les pages (interface, bannière, visionneuse) partagent des morceaux de code, que le paquet principal importe.
+ * `eval` ne sait pas importer : chaque morceau est donc inséré sur place, enfermé dans une fonction qui rend ses
+ * exportations, et évalué UNE seule fois (registre `globalThis.__chunks`) même s'il est importé par plusieurs
+ * morceaux : deux copies du moteur de Svelte ne partageraient pas leur état.
  */
 function inlineChunks(code) {
   return code.replace(/import\s*\{([^}]*)\}\s*from\s*"\.\/([^"]+)";?/g, (_, names, file) => {
@@ -23,7 +25,7 @@ function inlineChunks(code) {
     const table = pairs.map(([local, alias]) => `${JSON.stringify(alias ?? local)}: ${local}`).join(", ");
     const wanted = names.split(",").map((entry) => entry.trim().split(/\s+as\s+/)).filter((pair) => pair[0]);
     const picks = wanted.map(([name, alias]) => `${JSON.stringify(name)}: ${alias ?? name}`).join(", ");
-    return `const { ${picks} } = (() => { ${body}\n return { ${table} }; })();`;
+    return `const { ${picks} } = ((globalThis.__chunks ??= {})[${JSON.stringify(file)}] ??= (() => { ${body}\n return { ${table} }; })());`;
   });
 }
 if (!bundle) throw new Error("Bundle introuvable : la compilation a-t-elle réussi ?");

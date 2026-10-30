@@ -2,7 +2,9 @@
   import { t } from "../lib/i18n.svelte";
   /** Rangée de pastilles de couleur : `current` est la couleur cochée (`null` : aucune), `choose` reçoit le choix. */
   export type ColorEntry = { colors: { value: string | null; color: string | null; name: string }[]; current: string | null; choose: (value: string | null) => void; label: string };
-  export type MenuEntry = { label: string; shortcut?: string; disabled?: boolean; run: () => void } | ColorEntry | "separator";
+  /** Sous-menu : s'ouvre à droite (ou à gauche près du bord) au survol de l'entrée. */
+  export type SubmenuEntry = { label: string; submenu: MenuEntry[]; disabled?: boolean };
+  export type MenuEntry = { label: string; shortcut?: string; disabled?: boolean; run: () => void } | ColorEntry | SubmenuEntry | "separator";
 </script>
 
 <script lang="ts">
@@ -18,6 +20,23 @@
 
   let menu = $state<HTMLDivElement>();
   let position = $state({ left: 0, top: 0 });
+  /** Sous-menu ouvert : son entrée et sa position. */
+  let open = $state<{ index: number; left: number; top: number } | null>(null);
+  let sub = $state<HTMLDivElement>();
+
+  function openSub(index: number, event: Event): void {
+    const rect = (event.currentTarget as HTMLElement).getBoundingClientRect();
+    open = { index, left: rect.right + 2, top: rect.top - 7 };
+  }
+  // Le sous-menu reste dans la fenêtre : à gauche du menu s'il déborderait à droite.
+  $effect(() => {
+    if (!sub || !open || !menu) return;
+    const width = sub.offsetWidth;
+    const menuRect = menu.getBoundingClientRect();
+    const left = open.left + width > window.innerWidth - 4 ? menuRect.left - width - 2 : open.left;
+    const top = Math.max(4, Math.min(open.top, window.innerHeight - sub.offsetHeight - 4));
+    if (left !== open.left || top !== open.top) open = { ...open, left, top };
+  });
 
   // Le menu reste entièrement dans la fenêtre, même ouvert près d'un bord.
   $effect(() => {
@@ -31,7 +50,7 @@
 
 <svelte:window
   onpointerdown={(event) => {
-    if (event.target instanceof Node && menu?.contains(event.target)) return;
+    if (event.target instanceof Node && (menu?.contains(event.target) || sub?.contains(event.target))) return;
     if (guard.pointerDownCloses(event)) onclose();
   }}
   onkeydown={(event) => event.key === "Escape" && onclose()}
@@ -65,10 +84,16 @@
           {/each}
         </div>
       </div>
+    {:else if "submenu" in entry}
+      <button role="menuitem" aria-haspopup="menu" aria-expanded={open?.index === index} class:on={open?.index === index} disabled={entry.disabled} onpointerenter={(event) => openSub(index, event)} onclick={(event) => openSub(index, event)}>
+        <span>{t(entry.label)}</span>
+        <span class="shortcut">▸</span>
+      </button>
     {:else}
       <button
         role="menuitem"
         disabled={entry.disabled}
+        onpointerenter={() => (open = null)}
         onclick={() => {
           onclose();
           entry.run();
@@ -81,10 +106,36 @@
   {/each}
 </div>
 
+{#if open}
+  {@const parent = entries[open.index]}
+  {#if parent && parent !== "separator" && "submenu" in parent}
+    <div class="menu" role="menu" tabindex="-1" bind:this={sub} style:left="{open.left}px" style:top="{open.top}px" oncontextmenu={(event) => event.preventDefault()}>
+      {#each parent.submenu as entry, index (index)}
+        {#if entry === "separator"}
+          <div class="separator" role="separator"></div>
+        {:else if "run" in entry}
+          <button
+            role="menuitem"
+            disabled={entry.disabled}
+            onclick={() => {
+              onclose();
+              entry.run();
+            }}
+          >
+            <span>{t(entry.label)}</span>
+            {#if entry.shortcut}<span class="shortcut">{entry.shortcut}</span>{/if}
+          </button>
+        {/if}
+      {/each}
+    </div>
+  {/if}
+{/if}
+
 <style>
   .menu {
     position: fixed;
-    z-index: 40;
+    /* Au-dessus des boîtes flottantes (effets 40, couleur 45, pinceaux 58) : un menu contextuel passe devant tout. */
+    z-index: 80;
     min-width: 250px;
     display: flex;
     flex-direction: column;
@@ -108,7 +159,8 @@
   button:disabled {
     color: var(--text-disabled);
   }
-  button:not(:disabled):hover {
+  button:not(:disabled):hover,
+  button.on {
     background: var(--bg-active);
   }
   .shortcut {
@@ -155,10 +207,10 @@
     transform: rotate(-45deg);
   }
   .swatch.current {
-    border-color: #fff;
+    border-color: var(--text-strong);
   }
   .swatch:hover {
-    outline: 2px solid rgba(255, 255, 255, 0.35);
+    outline: 2px solid rgb(var(--ink) / 0.35);
     outline-offset: 1px;
   }
 </style>

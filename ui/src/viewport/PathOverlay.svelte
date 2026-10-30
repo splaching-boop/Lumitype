@@ -13,7 +13,7 @@
   import { type Vec, corner, distance, insertAnchor, isCorner, nearestOnPath, toSvg, toggleSmooth } from "../lib/path";
   import { snapPoint } from "../lib/snapping.svelte";
   import { app } from "../state/app.svelte";
-  import type { Camera } from "./camera";
+  import { type Camera, clientToDoc } from "./camera";
 
   // Plume et sélection directe. Le tracé est édité ici, localement : rien ne part vers le moteur
   // pendant un glisser. À chaque manipulation terminée, le tracé complet lui est envoyé, ce qui
@@ -90,6 +90,9 @@
 
   const toScreen = (p: Vec): Vec => [camera.x + p[0] * camera.zoom, camera.y + p[1] * camera.zoom];
   function docPoint(event: PointerEvent): Vec {
+    // Par la zone de travail : juste aussi quand l'affichage est tourné (outil R).
+    const mapped = clientToDoc(event.clientX, event.clientY);
+    if (mapped) return [mapped.x, mapped.y];
     const rect = root?.getBoundingClientRect();
     return [(event.clientX - (rect?.left ?? 0) - camera.x) / camera.zoom, (event.clientY - (rect?.top ?? 0) - camera.y) / camera.zoom];
   }

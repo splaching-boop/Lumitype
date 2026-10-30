@@ -9,6 +9,8 @@
   import ColorPopover from "./ColorPopover.svelte";
   import FontPicker from "./FontPicker.svelte";
   import StylePicker, { type Style } from "./StylePicker.svelte";
+  import TextStylesSection from "./TextStylesSection.svelte";
+  import { resolveStyle, runPatchOf } from "../lib/text-styles.svelte";
 
   // Réglages d'un calque de texte. Le contenu se tape directement sur l'image (outil Texte).
   let { layer, text }: { layer: LayerInfo; text: TextData } = $props();
@@ -37,7 +39,8 @@
 
   function send(next: TextData): void {
     // Les réglages choisis, couleur comprise, servent de point de départ au prochain calque de texte.
-    const { content: _content, runs: _runs, ...defaults } = next;
+    // Le cadre d'un paragraphe reste à son calque : le prochain clic pose toujours un texte de point.
+    const { content: _content, runs: _runs, frame: _frame, dynamic: _dynamic, ...defaults } = next;
     app.textDefaults = defaults;
     if (editing) editing.runs = next.runs ?? [];
     const session = editing?.id ?? ownSession;
@@ -137,11 +140,48 @@
     if (Number.isFinite(value)) apply(value);
   };
 
+  /**
+   * Style de caractère : à la sélection pendant la saisie, sinon au calque entier (interlignage compris) et aux autres
+   * textes sélectionnés. `null` : plus de style (l'aspect reste).
+   */
+  function applyCharStyle(id: number | null): void {
+    if (id === null) {
+      restyle({ style: undefined });
+      return;
+    }
+    const resolved = resolveStyle(app.active?.info.textStyles ?? [], id);
+    if (!resolved) return;
+    const patch = runPatchOf(resolved, id);
+    if (range) {
+      send({ ...current, runs: applyStyle(current, range.start, range.end, patch) });
+      return;
+    }
+    const whole = { ...patch, ...(resolved.lineHeight !== undefined ? { lineHeight: resolved.lineHeight } : {}) };
+    send(applyToLayer(current, whole));
+    sendToOthers((data) => applyToLayer(data, whole));
+  }
+
   const ALIGNMENTS = [
     { value: "left", label: t("Aligner à gauche"), icon: "M4 6h16M4 12h10M4 18h14" },
     { value: "center", label: "Centrer", icon: "M4 6h16M7 12h10M5 18h14" },
     { value: "right", label: t("Aligner à droite"), icon: "M4 6h16M10 12h10M6 18h14" },
+    { value: "justify", label: t("Justifier"), icon: "M4 6h16M4 12h16M4 18h10" },
   ] as const;
+
+  const DYNAMIC = { lines: 0, manual: false, gap: 0.12 };
+
+  /** Texte de paragraphe : son cadre (largeur, hauteur en pixels du texte). */
+  const frame = $derived(text.frame ?? null);
+  /** Justifier n'a de sens que dans la largeur d'un cadre : proposé pour un texte de paragraphe seulement. */
+  const alignments = $derived(ALIGNMENTS.filter((option) => option.value !== "justify" || frame !== null || text.align === "justify"));
+
+  /** Largeur ou hauteur du cadre saisie : un état d'historique par changement, le coin haut gauche ne bouge pas. */
+  function resizeFrame(patch: { width?: number; height?: number }): void {
+    if (!frame) return;
+    const next = { width: Math.round(Math.min(16384, Math.max(1, patch.width ?? frame.width))), height: Math.round(Math.min(16384, Math.max(1, patch.height ?? frame.height))) };
+    const gesture = `cadre-texte-${layer.id}-${Date.now()}`;
+    editLatest(gesture, { op: "setTextFrame", id: layer.id, frame: next, shift: [0, 0], gesture });
+  }
 </script>
 
 <div class="text">
@@ -183,7 +223,7 @@
 
   <div class="row">
     <div class="toggles">
-      {#each ALIGNMENTS as option (option.value)}
+      {#each alignments as option (option.value)}
         <button class:on={text.align === option.value} aria-pressed={text.align === option.value} aria-label={t(option.label)} title={t(option.label)} onclick={() => change({ align: option.value })}>
           <svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><path d={option.icon} /></svg>
         </button>
@@ -207,6 +247,32 @@
       {/if}
     </button>
   </div>
+
+  <TextStylesSection text={current} {shown} wholeLayer={!range} onapply={applyCharStyle} />
+
+  {#if frame}
+    <!-- Texte dynamique : chaque ligne à la taille qui remplit la largeur du cadre. -->
+    <label class="check"><input type="checkbox" checked={!!text.dynamic} onchange={(e) => change({ dynamic: e.currentTarget.checked ? { ...DYNAMIC, ...(text.dynamic ?? {}) } : null })} /> {t("Texte dynamique")}</label>
+    {#if text.dynamic}
+      {@const dyn = text.dynamic}
+      <div class="row">
+        <label>
+          {t("Lignes")}
+          <select value={dyn.manual ? "manual" : String(dyn.lines)} onchange={(e) => { const v = e.currentTarget.value; change({ dynamic: { ...dyn, manual: v === "manual", lines: v === "manual" ? dyn.lines : Number(v) } }); }}>
+            <option value="0">{t("Auto")}</option>
+            {#each [1, 2, 3, 4, 5, 6, 8, 10] as n (n)}<option value={String(n)}>{n}</option>{/each}
+            <option value="manual">{t("Mes retours à la ligne")}</option>
+          </select>
+        </label>
+        <label>{t("Interligne (%)")} <input type="number" min="-20" max="200" onkeydown={backToTyping} value={Math.round(dyn.gap * 100)} onchange={(e) => number(e, (v) => change({ dynamic: { ...dyn, gap: Math.min(2, Math.max(-0.2, v / 100)) } }))} /></label>
+      </div>
+    {/if}
+    <!-- Texte de paragraphe : taille du cadre, aussi réglable par ses poignées pendant la saisie. -->
+    <div class="row">
+      <label>{t("Largeur du cadre (px)")} <input type="number" min="1" max="16384" onkeydown={backToTyping} value={Math.round(frame.width)} onchange={(e) => number(e, (width) => resizeFrame({ width }))} /></label>
+      <label>{t("Hauteur du cadre (px)")} <input type="number" min="1" max="16384" onkeydown={backToTyping} value={Math.round(frame.height)} onchange={(e) => number(e, (height) => resizeFrame({ height }))} /></label>
+    </div>
+  {/if}
 </div>
 
 {#if colorPopover}
@@ -278,7 +344,7 @@
   }
   .toggles button.on {
     background: var(--bg-active);
-    color: #fff;
+    color: var(--text-strong);
   }
   svg {
     fill: none;
@@ -308,7 +374,23 @@
     width: 14px;
     height: 14px;
     border-radius: var(--radius-s);
-    border: 1px solid rgba(255, 255, 255, 0.35);
+    border: 1px solid rgb(var(--ink) / 0.35);
+  }
+  .check {
+    flex-direction: row;
+    align-items: center;
+    gap: 8px;
+  }
+  .check input {
+    height: auto;
+  }
+  select {
+    height: 26px;
+    border-radius: var(--radius-s);
+    border: 1px solid var(--border);
+    background: var(--bg-field);
+    color: var(--text);
+    font: inherit;
   }
   .many {
     margin: 0 0 8px;

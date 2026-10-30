@@ -4,6 +4,7 @@
   import { editLatest } from "../lib/engine";
   import type { LayerInfo, Rgb, ShapeData } from "../lib/ipc";
   import { app } from "../state/app.svelte";
+  import { backgroundInMode, foregroundInMode } from "../lib/color-mode.svelte";
   import ColorPopover from "./ColorPopover.svelte";
 
   // Réglages d'un calque de forme : taille, arrondi des coins, fond, contour. Tout reste
@@ -29,8 +30,8 @@
 
   function toggle(target: "fill" | "stroke", on: boolean): void {
     if (!on) change({ [target]: null });
-    else if (target === "fill") change({ fill: [...app.foreground, 255] });
-    else change({ stroke: [...app.background, 255], strokeWidth: Math.max(1, shape.strokeWidth) });
+    else if (target === "fill") change({ fill: [...foregroundInMode(), 255] });
+    else change({ stroke: [...backgroundInMode(), 255], strokeWidth: Math.max(1, shape.strokeWidth) });
   }
 
   function openPicker(event: MouseEvent, target: "fill" | "stroke"): void {
@@ -159,7 +160,7 @@
     width: 14px;
     height: 14px;
     border-radius: var(--radius-s);
-    border: 1px solid rgba(255, 255, 255, 0.35);
+    border: 1px solid rgb(var(--ink) / 0.35);
   }
   p {
     margin: 0;

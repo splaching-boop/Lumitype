@@ -4,12 +4,13 @@ import { SvelteMap } from "svelte/reactivity";
 import type { GradientState } from "../lib/gradient";
 import type { MetadataSettings } from "../lib/metadata";
 import type { PerformanceSettings } from "../lib/performance.svelte";
-import type { ProofProfileId } from "../lib/proof-profiles";
-import { type BrushDynamics, type BrushKind, type BrushTipInfo, NEUTRAL_DYNAMICS } from "../lib/ipc";
-import type { DocumentInfo, Filter, FontFamily, LayerInfo, Rgb, ShapeData, StyleRun, SystemInfo, TextData } from "../lib/ipc";
+import { type AppError, toAppError } from "../lib/errors";
+import { type BrushDynamics, type BrushKind, type BrushTipInfo, type DualParam, type TextureParam, NEUTRAL_DYNAMICS } from "../lib/ipc";
+import type { BlendMode, DocumentInfo, Filter, FontFamily, LayerEffect, LayerInfo, Rgb, ShapeData, StyleRun, SystemInfo, TextData } from "../lib/ipc";
+import type { RawDialogMode, RawOpened, RawParams } from "../lib/ipc";
 import type { Camera } from "../viewport/camera";
 
-export type ToolId = "move" | "crop" | "shape" | "heal" | "quickSelect" | "marquee" | "lasso" | "wand" | "eyedropper" | "brush" | "eraser" | "fill" | "pen" | "text" | "pathSelect" | "hand" | "zoom";
+export type ToolId = "move" | "crop" | "shape" | "heal" | "quickSelect" | "marquee" | "lasso" | "wand" | "eyedropper" | "brush" | "eraser" | "fill" | "pen" | "text" | "pathSelect" | "hand" | "rotateView" | "zoom";
 export type PaintTool = "brush" | "eraser";
 
 export interface BrushSettings {
@@ -24,6 +25,20 @@ export interface BrushSettings {
 export interface Point {
   x: number;
   y: number;
+}
+
+/** Un RAW dans la fenêtre « Développement RAW » : `resolve(null)` = Annuler. */
+export interface RawDevelopRequest {
+  opened: RawOpened;
+  mode: RawDialogMode;
+  /** Position dans une série de RAW ouverts d'un coup (1 sur `count`). */
+  index: number;
+  count: number;
+  /** Réglages de départ (ceux du RAW précédent de la série, ou ceux de l'objet dynamique à redévelopper). */
+  initial: RawParams | null;
+  /** État de départ de la case « redévelopper plus tard » (celui du RAW précédent de la série). */
+  keepRaw: boolean;
+  resolve: (result: { params: RawParams; applyToRest: boolean; keepRaw: boolean } | null) => void;
 }
 
 /** Transformation libre en cours (Ctrl+T). Tant qu'elle existe, les autres outils sont suspendus. */
@@ -62,28 +77,75 @@ export interface TextEditSession {
   selectAll: boolean;
 }
 
-export interface OpenDocument {
-  info: DocumentInfo;
+/**
+ * Document ouvert dans un onglet. Classe (et non simple objet) pour une seule raison : la sélection de calques passe
+ * par un accesseur, le point unique où le calque actif change. C'est là que la cible des outils revient aux pixels.
+ */
+export class OpenDocument {
+  /**
+   * Description du document telle que le moteur la renvoie. Jamais modifiée en place (chaque révision la remplace
+   * entière, voir `App.update`) : `$state.raw` évite d'envelopper ses centaines de calques dans des proxys.
+   */
+  info = $state.raw() as DocumentInfo;
   /**
    * Vrai tant que la vue est en « taille écran » : elle se réajuste alors toute seule quand la fenêtre
    * change de taille (agrandissement, plein écran…). Tout zoom ou déplacement manuel y met fin ; Ctrl+0 y revient.
    */
-  autoFit: boolean;
+  autoFit = $state(true);
+  /** Plan de travail sur lequel on travaille seul (sélecteur du panneau Calques) ; `null` = tous les plans. */
+  boardFocus = $state<number | null>(null);
   /** Révision du dernier enregistrement (ou de l'ouverture) : au-delà, le document a des modifications non enregistrées. */
-  savedRevision: number;
+  savedRevision = $state(0);
   /** Nom de sa copie de secours (sauvegarde automatique), unique et stable tant que le document est ouvert. */
   recoveryKey: string;
   /** Révision et moment de la dernière sauvegarde automatique (ou de l'ouverture, ou du dernier enregistrement). */
-  autosavedRevision: number;
-  autosavedAt: number;
+  autosavedRevision = $state(0);
+  autosavedAt = $state(0);
   /** `null` tant que la zone de travail n'a pas cadré le document une première fois. */
-  camera: Camera | null;
-  /** Calques sélectionnés ; le dernier est le calque actif. */
-  selection: number[];
-  /** Cible de la peinture sur le calque actif. */
+  camera = $state<Camera | null>(null);
+  /**
+   * Vrai depuis l'ouverture jusqu'à ce que ses calques soient tous sur la carte graphique (ou qu'elle n'en prenne
+   * pas) : la zone de travail montre alors une carte de chargement au centre (voir Viewport.svelte).
+   */
+  opening = $state(true);
+  /** Instant de l'ouverture (ms, `performance.now`). */
+  readonly openedAt = performance.now();
+  #selection = $state<number[]>([]);
   /** Ce que visent les outils : les pixels, le masque de fusion, ou les deux (Ctrl + clic sur l'autre vignette :
-   *  l'outil Déplacement les déplace alors ensemble ; peindre vise les pixels). */
-  target: "pixels" | "mask" | "both";
+   *  l'outil Déplacement les déplace alors ensemble ; peindre vise les pixels). Toujours celui du calque actif. */
+  target = $state<"pixels" | "mask" | "both">("pixels");
+  /** Temps de travail actif sur le projet, en secondes (lib/work-time.svelte.ts) : repris du fichier à l'ouverture. */
+  workSeconds = $state(0);
+  /** Temps de travail au début de cette session (ouverture), pour « Cette session » au survol. */
+  readonly workAtOpen: number;
+
+  constructor(info: DocumentInfo, recoveryKey: string) {
+    this.info = info;
+    this.workSeconds = info.workSeconds ?? 0;
+    this.workAtOpen = this.workSeconds;
+    this.savedRevision = info.revision;
+    this.autosavedRevision = info.revision;
+    this.autosavedAt = Date.now();
+    this.recoveryKey = recoveryKey;
+    const first = info.layers[0];
+    this.#selection = first ? [first.id] : [];
+  }
+
+  /** Calques sélectionnés ; le dernier est le calque actif. */
+  get selection(): number[] {
+    return this.#selection;
+  }
+
+  /**
+   * Autre calque actif (panneau Calques, sélection automatique de l'outil Déplacement, calque créé ou supprimé…) : la
+   * cible revient aux pixels. Sans cela, viser le masque d'un calque puis en activer un autre ailleurs que dans le
+   * panneau laissait la cible sur « masque » : Suppr retirait alors le masque d'un calque jamais visé. Un clic sur la
+   * vignette du masque choisit sa cible APRÈS avoir changé la sélection (LayersPanel.svelte).
+   */
+  set selection(ids: number[]) {
+    if (ids.at(-1) !== this.#selection.at(-1)) this.target = "pixels";
+    this.#selection = ids;
+  }
 }
 
 class AppState {
@@ -92,27 +154,26 @@ class AppState {
   tool = $state<ToolId>("move");
   rulersVisible = $state(true);
   /**
-   * Affichage › Épreuve : profil d'impression simulé par la zone de travail (document et export restent RVB),
-   * `null` sans épreuve. Voir lib/proof-profiles.ts.
+   * Affichage › Épreuve CMJN (Ctrl+Y) : la zone de travail simule l'impression dans l'espace CMJN des Paramètres de
+   * couleur (document et export restent RVB). Voir lib/color-settings.svelte.ts.
    */
-  proofProfile = $state<ProofProfileId | null>(null);
-  /** Dernier profil d'épreuve choisi (gardé dans les réglages) : celui que rallume Épreuve CMJN (Ctrl+Y). */
-  lastProofProfile = $state<ProofProfileId>("fogra39");
-  /** Épreuve active, quel qu'en soit le profil (ancien état booléen, gardé pour ce qui le lit encore). */
-  get proofCmyk(): boolean {
-    return this.proofProfile !== null;
-  }
-  set proofCmyk(on: boolean) {
-    this.proofProfile = on ? (this.proofProfile ?? this.lastProofProfile) : null;
-  }
+  proofCmyk = $state(false);
   /** Écran d'accueil : ouvert par l'écran de lancement quand il se retire, puis par Ctrl+N. */
   newDocumentDialogOpen = $state(false);
+  /** Impression : Image › Format d'impression…, Image › Corriger l'encrage…, Vérifier avant impression…. */
+  printSetupDialogOpen = $state(false);
+  correctInkDialogOpen = $state(false);
+  preflightOpen = $state(false);
   shortcutsDialogOpen = $state(false);
   /** Libellé de l'opération longue en cours, affiché dans la barre d'état. */
   busy = $state<string | null>(null);
   /** Chargement des calques du document affiché (jauge discrète de la barre d'état) ; `null` au repos. */
   loading = $state<{ done: number; total: number } | null>(null);
   error = $state<string | null>(null);
+  /** Code du moteur de l'erreur affichée (seulement s'il s'agit encore du même message). */
+  errorCode = $state<{ message: string; code: string } | null>(null);
+  /** Dernière erreur survenue, même effacée de l'écran : reprise dans le rapport de bug. */
+  lastError = $state<(AppError & { at: number }) | null>(null);
   /** Taille de la zone de travail en pixels CSS, tenue à jour par le viewport. */
   viewport = $state({ width: 0, height: 0 });
   /** Position du pointeur en pixels du document. */
@@ -133,10 +194,23 @@ class AppState {
   quickSelect = $state({ size: 40, tolerance: 24 });
   /** Fenêtre « Modifier la sélection ». */
   modifySelectionOpen = $state(false);
+  /** Fenêtre Sélection avancée (couches, niveaux, affinage des contours). */
+  advancedSelectOpen = $state(false);
+  /** Fenêtre Plans de travail. */
+  artboardDialog = $state(false);
+  /** Vue miroir : l'affichage est retourné horizontalement (les pixels ne changent pas). */
+  viewMirrored = $state(false);
   /** Forme du pinceau et de la gomme (une gomme « mélangeur » n'ayant pas de sens, elle redevient ronde). */
   brushKind = $state<BrushKind>({ type: "round" });
   /** Dynamique de forme du pinceau courant (espacement, dispersion, angle…). */
   brushDynamics = $state<BrushDynamics>({ ...NEUTRAL_DYNAMICS });
+  /** Pinceau double et texture du pinceau choisi (préréglages importés de Photoshop) ; `null` sinon. */
+  brushDual = $state<DualParam | null>(null);
+  brushTexture = $state<TextureParam | null>(null);
+  /** Pinceau choisi dans la bibliothèque (clé d'entrée), pour le surligner ; `null` après un réglage à la main de la forme. */
+  brushKey = $state<string | null>(null);
+  /** Panneau des pinceaux ouvert (position du coin haut-gauche), ou `null`. */
+  brushPanel = $state<{ x: number; y: number } | null>(null);
   /** Vignettes des pointes (adresses d'images en mémoire), par identifiant. */
   brushThumbnails = $state<Record<number, string>>({});
   /** Pointes connues : fournies avec le logiciel, puis importées. */
@@ -145,8 +219,8 @@ class AppState {
   heal = $state({ size: 40, hardness: 0.6 });
   /** Lissage du tracé du pinceau et de la gomme, de 0 (brut) à 1 (très lissé, le trait suit avec un léger retard). */
   strokeSmoothing = $state(0.6);
-  /** Outil G : dégradé ou pot de peinture (Maj+G pour alterner). */
-  fill = $state({ kind: "gradient" as "gradient" | "bucket", radial: false, tolerance: 32, contiguous: true });
+  /** Outil G : pot de peinture (par défaut, comme le veut l'utilisateur) ou dégradé (Maj+G pour alterner). */
+  fill = $state({ kind: "bucket" as "gradient" | "bucket", radial: false, tolerance: 32, contiguous: true });
   /** Dégradé courant ; par défaut il suit les couleurs de premier plan et d'arrière-plan. */
   gradient = $state<GradientState>({ stops: [], dynamic: "foregroundToBackground" });
   /**
@@ -202,22 +276,43 @@ class AppState {
   layerDrag: { docId: number; ids: number[] } | null = null;
   /** Masque de fusion en cours de glisser : calque d'origine. */
   maskDrag: number | null = null;
-  /** Menu du pinceau ouvert au clic droit sur l'image : position à l'écran. */
-  brushMenu = $state<{ x: number; y: number } | null>(null);
   /** Avancement d'un export en cours (0 à 1) et étape ; `null` = pas d'export. */
   exportProgress = $state<{ progress: number; label: string } | null>(null);
   /** Fenêtre d'export. */
   exportOpen = $state(false);
+  /** Fenêtre « Exporter sous… » d'un calque ou d'un groupe : calques visés ; `separate` : un fichier par calque. */
+  layerExport = $state<{ ids: number[]; separate: boolean; zone?: "artboard" } | null>(null);
   /** Fenêtre « À propos de Lumitype ». */
   aboutOpen = $state(false);
+  /** Aide > Signaler un bug… */
+  bugReportOpen = $state(false);
   /** Lignes d'alignement à afficher (pixels du document) quand ce qu'on déplace s'aimante. */
   smartGuides = $state<{ x: number | null; y: number | null }>({ x: null, y: null });
   /** Fenêtre « Disposition de repères ». */
   guideLayoutOpen = $state(false);
   /** Question « Enregistrer les modifications ? » en cours, et de quoi y répondre. */
   savePrompt = $state<{ name: string; resolve: (choice: "save" | "discard" | "cancel") => void } | null>(null);
+  /** Fenêtre « Développement RAW » ouverte sur un RAW (voir `developRaw` dans actions.ts), et de quoi y répondre. */
+  rawDevelop = $state<RawDevelopRequest | null>(null);
   /** Calque dont la fenêtre « Effets de calque » est ouverte. */
   effectsLayer = $state<number | null>(null);
+  /**
+   * Page à montrer dans la fenêtre des effets (menu du bouton fx) : un type d'effet (ajouté et coché s'il manque au
+   * calque, sélectionné sinon) ou « blending » pour les options de fusion. La fenêtre la lit puis la remet à `null`.
+   */
+  effectsFocus = $state<string | null>(null);
+  /** Style copié (Calque > Copier le style) : effets et options de fusion, prêts à coller sur d'autres calques. */
+  styleClipboard = $state<{ effects: LayerEffect[]; blend: BlendMode; opacity: number; fill: number } | null>(null);
+  /**
+   * Boîte de dialogue d'un calque de remplissage : `kind` ce qu'il contient, `layer` le calque modifié (double-clic sur
+   * sa vignette), ou `null` pour en créer un au-dessus du calque actif.
+   */
+  fillDialog = $state<{ kind: "solidColor" | "gradient" | "pattern"; layer: number | null } | null>(null);
+  /**
+   * Glissé dans l'image confié à une boîte de dialogue ouverte (centre d'un dégradé de remplissage) : l'outil actif
+   * n'agit pas tant qu'il est posé. Points en pixels du document.
+   */
+  canvasDrag = $state<{ begin: (x: number, y: number) => void; move: (x: number, y: number) => void; end: () => void } | null>(null);
   /** Fenêtre des préférences. */
   preferencesOpen = $state(false);
   /** Fenêtre « Copyright et métadonnées » (menu Copyright). */
@@ -233,19 +328,28 @@ class AppState {
   /** Résolution dynamique : facteur du canevas (1 = écran ; 0,5 = quatre fois moins de pixels pendant un geste). */
   renderScale = $state(1);
   /** État de la composition sur carte graphique, pour les Préférences et la barre d'état. */
-  gpuStatus = $state<{ renderer: string; maxTexture: number; active: boolean; reason: string | null; memoryMb: number } | null>(null);
+  gpuStatus = $state<{ renderer: string; maxTexture: number; active: boolean; reason: string | null; memoryMb: number; move?: { mode: "cache" | "collapse" | "engine" | "pending" | "gpu"; ms: number | null; detail: string } | null } | null>(null);
   /** Onglet affiché dans le panneau de gauche. */
   leftTab = $state<"properties" | "adjustments" | "history">("properties");
   /** Filtre dont la boîte de dialogue est ouverte. */
   filterDialog = $state<Exclude<Filter["type"], "liquify"> | null>(null);
+  /**
+   * Filtre dynamique rouvert (double-clic dans le panneau Calques) : la galerie, la Fluidité ou Camera Raw s'ouvrent
+   * sur ses réglages, et « Appliquer » le remplace dans la liste du calque au lieu d'en ajouter un.
+   */
+  filterEdit = $state<{ layerId: number; index: number } | null>(null);
   /** Outil Déplacement : un clic sélectionne le calque visible sous le pointeur. */
   autoSelect = $state(true);
+  /** Sélection automatique : le calque touché, ou le groupe le plus haut qui le contient (comme Photoshop). */
+  autoSelectMode = $state<"layer" | "group">("layer");
   guidesVisible = $state(true);
   /** Magnétisme : repères, bords et centre du document. */
   snapEnabled = $state(true);
   transform = $state<TransformSession | null>(null);
   /** Réglages du prochain calque de texte ; ils suivent les derniers choix de l'utilisateur. */
   /** La couleur du texte est la sienne : elle ne suit pas la couleur de premier plan. */
+  /** Option de l'outil Texte : un cadre tracé crée un texte dynamique (chaque ligne remplit la largeur du cadre). */
+  textDynamic = $state(false);
   textDefaults = $state<Omit<TextData, "content" | "runs">>({ fontFamily: "", size: 72, lineHeight: 1.2, tracking: 0, align: "left", color: [0, 0, 0], weight: 400, italic: false });
   textEdit = $state<TextEditSession | null>(null);
   recentColors = $state<Rgb[]>([]);
@@ -264,15 +368,15 @@ class AppState {
   /** Miniatures, par clé `document:calque:p|m`. */
   thumbnails = new SvelteMap<string, ImageData>();
 
-  get active(): OpenDocument | null {
-    return this.documents.find((d) => d.info.id === this.activeId) ?? null;
-  }
+  /** Document actif : mémorisé tant que ni la liste des documents ni `activeId` ne changent (au lieu d'une recherche à chaque lecture). */
+  readonly active: OpenDocument | null = $derived(this.documents.find((d) => d.info.id === this.activeId) ?? null);
 
-  get activeLayer(): LayerInfo | null {
+  /** Calque actif (dernier de la sélection du document actif), mémorisé de même. */
+  readonly activeLayer: LayerInfo | null = $derived.by(() => {
     const doc = this.active;
     const id = doc?.selection.at(-1);
     return doc?.info.layers.find((l) => l.id === id) ?? null;
-  }
+  });
 
   /** Vrai si le document a été modifié depuis son ouverture ou son dernier enregistrement. */
   isModified(doc: OpenDocument): boolean {
@@ -285,18 +389,7 @@ class AppState {
 
   add(info: DocumentInfo): void {
     this.homeOpen = false; // un document s'ouvre : l'accueil laisse la place
-    const first = info.layers[0];
-    this.documents.push({
-      info,
-      autoFit: true,
-      savedRevision: info.revision,
-      recoveryKey: crypto.randomUUID(),
-      autosavedRevision: info.revision,
-      autosavedAt: Date.now(),
-      camera: null,
-      selection: first ? [first.id] : [],
-      target: "pixels",
-    });
+    this.documents.push(new OpenDocument(info, crypto.randomUUID()));
     this.activeId = info.id;
   }
 
@@ -348,7 +441,17 @@ class AppState {
   /** `fit` : ce placement est un ajustement à la fenêtre ; sinon c'est un choix de l'utilisateur, qui met fin à l'ajustement automatique. */
   setCamera(camera: Camera, fit = false): void {
     const active = this.active;
-    if (active) [active.camera, active.autoFit] = [camera, fit];
+    if (!active) return;
+    // Une caméra sans rotation explicite (zoom animé, déplacement…) garde la rotation de l'affichage en cours :
+    // seuls l'outil Rotation de l'affichage et sa réinitialisation la changent.
+    const rotation = camera.rotation ?? active.camera?.rotation ?? 0;
+    [active.camera, active.autoFit] = [{ ...camera, rotation }, fit];
+  }
+
+  /** Rotation de l'affichage du document actif (radians, sens horaire), sans toucher au zoom ni au cadrage. */
+  setViewRotation(rotation: number): void {
+    const active = this.active;
+    if (active?.camera) active.camera = { ...active.camera, rotation };
   }
 
   /** Fournie par le viewport : amène la caméra à destination par une transition douce. */
@@ -363,7 +466,10 @@ class AppState {
   }
 
   fail(error: unknown): void {
-    this.error = typeof error === "string" ? error : error instanceof Error ? error.message : String(error);
+    const { code, message } = toAppError(error);
+    this.error = message;
+    this.errorCode = code ? { message, code } : null;
+    this.lastError = { code, message, at: Date.now() };
   }
 }
 

@@ -135,7 +135,7 @@
     height: 28px;
     flex-shrink: 0;
     border-radius: var(--radius-s);
-    border: 1px solid rgba(255, 255, 255, 0.3);
+    border: 1px solid rgb(var(--ink) / 0.3);
   }
   input {
     flex: 1;
@@ -156,7 +156,7 @@
   .swatches button {
     aspect-ratio: 1;
     border-radius: var(--radius-s);
-    border: 1px solid rgba(255, 255, 255, 0.14);
+    border: 1px solid rgb(var(--ink) / 0.14);
   }
   .swatches button:hover {
     outline: 1.5px solid #fff;

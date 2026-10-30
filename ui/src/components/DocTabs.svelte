@@ -2,7 +2,8 @@
   import { t } from "../lib/i18n.svelte";
   import { documentTitle, isActionEnabled, runAction } from "../lib/actions";
   import { layerDrag } from "../lib/layer-drag.svelte";
-  import { proofShortName } from "../lib/proof-profiles";
+  import { profileShort } from "../lib/color-settings.svelte";
+  import { effectiveProof, modeTabLabel, workflowSpace } from "../lib/color-mode.svelte";
   import { app } from "../state/app.svelte";
   import ContextMenu, { type MenuEntry } from "./ContextMenu.svelte";
   import Icon from "./Icon.svelte";
@@ -13,8 +14,15 @@
   // que le marquer.
 
   const percent = (zoom: number | undefined) => (zoom ? `${Math.round(zoom * 1000) / 10} %` : "");
-  // Mode affiché après le zoom : « RVB/8 », ou le profil simulé quand l'épreuve est active (« CMJN FOGRA39 »).
-  const mode = $derived(app.proofProfile ? `${t("CMJN")} ${proofShortName(app.proofProfile)}` : "RVB/8");
+  // Mode affiché après le zoom, comme Photoshop (« RGB/8 », « Gray/8 », « Bitmap », « CMYK/8 ») : celui du document
+  // (Image › Mode) ; un document RVB montré en épreuve CMJN (Affichage › Épreuve CMJN) dit aussi « CMJN/8 ». Le profil est
+  // dans la barre d'état et l'infobulle.
+  const mode = $derived(modeTabLabel(app.active?.info));
+  const proofHint = $derived.by(() => {
+    const proof = effectiveProof(app.active?.info);
+    if (!proof) return "";
+    return workflowSpace(app.active?.info) ? ` — ${t("Mode")} ${t("CMJN")} ${profileShort(proof.profile)}` : ` — ${t("Épreuve")} ${t("CMJN")} ${profileShort(proof.profile)}`;
+  });
 
   // ---- Atteindre un document quand il y en a plus que la barre n'en montre.
   //
@@ -65,7 +73,7 @@
         data-doc={doc.info.id}
         role="presentation"
       >
-        <button role="tab" aria-selected={active} title={doc.info.smartParent ? `${documentTitle(doc.info)} — ${t("Ctrl+S met à jour l'objet dynamique")}` : doc.info.name} onclick={() => (app.activeId = doc.info.id)}>
+        <button role="tab" aria-selected={active} title={doc.info.smartParent ? `${documentTitle(doc.info)} — ${t("Ctrl+S met à jour l'objet dynamique")}${active ? proofHint : ""}` : `${doc.info.name}${active ? proofHint : ""}`} onclick={() => (app.activeId = doc.info.id)}>
           <span class="name">{documentTitle(doc.info)}{app.isModified(doc) ? " *" : ""}</span>
           {#if active}<span class="about">@ {percent(doc.camera?.zoom)} ({mode})</span>{/if}
         </button>
@@ -142,6 +150,10 @@
   .tab.smart {
     max-width: 320px;
   }
+  /* Onglet actif : le zoom et le mode s'ajoutent au nom ; le nom se raccourcit d'abord. */
+  .tab.active:not(.smart) {
+    max-width: 260px;
+  }
   /* Onglet actif : le zoom et le mode s'y ajoutent, le titre garde sa place. */
   .tab.smart.active {
     max-width: 440px;
@@ -171,7 +183,11 @@
     white-space: nowrap;
   }
   .about {
-    flex-shrink: 0;
+    /* Ne se raccourcit qu'une fois le nom réduit. */
+    flex-shrink: 0.01;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
     color: var(--text-muted);
   }
   .close {

@@ -1,7 +1,8 @@
 [package]
-name = "image-editor"
+name = "lumitype"
 description = "Éditeur d'images raster"
-version.workspace = true
+# Version de l'application (À propos, installeurs) : propre à Lumitype, le moteur garde celle de l'espace de travail.
+version = "1.2.88"
 edition.workspace = true
 license.workspace = true
 
@@ -30,6 +31,10 @@ ureq = "2"
 # les images copiées ailleurs (captures d'écran) dans ses événements de collage.
 arboard = { version = "3", default-features = false, features = ["image-data"] }
 serde_json = "1"
+# Visionneuse (viewer.rs) : prise de vue lue dans l'EXIF (appareil, objectif, exposition, orientation), en Rust pur ;
+# mise à la corbeille du système (Windows, Linux, macOS) plutôt qu'une suppression définitive.
+kamadak-exif = "0.6"
+trash = "5"
 # Double-clic sur un projet alors que Lumitype tourne déjà : le fichier s'ouvre dans la fenêtre existante.
 tauri-plugin-single-instance = "2"
 # Mémoire vive de la machine, pour l'allocation automatique du cache. Seule la partie « système » est compilée.
@@ -37,7 +42,12 @@ sysinfo = { version = "0.33", default-features = false, features = ["system"] }
 # Nombre de cœurs réglable : les calculs du moteur tournent dans un groupe de threads dédié, reconstruit à la demande.
 rayon = "1"
 # Vignettes des pointes de pinceau (PNG) : mêmes réglages que le moteur.
-image = { version = "0.25", default-features = false, features = ["png"] }
+# « My ref » : visionneuse en JPEG et taille des images lue dans l'en-tête (mêmes fonctions que le moteur : rien de plus
+# à compiler).
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "tiff"] }
+# « My ref » : vignettes WebP avec perte (libwebp ; l'encodeur de `image` ne fait que du sans perte). Même version que
+# le moteur (crates/engine) : la bibliothèque C y est déjà compilée, rien de plus à construire.
+webp = { version = "0.3", default-features = false }
 # Mémoire vidéo de la carte (préférences › Mémoire vidéo utilisable) : lue par Vulkan, chargeur ouvert à l'exécution
 # (fonction « loaded » : pas de lien statique, échec silencieux sans Vulkan). Voir gpu_info.rs.
 ash = { version = "0.38", default-features = false, features = ["loaded", "std"] }
@@ -59,11 +69,13 @@ windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Dx
 
 [features]
 # Par défaut : la webview du système (WebView2 sous Windows — c'est Chromium —, WebKitGTK sous Linux, qui plafonne vers
-# 45-50 i/s en plein écran 4K). Sous Linux, export/linux.sh compile Chromium (CEF) : `--no-default-features --features cef`.
+# 45-50 i/s en plein écran 4K). Sous Linux, packaging/linux.sh compile Chromium (CEF) : `--no-default-features --features cef`.
 default = ["wry"]
 wry = ["tauri/wry", "tauri/x11", "tauri/dbus"]
 cef = ["dep:tauri-runtime-cef"]
-# Vérification de type sans binaires CEF : `cargo check -p image-editor --no-default-features --features cef-check`.
+# Vérification de type sans binaires CEF : `cargo check -p lumitype --no-default-features --features cef-check`.
 cef-check = ["cef", "dep:cef", "cef/dox"]
 
 [dev-dependencies]
+# Tests de la bibliothèque « My ref » (myref.rs) : dossiers temporaires.
+tempfile = "3"

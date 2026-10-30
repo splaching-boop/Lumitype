@@ -1,0 +1,6 @@
+# Les scripts Linux gardent des fins de ligne LF, même sur un Windows où git convertit en CRLF : sans cela, bash
+# dans WSL refuse de les lire (« $'\r': command not found »).
+*.sh text eol=lf
+packaging/lib/* text eol=lf
+*.bat text eol=crlf
+*.ps1 text eol=crlf

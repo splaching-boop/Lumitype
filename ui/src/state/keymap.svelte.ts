@@ -1,5 +1,6 @@
 // Raccourcis effectifs : preset Photoshop + personnalisations, enregistrées sur disque.
 import { invoke } from "@tauri-apps/api/core";
+import { describeError } from "../lib/errors";
 import type { ActionId } from "../lib/actions";
 import { type Binding, type Chord, chordLabel, chordsConflict } from "../lib/keymap";
 import { PHOTOSHOP_KEYMAP } from "../lib/keymap-photoshop";
@@ -47,6 +48,36 @@ class Keymap {
     return [...new Set(found)];
   }
 
+  /**
+   * Actions dont un raccourci est aussi celui d'une autre action (choisi à la main malgré l'avertissement) : la
+   * liste les montre en rouge. À la frappe, la première action de la liste des raccourcis l'emporte.
+   */
+  readonly clashing: Set<ActionId> = $derived.by(() => {
+    const out = new Set<ActionId>();
+    const list = this.bindings;
+    for (let i = 0; i < list.length; i++) {
+      for (let j = i + 1; j < list.length; j++) {
+        const [a, b] = [list[i]!, list[j]!];
+        if (a.action !== b.action && chordsConflict(a.chord, b.chord)) {
+          out.add(a.action);
+          out.add(b.action);
+        }
+      }
+    }
+    return out;
+  });
+
+  /** Ce raccourci de cette action est-il partagé avec une autre action ? */
+  clashes(action: ActionId, chord: Chord): boolean {
+    return this.bindings.some((b) => b.action !== action && chordsConflict(b.chord, chord));
+  }
+
+  /** Ajoute un raccourci à une action en le laissant aussi aux autres (conflit assumé, signalé en rouge). */
+  assignShared(action: ActionId, chord: Chord): void {
+    this.overrides[action] = [...this.chordsOf(action).filter((c) => !chordsConflict(c, chord)), chord];
+    this.save();
+  }
+
   /** Ajoute un raccourci à une action et le retire de celles qui l'utilisaient. */
   assign(action: ActionId, chord: Chord): void {
     for (const other of this.conflicts(chord, action)) {
@@ -79,7 +110,7 @@ class Keymap {
       // Une version inconnue est ignorée plutôt que mal interprétée : on retombe sur le preset.
       if (stored.version === FORMAT_VERSION) this.overrides = stored.overrides;
     } catch (error) {
-      app.fail(`Raccourcis personnalisés illisibles, preset par défaut utilisé — ${String(error)}`);
+      app.fail(`Raccourcis personnalisés illisibles, preset par défaut utilisé — ${describeError(error)}`);
     }
   }
 

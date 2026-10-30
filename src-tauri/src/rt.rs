@@ -1,5 +1,5 @@
 //! Moteur de la fenêtre (runtime Tauri) : Chromium embarqué avec `--features cef` (Linux, ce que construit
-//! export/linux.sh), webview du système sinon (wry : WebView2 sous Windows, toujours ; WebKitGTK sous Linux en
+//! packaging/linux.sh), webview du système sinon (wry : WebView2 sous Windows, toujours ; WebKitGTK sous Linux en
 //! secours, `LUMITYPE_MOTEUR=webkit`).
 //! Tout le code passe par ces alias : le reste de l'application ne dépend pas du moteur choisi.
 

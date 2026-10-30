@@ -5,6 +5,7 @@ export const ICONS = {
   lasso: "M12 4c5 0 9 2.5 9 6s-4 6-9 6-9-2.5-9-6 4-6 9-6zM7 15c-1 2 0 4 2 6",
   wand: "M4 20L15 9M14 3v3M18 10h3M18 4l-2 2M20 15l-2-1",
   crop: "M6 2v16h16M2 6h16v16",
+  artboard: "M7 3v18M17 3v18M3 7h18M3 17h18",
   pipette: "M16 4l4 4-3 3-4-4zM13 9l-9 9v2h2l9-9",
   brush: "M18 3l3 3-9 9-3-3zM9 12c-3 0-4 2-4 4s-1 3-2 3c3 1 8 0 8-5",
   eraser: "M8 20l-5-5L14 4l7 7-9 9zM8 20h12M9 9l7 7",
@@ -42,13 +43,20 @@ export const ICONS = {
 
   quickSelect: "M14 4l6 6-7 7-4 1 1-4zM4 14a3 3 0 013-3M4 19a3 3 0 003 2M10 21a3 3 0 002-1",
   heal: "M4.5 13.5l9-9a4.2 4.2 0 016 6l-9 9a4.2 4.2 0 01-6-6zM9 9l6 6M11.5 12.5h.01M13 11h.01M10 14h.01",
+  // ---- Outils empilés (variantes affichées dans les cases de la barre d'outils et leur liste)
+  marqueeEllipse: "M4.6 9.2A8.5 6.5 0 017.6 6.4M10.5 5.6a8.5 6.5 0 013 0M16.4 6.4a8.5 6.5 0 013 2.8M19.4 14.8a8.5 6.5 0 01-3 2.8M13.5 18.4a8.5 6.5 0 01-3 0M7.6 17.6a8.5 6.5 0 01-3-2.8",
+  lassoPolygon: "M4 8l8-4 9 4-3 8-12-1zM6 15c-1 2 0 4 2 6",
+  gradient: "M4 5h16v14H4zM9 5v14M13 5v14M16 5v14M18.3 5v14",
+  shapeHexagon: "M8 4.5h8l4 7.5-4 7.5H8L4 12z",
+  // Rotation de l'affichage : flèche circulaire autour d'une page inclinée.
+  rotateView: "M20 12a8 8 0 11-2.34-5.66M20 3.5v4h-4M12 8.5l3.5 3.5-3.5 3.5-3.5-3.5z",
 } as const;
 
 export type IconName = keyof typeof ICONS;
 
 /**
  * Icônes personnalisées : tout fichier `ui/src/assets/icons/<nom>.svg` (ou `.png`) remplace l'icône
- * intégrée du même nom. Voir `ui/src/assets/icons/LISEZ-MOI.md` pour les noms et le gabarit.
+ * intégrée du même nom. Voir `ui/src/assets/icons/README.md` pour les noms et le gabarit.
  */
 // Les fichiers de travail (gabarits, modèles), dont le nom commence par « _ », ne sont ni lus ni embarqués dans l'application.
 const files = import.meta.glob<string>(["../assets/icons/*.{svg,png}", "!../assets/icons/_*"], { eager: true, import: "default", query: "?url" });

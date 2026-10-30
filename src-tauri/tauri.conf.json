@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Lumitype",
-  "version": "1.1.0",
+  "version": "1.2.88",
   "identifier": "dev.imageeditor.app",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -79,6 +79,8 @@
         "desktopTemplate": "linux/lumitype.desktop",
         "files": {
           "/usr/share/mime/packages/lumitype.xml": "linux/lumitype-mime.xml",
+          "/usr/share/applications/lumitype-visionneuse.desktop": "linux/lumitype-visionneuse.desktop",
+          "/usr/share/thumbnailers/lumitype.thumbnailer": "linux/lumitype.thumbnailer",
           "/usr/share/icons/hicolor/48x48/mimetypes/application-x-lumitype.png": "linux/mimetypes/application-x-lumitype-48.png",
           "/usr/share/icons/hicolor/64x64/mimetypes/application-x-lumitype.png": "linux/mimetypes/application-x-lumitype-64.png",
           "/usr/share/icons/hicolor/128x128/mimetypes/application-x-lumitype.png": "linux/mimetypes/application-x-lumitype-128.png",
@@ -90,6 +92,8 @@
         "desktopTemplate": "linux/lumitype.desktop",
         "files": {
           "/usr/share/mime/packages/lumitype.xml": "linux/lumitype-mime.xml",
+          "/usr/share/applications/lumitype-visionneuse.desktop": "linux/lumitype-visionneuse.desktop",
+          "/usr/share/thumbnailers/lumitype.thumbnailer": "linux/lumitype.thumbnailer",
           "/usr/share/icons/hicolor/48x48/mimetypes/application-x-lumitype.png": "linux/mimetypes/application-x-lumitype-48.png",
           "/usr/share/icons/hicolor/64x64/mimetypes/application-x-lumitype.png": "linux/mimetypes/application-x-lumitype-64.png",
           "/usr/share/icons/hicolor/128x128/mimetypes/application-x-lumitype.png": "linux/mimetypes/application-x-lumitype-128.png",
@@ -106,6 +110,28 @@
           "/usr/share/icons/hicolor/256x256/mimetypes/application-x-lumitype.png": "linux/mimetypes/application-x-lumitype-256.png",
           "/usr/share/icons/hicolor/512x512/mimetypes/application-x-lumitype.png": "linux/mimetypes/application-x-lumitype-512.png"
         }
+      }
+    },
+    "windows": {
+      "nsis": {
+        "template": "windows/installer.nsi",
+        "installerIcon": "icons/icon.ico",
+        "uninstallerIcon": "icons/icon.ico",
+        "sidebarImage": "windows/installer-side.bmp",
+        "headerImage": "windows/installer-header.bmp",
+        "languages": [
+          "French",
+          "English",
+          "Spanish",
+          "German"
+        ],
+        "displayLanguageSelector": true,
+        "installerHooks": "windows/installer-hooks.nsh"
+      },
+      "wix": {
+        "language": "fr-FR",
+        "bannerPath": "windows/msi-bandeau.bmp",
+        "dialogImagePath": "windows/msi-accueil.bmp"
       }
     }
   },

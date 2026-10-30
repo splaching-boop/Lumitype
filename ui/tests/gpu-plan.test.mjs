@@ -80,6 +80,14 @@ assert.deepEqual(plan.program, { ops: [
   { op: "blend", target: 0, source: { layer: 2 }, mode: "normal", layer: 2 },
 ], buffers: 1 });
 
+// Image › Mode : en gris ou en bitmap, le rendu final se fait à la présentation du tampon 0 — jamais en dessin direct.
+// Le programme ne change pas ; le CMJN (mode de travail, pixels RVB) reste direct.
+for (const [kind, simple] of [["grayscale", false], ["bitmap", false], ["cmykWorkflow", true], ["rgb", true]]) {
+  const modePlan = gpuPlan({ ...doc([layer(1, null, 0), layer(2, null, 1, { opacity: 0.5 })]), colorMode: { kind, profile: "fogra39" } });
+  assert.equal(modePlan.simple, simple, kind);
+  assert.deepEqual(modePlan.program, plan.program, kind);
+}
+
 // Mode de fusion et masque : le programme n'est plus « simple », le masque est à charger.
 plan = gpuPlan(doc([layer(1, null, 0), layer(2, null, 1, { blend: "multiply", hasMask: true, maskEnabled: true })]));
 assert.equal(plan.ok, true);

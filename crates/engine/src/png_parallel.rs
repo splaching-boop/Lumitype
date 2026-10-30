@@ -30,10 +30,54 @@ fn rows_per_strip(row_bytes: usize, height: usize) -> usize {
 
 /// Encode une image 8 bits (`channels` = 3 pour RGB, 4 pour RGBA ; pixels à alpha droit) en PNG. `level` : 0 à 9.
 pub fn encode(width: u32, height: u32, pixels: &[u8], channels: usize, level: u32) -> Result<Vec<u8>, EngineError> {
+    if !matches!(channels, 3 | 4) {
+        return Err(EngineError::Corrupt("encodage PNG : tampon de taille inattendue".into()));
+    }
+    let zlib = zlib_stream(width, height, pixels, channels, level)?;
+    let mut out = Vec::with_capacity(zlib.len() + 64);
+    out.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
+    let mut ihdr = Vec::with_capacity(13);
+    ihdr.extend_from_slice(&width.to_be_bytes());
+    ihdr.extend_from_slice(&height.to_be_bytes());
+    ihdr.extend_from_slice(&[8, if channels == 4 { 6 } else { 2 }, 0, 0, 0]);
+    chunk(&mut out, b"IHDR", &ihdr);
+    // Données en morceaux de 1 Mio : taille habituelle, et bien en dessous de la limite de 2 Gio d'un morceau.
+    for piece in zlib.chunks(1 << 20) {
+        chunk(&mut out, b"IDAT", piece);
+    }
+    chunk(&mut out, b"IEND", &[]);
+    Ok(out)
+}
+
+/// PNG d'un tampon quelconque : `columns × height` éléments de `channels` octets (le filtre PNG travaille par élément),
+/// déclaré au format `bit_depth` / `color_type` de l'IHDR. Sert aux niveaux de gris de l'export : gris 8 bits
+/// (`columns` = largeur, 1 octet, type 0), gris + alpha (2 octets, type 4), et 1 bit (lignes de bits déjà tassées :
+/// `columns` = octets par ligne, 1 octet, profondeur 1, type 0).
+#[allow(clippy::too_many_arguments)]
+pub fn encode_raw(width: u32, height: u32, columns: u32, data: &[u8], channels: usize, bit_depth: u8, color_type: u8, level: u32) -> Result<Vec<u8>, EngineError> {
+    let zlib = zlib_stream(columns, height, data, channels, level)?;
+    let mut out = Vec::with_capacity(zlib.len() + 64);
+    out.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
+    let mut ihdr = Vec::with_capacity(13);
+    ihdr.extend_from_slice(&width.to_be_bytes());
+    ihdr.extend_from_slice(&height.to_be_bytes());
+    ihdr.extend_from_slice(&[bit_depth, color_type, 0, 0, 0]);
+    chunk(&mut out, b"IHDR", &ihdr);
+    for piece in zlib.chunks(1 << 20) {
+        chunk(&mut out, b"IDAT", piece);
+    }
+    chunk(&mut out, b"IEND", &[]);
+    Ok(out)
+}
+
+/// Flux zlib des lignes filtrées à la manière du PNG (un octet de filtre en tête de chaque ligne), compressé sur
+/// tous les cœurs : les données d'un PNG, et aussi celles d'une image PDF en `FlateDecode` avec
+/// `/DecodeParms << /Predictor 15 … >>` (prédicteurs PNG, choisis ligne par ligne). `channels` : 1 à 4.
+pub fn zlib_stream(width: u32, height: u32, pixels: &[u8], channels: usize, level: u32) -> Result<Vec<u8>, EngineError> {
     let (w, h) = (width as usize, height as usize);
     let row = w * channels;
-    if w == 0 || h == 0 || pixels.len() != row * h || !matches!(channels, 3 | 4) {
-        return Err(EngineError::Corrupt("encodage PNG : tampon de taille inattendue".into()));
+    if w == 0 || h == 0 || pixels.len() != row * h || !(1..=4).contains(&channels) {
+        return Err(EngineError::Corrupt("compression : tampon de taille inattendue".into()));
     }
     let strip = rows_per_strip(row, h);
     let starts: Vec<usize> = (0..h).step_by(strip).collect();
@@ -61,20 +105,7 @@ pub fn encode(width: u32, height: u32, pixels: &[u8], channels: usize, level: u3
         zlib.extend_from_slice(data);
     }
     zlib.extend_from_slice(&adler.to_be_bytes());
-
-    let mut out = Vec::with_capacity(zlib.len() + 64);
-    out.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
-    let mut ihdr = Vec::with_capacity(13);
-    ihdr.extend_from_slice(&width.to_be_bytes());
-    ihdr.extend_from_slice(&height.to_be_bytes());
-    ihdr.extend_from_slice(&[8, if channels == 4 { 6 } else { 2 }, 0, 0, 0]);
-    chunk(&mut out, b"IHDR", &ihdr);
-    // Données en morceaux de 1 Mio : taille habituelle, et bien en dessous de la limite de 2 Gio d'un morceau.
-    for piece in zlib.chunks(1 << 20) {
-        chunk(&mut out, b"IDAT", piece);
-    }
-    chunk(&mut out, b"IEND", &[]);
-    Ok(out)
+    Ok(zlib)
 }
 
 /// Poids estimé du PNG : parmi les bandes qu'utiliserait `encode`, `samples` bandes réparties sur la hauteur sont

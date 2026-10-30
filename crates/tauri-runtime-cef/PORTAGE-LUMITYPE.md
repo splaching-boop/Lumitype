@@ -17,7 +17,7 @@ Quand Tauri publiera officiellement son runtime CEF, cette copie disparaît au p
 
 ## Windows : abandonné (10/10/2026)
 
-Le Chromium embarqué n'est utilisé que sous Linux. Sous Windows, Lumitype garde WebView2 (export/windows.ps1).
+Le Chromium embarqué n'est utilisé que sous Linux. Sous Windows, Lumitype garde WebView2 (packaging/windows.ps1).
 Un essai (05-06/10) s'est soldé par une fenêtre blanche malgré le manifeste `supportedOS` de cefsimple ; le code
 Windows de ce runtime, « porté à l'aveugle » par son auteur, n'a jamais été mis au point. Ce qui en reste :
 

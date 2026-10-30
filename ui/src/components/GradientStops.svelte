@@ -270,7 +270,7 @@
     cursor: grab;
   }
   .stop.on {
-    border-color: #fff;
+    border-color: var(--text-strong);
     box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.6);
   }
   .stop.removing {
@@ -320,7 +320,7 @@
     width: 16px;
     height: 16px;
     border-radius: var(--radius-s);
-    border: 1px solid rgba(255, 255, 255, 0.35);
+    border: 1px solid rgb(var(--ink) / 0.35);
   }
   .spacer {
     flex: 1;
@@ -349,7 +349,7 @@
     padding: 0;
     border-radius: var(--radius-m);
     overflow: hidden;
-    border: 1px solid rgba(255, 255, 255, 0.12);
+    border: 1px solid rgb(var(--ink) / 0.12);
   }
   .preset:hover {
     outline: 1.5px solid #fff;

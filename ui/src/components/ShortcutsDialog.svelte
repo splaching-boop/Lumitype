@@ -17,7 +17,7 @@
   const categories = $derived(
     ACTION_CATEGORIES.map((category) => ({
       name: category.name,
-      actions: category.actions.filter((id) => ACTION_LABELS[id].toLowerCase().includes(search.trim().toLowerCase())),
+      actions: category.actions.filter((id) => [ACTION_LABELS[id], t(ACTION_LABELS[id])].some((label) => label.toLowerCase().includes(search.trim().toLowerCase()))),
     })).filter((category) => category.actions.length > 0),
   );
 
@@ -66,6 +66,12 @@
     if (pending) keymap.assign(pending.action, pending.chord);
     pending = null;
   }
+
+  /** Garder le raccourci sur les deux actions : permis, mais signalé en rouge dans la liste. */
+  function keepBoth(): void {
+    if (pending) keymap.assignShared(pending.action, pending.chord);
+    pending = null;
+  }
 </script>
 
 <svelte:window onkeydowncapture={onKeyDown} />
@@ -88,10 +94,13 @@
         {pending.conflicts.map((id) => `« ${t(ACTION_LABELS[id])} »`).join(", ")}.
       </span>
       <button class="ghost" onclick={() => (pending = null)}>{t("Annuler")}</button>
+      <button class="ghost" onclick={keepBoth}>{t("Garder les deux")}</button>
       <button class="pill" onclick={confirmPending}>{t("Réattribuer")}</button>
     </div>
   {:else if notice}
     <div class="conflict" role="alert"><span>{notice}</span></div>
+  {:else if keymap.clashing.size > 0}
+    <div class="conflict warn" role="status"><span>{t("{n} commandes partagent un raccourci (en rouge) : à la frappe, une seule se déclenche.", { n: keymap.clashing.size })}</span></div>
   {/if}
 
   <div class="list">
@@ -99,11 +108,11 @@
     {#each app.shortcutsDialogOpen ? categories : [] as category (category.name)}
       <h3>{t(category.name)}</h3>
       {#each category.actions as action (action)}
-        <div class="row">
+        <div class="row" class:clash={keymap.clashing.has(action)}>
           <span class="label">{t(ACTION_LABELS[action])}</span>
           <div class="chords">
             {#each keymap.chordsOf(action) as chord, index (index)}
-              <span class="chip">
+              <span class="chip" class:clash={keymap.clashes(action, chord)} title={keymap.clashes(action, chord) ? t("Ce raccourci est aussi celui d'une autre commande") : undefined}>
                 {chordLabel(chord)}
                 <button aria-label={t("Retirer {chord}", { chord: chordLabel(chord) })} onclick={() => keymap.remove(action, chord)}>×</button>
               </span>
@@ -270,5 +279,16 @@
     background: var(--pill-bg);
     color: var(--pill-text);
     font-weight: 500;
+  }
+  .row.clash .label {
+    color: #ff6b6b;
+  }
+  .chip.clash {
+    border-color: #e5343e;
+    background: rgba(229, 52, 62, 0.18);
+    color: #ffb3b3;
+  }
+  .conflict.warn {
+    border-color: rgba(229, 52, 62, 0.45);
   }
 </style>

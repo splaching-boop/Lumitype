@@ -1,5 +1,5 @@
-// Aide des outils : une phrase et une animation par outil, affichées après deux secondes de survol.
-// L'animation vient de `assets/media/tools/<outil>.gif` dès que ce fichier existe (voir `media.ts`).
+// Aide des outils : une phrase et un film par outil, affichés après une seconde de survol.
+// Le film vient de `assets/media/demos/` dès que le fichier existe (voir `media.ts`, table `TOOL_DEMO`).
 import type { ToolId } from "../state/app.svelte";
 
 export interface ToolHelp {
@@ -28,5 +28,6 @@ export const TOOL_HELP: Record<ToolId, ToolHelp> = {
   pathSelect: { name: "Sélection directe", keys: "A", hint: "Déplace les points et les poignées d'un chemin déjà tracé." },
   shape: { name: "Forme", keys: "U", hint: "Trace un rectangle, une ellipse ou un polygone vectoriel." },
   hand: { name: "Main", keys: "H", hint: "Fait glisser la vue ; un double-clic ajuste l'image à l'écran." },
+  rotateView: { name: "Rotation de l'affichage", keys: "R", hint: "Fait tourner la vue sans toucher aux pixels ; Maj : pas de 15°, Échap ou double-clic : 0°." },
   zoom: { name: "Zoom", keys: "Z", hint: "Agrandit ou réduit la vue ; un double-clic revient à 100 %." },
 };

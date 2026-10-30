@@ -28,15 +28,18 @@ assert.equal(dyn.endGesture(), false);
 dyn = new DynamicResolution();
 run(dyn, 0, 1000 / 60, 10); // mesure du rafraîchissement
 let seen = run(dyn, 1000, 20, 10);
-assert.deepEqual(seen, [0.75, 0.5]);
-// Fin du geste : image nette, et le prochain geste repart directement à 0,5.
+assert.deepEqual(seen, [0.75, 0.5, 0.35]);
+// Plancher : jamais sous 35 %, même très lent (la cadence baisse, pas la netteté).
+assert.deepEqual(run(dyn, 2000, 60, 40), []);
+assert.equal(dyn.factor, 0.35);
+// Fin du geste : image nette, et le prochain geste repart directement à 0,35.
 assert.equal(dyn.endGesture(), true);
 assert.equal(dyn.factor, 1);
 assert.equal(dyn.gestureFrame(5000), true);
-assert.equal(dyn.factor, 0.5);
-// À 0,5 les images repassent sous le budget : remontée après 24 images rapides, puis encore 24.
+assert.equal(dyn.factor, 0.35);
+// À 0,35 les images repassent sous le budget : remontée après 24 images rapides, puis encore 24.
 seen = run(dyn, 5000 + 20, 1000 / 60 - 0.5, 60);
-assert.deepEqual(seen, [0.75, 1]);
+assert.deepEqual(seen, [0.5, 0.75]);
 
 // Désactivée : rien ne bouge, même à 40 ms par image.
 dyn = new DynamicResolution(false);

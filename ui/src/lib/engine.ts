@@ -1,7 +1,7 @@
 // Modifications du document : file ordonnée, rafraîchissement de l'affichage, miniatures.
 import { t } from "./i18n.svelte";
 import { app } from "../state/app.svelte";
-import { type DirtyInfo, type DocumentInfo, type EditOp, api } from "./ipc";
+import { type DirtyInfo, type DocumentInfo, type EditOp, type HistoryPatch, api } from "./ipc";
 
 // ---------------------------------------------------------------- file ordonnée
 
@@ -80,27 +80,56 @@ export function refreshThumbnails(info: DocumentInfo, changed: readonly number[]
  * Prélève la couleur de l'image en un point du document. Elle va au sélecteur de couleur
  * ouvert s'il y en a un (couleur d'un texte, par exemple), sinon à la couleur de premier plan.
  */
-export async function sampleColor(x: number, y: number, pointer: { clientX: number; clientY: number }): Promise<void> {
-  const docId = app.activeId;
-  if (docId === null) return;
+export function sampleColor(x: number, y: number, pointer: { clientX: number; clientY: number }): Promise<void> {
+  // Un seul prélèvement en vol ; pendant un glisser, seul le dernier point attend son tour (comme `editLatest`),
+  // sans quoi chaque pointermove empilait une demande et les réponses revenaient dans le désordre.
+  sampleLatest = { docId: app.activeId, x, y, pointer: { clientX: pointer.clientX, clientY: pointer.clientY } };
+  if (!sampleInFlight) sampleInFlight = drainSamples();
+  return sampleInFlight;
+}
+
+type SampleRequest = { docId: number | null; x: number; y: number; pointer: { clientX: number; clientY: number } };
+let sampleLatest: SampleRequest | null = null;
+let sampleInFlight: Promise<void> | null = null;
+
+async function drainSamples(): Promise<void> {
   try {
-    const rgb = await api.sampleColor(docId, Math.floor(x), Math.floor(y));
-    if (!rgb) return; // hors du document, ou pixel transparent
-    // Pastille ronde au-dessus du pointeur : on voit la couleur prélevée sans quitter l'image des yeux.
-    app.sample = { x: pointer.clientX, y: pointer.clientY, rgb };
-    if (app.eyedropperTarget) app.eyedropperTarget(rgb);
-    else app.foreground = rgb;
-  } catch (error) {
-    app.fail(error);
+    while (sampleLatest) {
+      const { docId, x, y, pointer } = sampleLatest;
+      sampleLatest = null;
+      if (docId === null) continue;
+      try {
+        const rgb = await api.sampleColor(docId, Math.floor(x), Math.floor(y));
+        // Réponse périmée (document changé, ou un point plus récent déjà demandé) : elle est ignorée.
+        if (docId !== app.activeId || sampleLatest) continue;
+        if (!rgb) continue; // hors du document, ou pixel transparent
+        // Pastille ronde au-dessus du pointeur : on voit la couleur prélevée sans quitter l'image des yeux.
+        app.sample = { x: pointer.clientX, y: pointer.clientY, rgb };
+        if (app.eyedropperTarget) app.eyedropperTarget(rgb);
+        else app.foreground = rgb;
+      } catch (error) {
+        app.fail(error);
+      }
+    }
+  } finally {
+    sampleInFlight = null;
   }
 }
 
 // --------------------------------------------------------------------- édition
 
 /** Applique le résultat d'une modification à l'état de l'interface. */
-export function adopt(info: DocumentInfo, dirty: DirtyInfo): void {
+/**
+ * `restThumbnails` : miniatures relues seulement une fois au repos (traits de pinceau, annulations en rafale) — chaque
+ * relecture demande au moteur de réduire tout le calque, ce qui retardait le trait ou l'annulation suivante.
+ */
+export function adopt(info: DocumentInfo, dirty: DirtyInfo, options: { restThumbnails?: boolean } = {}): void {
   app.update(info);
   notifyDirty(info.id, dirty, info.revision);
+  if (options.restThumbnails) {
+    deferThumbnails(info.id, dirty.layers);
+    return;
+  }
   // Miniatures : tout de suite pour les calques repeints. Un calque seulement déplacé (sa miniature, cadrée sur le
   // document, change avec sa position) attend un temps de repos : pendant un geste de déplacement, chaque pas
   // faisait relire la miniature de tous les calques déplacés (un dossier entier, par exemple), ce qui retardait
@@ -136,7 +165,7 @@ function deferThumbnails(docId: number, layers: readonly number[]): void {
 /** Au-delà de ce délai, une modification en cours s'affiche dans la barre d'activité (et les raccourcis attendent). */
 const BUSY_AFTER_MS = 400;
 /** Libellé de la barre d'activité pour les modifications longues ; les autres restent muettes. */
-const BUSY_LABELS: Partial<Record<EditOp["op"], string>> = { applyFilter: "Filtre…", delete: "Suppression…", duplicate: "Duplication…", importLayer: "Import…" };
+const BUSY_LABELS: Partial<Record<EditOp["op"], string>> = { applyFilter: "Filtre…", rasterizeAndFilter: "Filtre…", delete: "Suppression…", duplicate: "Duplication…", importLayer: "Import…" };
 
 /**
  * Crochet appelé avant chaque modification (voir `setBeforeEdit`). Enregistré par la séance de transformation :
@@ -161,13 +190,17 @@ export function settlePendingEdits(op: EditOp | null = null): void {
  * se suivent dans l'ordre ; si l'une d'elles dure (filtre sur un grand calque), la barre d'activité le montre et les
  * raccourcis sont retenus en attendant, plutôt que de paraître sans effet.
  */
-export async function edit(op: EditOp): Promise<boolean> {
-  return (await editDirty(op)) !== null;
+export async function edit(op: EditOp, document: number | null = app.activeId): Promise<boolean> {
+  return (await editDirty(op, document)) !== null;
 }
 
-/** Comme `edit`, mais rend ce que la modification a touché (`null` en cas d'échec). */
-async function editDirty(op: EditOp): Promise<{ info: DocumentInfo; dirty: DirtyInfo } | null> {
-  const docId = app.activeId;
+/**
+ * Comme `edit`, mais rend ce que la modification a touché (`null` en cas d'échec). `document` : le document visé (par
+ * défaut, le document actif) — une transformation montrée par la carte graphique est validée dans SON document, même
+ * si l'on vient de changer d'onglet.
+ */
+async function editDirty(op: EditOp, document: number | null = app.activeId): Promise<{ info: DocumentInfo; dirty: DirtyInfo } | null> {
+  const docId = document;
   if (docId === null) return null;
   // Transformation en attente (cadre de l'outil Déplacement tiré, Ctrl+T) : toute autre opération la valide
   // d'abord. Rien n'est attendu ici (un `await` laisserait passer devant une opération demandée juste après) :
@@ -240,6 +273,71 @@ export function whenIdle(key: string): Promise<void> {
  * Pour les curseurs : tant qu'une modification de même clé est en cours, seule la
  * dernière valeur demandée est retenue. L'interface ne prend jamais de retard.
  */
+/** Réunit ce que plusieurs modifications successives ont touché (une seule mise à jour de l'affichage pour toutes). */
+export function mergeDirty(a: DirtyInfo, b: DirtyInfo): DirtyInfo {
+  const tiles = new Map<string, [number, number]>();
+  for (const t of [...a.tiles, ...b.tiles]) tiles.set(`${t[0]},${t[1]}`, t);
+  const union = (x?: number[], y?: number[]) => (x === undefined && y === undefined ? undefined : [...new Set([...(x ?? []), ...(y ?? [])])]);
+  return {
+    all: a.all || b.all,
+    tiles: [...tiles.values()],
+    layers: union(a.layers, b.layers) ?? [],
+    selection: a.selection || b.selection,
+    // Absent d'un côté (« tout est repeint ») : absent du résultat.
+    repainted: a.repainted && b.repainted ? union(a.repainted, b.repainted) : undefined,
+    areas: a.areas && b.areas ? [...a.areas, ...b.areas] : undefined,
+  };
+}
+
+/**
+ * Annuler / Rétablir en rafale (Ctrl+Z tenu ou tapé vite) : les appuis qui arrivent pendant qu'une annulation est en
+ * cours sont comptés, puis passés au moteur d'un trait (un pas après l'autre, sans attendre l'affichage), et l'image ne
+ * se met à jour qu'une fois, pour l'état final. Auparavant chaque appui rechargeait l'affichage du document entier :
+ * dix appuis empilaient dix rechargements, et le logiciel paraissait bloqué. L'ordre des appuis est gardé (Annuler
+ * puis Rétablir ne se compensent pas : chacun est fait).
+ */
+const steps: { op: "undo" | "redo"; n: number; docId: number }[] = [];
+let stepping = false;
+export function historyStep(op: "undo" | "redo", document: number | null = app.activeId): void {
+  if (document === null) return;
+  const last = steps[steps.length - 1];
+  if (last && last.op === op && last.docId === document) last.n += 1;
+  else steps.push({ op, n: 1, docId: document });
+  if (!stepping) void flushSteps();
+}
+async function flushSteps(): Promise<void> {
+  stepping = true;
+  try {
+    while (steps.length > 0) {
+      const { op, n, docId } = steps.shift()!;
+      settlePendingEdits({ op });
+      try {
+        // Un seul saut dans l'historique pour tous les appuis comptés ; les pixels des zones repeintes viennent avec.
+        const result = await enqueue(docId, () => api.historyStep(docId, op, n));
+        patchSink?.apply(docId, result.patches);
+        try {
+          adopt(result.document, result.dirty, { restThumbnails: true });
+        } finally {
+          patchSink?.done();
+        }
+      } catch (error) {
+        app.fail(error);
+      }
+    }
+  } finally {
+    stepping = false;
+  }
+}
+
+/**
+ * Fourni par le viewport : pose les pixels envoyés avec une annulation dans les textures de la composition (`apply`),
+ * juste avant le signalement de la modification, qui ne relit alors pas ces zones ; `done` juste après.
+ */
+let patchSink: { apply: (docId: number, patches: readonly HistoryPatch[]) => void; done: () => void } | null = null;
+export function provideHistoryPatches(sink: typeof patchSink): void {
+  patchSink = sink;
+}
+
 export function editLatest(key: string, op: EditOp): void {
   if (latest.has(key)) {
     latest.set(key, op);

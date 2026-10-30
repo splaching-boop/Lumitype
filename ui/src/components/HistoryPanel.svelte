@@ -65,7 +65,7 @@
   }
   button.current {
     background: var(--bg-active);
-    color: #fff;
+    color: var(--text-strong);
   }
   /* États annulés : encore accessibles, mais un nouveau geste les effacera. */
   button.undone {

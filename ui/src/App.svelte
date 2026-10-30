@@ -4,6 +4,12 @@
   import DocTabs from "./components/DocTabs.svelte";
   import ErrorToast from "./components/ErrorToast.svelte";
   import FeatherDialog from "./components/FeatherDialog.svelte";
+  import PrintSetupDialog from "./components/print/PrintSetupDialog.svelte";
+  import CorrectInkDialog from "./components/print/CorrectInkDialog.svelte";
+  import PreflightDialog from "./components/print/PreflightDialog.svelte";
+  import BitmapDialog from "./components/BitmapDialog.svelte";
+  import CmykModeDialog from "./components/CmykModeDialog.svelte";
+  import ColorSettingsDialog from "./components/ColorSettingsDialog.svelte";
   import HistoryPanel from "./components/HistoryPanel.svelte";
   import LayersPanel from "./components/LayersPanel.svelte";
   import MenuBar from "./components/MenuBar.svelte";
@@ -11,15 +17,20 @@
   import OptionsBar from "./components/OptionsBar.svelte";
   import Panel from "./components/Panel.svelte";
   import AboutDialog from "./components/AboutDialog.svelte";
+  import BugReportDialog from "./components/BugReportDialog.svelte";
   import BrushPicker from "./components/BrushPicker.svelte";
-  import BrushQuickMenu from "./components/BrushQuickMenu.svelte";
+  import BrushPanel from "./components/BrushPanel.svelte";
   import ExportProgress from "./components/ExportProgress.svelte";
+  import LayerExportDialog from "./components/LayerExportDialog.svelte";
+  import AdvancedSelectDialog from "./components/AdvancedSelectDialog.svelte";
+  import ArtboardDialog from "./components/ArtboardDialog.svelte";
   import RecoveryDialog from "./components/RecoveryDialog.svelte";
   import HomeScreen from "./components/HomeScreen.svelte";
   import { api } from "./lib/ipc";
   import AdjustmentProperties from "./components/AdjustmentProperties.svelte";
   import AdjustmentsPanel from "./components/AdjustmentsPanel.svelte";
   import EffectsDialog from "./components/EffectsDialog.svelte";
+  import FillLayerDialog from "./components/FillLayerDialog.svelte";
   import ExportDialog from "./components/ExportDialog.svelte";
   import FilterDialog from "./components/FilterDialog.svelte";
   import GuideLayoutDialog from "./components/GuideLayoutDialog.svelte";
@@ -38,9 +49,13 @@
   import Toolbar from "./components/Toolbar.svelte";
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { onMount, untrack } from "svelte";
+  import { startWorkClock } from "./lib/work-time.svelte";
   import ShortcutsDialog from "./components/ShortcutsDialog.svelte";
+  import RawDevelopDialog from "./components/RawDevelopDialog.svelte";
+  import { installBrushFiles, installBrushPaths, isBrushFile } from "./lib/brush-drop";
   import { checkSmartLinks, importDroppedFiles, importFromUrl, importLocalPaths, pasteFromClipboard, runAction, setOpacityFromDigit, settleUnsaved } from "./lib/actions";
-  import { floatingPanelOpen, resolve } from "./lib/keymap";
+  import { claimWindowDrop, hoverWindowDrop } from "./lib/myref";
+  import { floatingPanelOpen, isTyping, resolve } from "./lib/keymap";
   import { commitTransform, transformIsModal, transformIsPending } from "./lib/transform-session";
   import { rgbToHex } from "./lib/color";
   import { app } from "./state/app.svelte";
@@ -55,8 +70,7 @@
    * du haut donne & é " … sans Maj, mais `event.code` vaut bien Digit1, Digit2…
    */
   function plainDigit(event: KeyboardEvent): number | null {
-    const typing = event.target instanceof HTMLInputElement || event.target instanceof HTMLSelectElement;
-    if (typing || event.ctrlKey || event.altKey || event.shiftKey || event.metaKey) return null;
+    if (isTyping(event) || event.ctrlKey || event.altKey || event.shiftKey || event.metaKey) return null;
     const match = /^(?:Digit|Numpad)(\d)$/.exec(event.code);
     return match?.[1] === undefined ? null : Number(match[1]);
   }
@@ -79,6 +93,8 @@
   // Propriétés, qu'il ouvre quand il le veut.
 
   onMount(() => void keymap.load());
+  // Temps de travail par projet (barre d'état), compté tant qu'on s'en sert.
+  onMount(startWorkClock);
 
   // Fermer la fenêtre demande confirmation dès qu'un document est ouvert.
   onMount(() => {
@@ -127,6 +143,8 @@
   // Seuls les glissers venant de l'extérieur (fichiers, images d'un navigateur) passent par le glisser natif. Les
   // glissers internes (calques, masques) sont menés par l'application, sans lui : voir lib/layer-drag.svelte.ts.
   let fileHover = $state(false);
+  /** Le glisser en cours apporte des pinceaux (.abr, .gbr) : le dépôt les installe (connu par le chemin, Linux). */
+  let brushHover = $state(false);
   /**
    * Alt tenu pendant le glisser : l'image déposée devient un objet dynamique (incorporé) plutôt qu'un calque de
    * pixels. Lu sur les événements du glisser de la page, et sur le clavier pour les dépôts reçus par la fenêtre.
@@ -198,6 +216,8 @@
   function onDrop(event: DragEvent): void {
     const data = event.dataTransfer;
     app.externalDrag = false;
+    // Dépôt déjà pris en charge plus bas dans la page (une collection de My ref, à l'accueil) : rien à ouvrir ici.
+    if (event.defaultPrevented) return void (fileHover = false);
     if (!data || (!carriesFiles(event) && !carriesLink(event))) return;
     event.preventDefault();
     fileHover = false;
@@ -205,8 +225,14 @@
     // Sous Linux, un fichier glissé depuis le gestionnaire de fichiers n'arrive souvent que par son adresse
     // file:// (la liste des fichiers reste vide, ou ne contient que des fichiers vides) : on lit alors le fichier
     // lui-même, par son chemin.
-    const files = [...data.files].filter((file) => file.size > 0);
-    const paths = droppedLocalPaths(data);
+    // Pinceaux (.abr, .gbr) : installés dans la bibliothèque, pas ouverts comme des images.
+    const brushes = [...data.files].filter((file) => file.size > 0 && isBrushFile(file.name));
+    const brushPaths = droppedLocalPaths(data).filter(isBrushFile);
+    if (brushes.length > 0) void installBrushFiles(brushes);
+    else if (brushPaths.length > 0) void installBrushPaths(brushPaths);
+    const files = [...data.files].filter((file) => file.size > 0 && !isBrushFile(file.name));
+    const paths = droppedLocalPaths(data).filter((path) => !isBrushFile(path));
+    if (files.length === 0 && paths.length === 0 && (brushes.length > 0 || brushPaths.length > 0)) return;
     const url = droppedImageUrl(data);
     const asSmart = event.altKey;
     dropAsSmart = false;
@@ -226,7 +252,11 @@
    * crates/winit-x11/PORTAGE-LUMITYPE.md). Avec la webview du système (Windows), ces événements sont coupés
    * (`dragDropEnabled: false`) et c'est le dépôt de la page, plus haut, qui sert.
    */
-  function importWindowDrop(paths: readonly string[]): void {
+  function importWindowDrop(all: readonly string[]): void {
+    const brushes = all.filter(isBrushFile);
+    if (brushes.length > 0) void installBrushPaths(brushes);
+    const paths = all.filter((path) => !isBrushFile(path));
+    if (paths.length === 0) return;
     const web = paths.filter((path) => /^https?:\/\//i.test(path));
     const local = paths.filter((path) => !web.includes(path));
     if (local.length > 0) void importLocalPaths(local, dropAsSmart);
@@ -238,9 +268,14 @@
     const unlisten = getCurrentWindow().onDragDropEvent(({ payload }) => {
       if (payload.type === "enter" || payload.type === "over") {
         [fileHover, app.externalDrag] = [true, true];
+        if (payload.type === "enter") brushHover = payload.paths.some(isBrushFile);
+        hoverWindowDrop(payload.position);
         return;
       }
       [fileHover, app.externalDrag] = [false, false];
+      hoverWindowDrop(null);
+      // Dépôt sur une collection de My ref (accueil) : rangé dans la bibliothèque, pas ouvert comme document.
+      if (payload.type === "drop" && claimWindowDrop(payload.paths, payload.position)) return void (dropAsSmart = false);
       if (payload.type !== "drop" || performance.now() - lastPageDrop < 1500) return void (dropAsSmart = false);
       importWindowDrop(payload.paths);
       dropAsSmart = false;
@@ -372,6 +407,14 @@
               <ShapeProperties {layer} shape={layer.shape} />
             {/key}
           {/if}
+          {#if layer.fillLayer}
+            {@const content = layer.fillLayer}
+            <!-- Calque de remplissage : sa boîte de dialogue se rouvre d'ici (ou d'un double-clic sur sa vignette). -->
+            <div class="fill-properties">
+              <button onclick={() => (app.fillDialog = { kind: content.type, layer: layer.id })}>{t("Modifier le remplissage…")}</button>
+              <p>{t("Calque de remplissage : il couvre toute la zone de travail. Pixellisez-le (clic droit) pour le peindre.")}</p>
+            </div>
+          {/if}
           {#if layer.text}
             <!-- La clé recrée l'éditeur quand on change de calque : nouvelle séance d'édition, nouvel état d'historique. -->
             {#key layer.id}
@@ -393,7 +436,12 @@
   </div>
   <StatusBar />
 </div>
-{#if fileHover && !app.homeVisible}
+{#if fileHover && brushHover}
+  <div class="dropzone">
+    <p>{t("Déposer pour installer les pinceaux")}</p>
+    <small>{t("Fichiers .abr (Photoshop) et .gbr (GIMP)")}</small>
+  </div>
+{:else if fileHover && !app.homeVisible}
   <div class="dropzone">
     <p>{app.active ? (dropAsSmart ? t("Déposer pour placer comme objet dynamique") : t("Déposer pour ajouter comme calque")) : t("Déposer pour ouvrir")}</p>
     {#if app.active}<small>{t("Alt : objet dynamique")}</small>{/if}
@@ -407,6 +455,7 @@
 <SplashScreen />
 <NewDocumentDialog />
 <AboutDialog />
+<BugReportDialog />
 <!-- Travail en cours (enregistrement, ouverture, import…) : un filet animé tout en haut de la fenêtre. -->
 <!-- Sauvegarde automatique : un filet qui avance, tout en haut ; le travail continue pendant ce temps. -->
 <div class="savebar" class:on={app.autosaveProgress !== null} role="progressbar" aria-label={t("Sauvegarde automatique")} aria-valuenow={Math.round((app.autosaveProgress ?? 0) * 100)}>
@@ -416,11 +465,17 @@
 <div class="busybar" class:on={app.busy !== null} role="progressbar" aria-label={app.busy ?? t("Aucun travail en cours")} aria-hidden={app.busy === null}><div></div></div>
 <SavePrompt />
 <ExportProgress />
-{#if app.brushMenu && app.paintTool}
-  <BrushQuickMenu x={app.brushMenu.x} y={app.brushMenu.y} />
+{#if app.brushPanel}
+  <BrushPanel />
 {/if}
 {#if app.shapeDialog}
   <ShapeDialog />
+{/if}
+{#if app.artboardDialog && app.active}
+  <ArtboardDialog />
+{/if}
+{#if app.advancedSelectOpen && app.active}
+  <AdvancedSelectDialog />
 {/if}
 {#if app.modifySelectionOpen}
   <ModifySelectionDialog />
@@ -435,11 +490,20 @@
     {/key}
   {/if}
 {/if}
+{#if app.fillDialog && app.active}
+  <!-- Calque de remplissage : une boîte par ouverture (geste propre, valeurs de départ). -->
+  {#key app.fillDialog}
+    <FillLayerDialog />
+  {/key}
+{/if}
 {#if app.guideLayoutOpen && app.active}
   <GuideLayoutDialog />
 {/if}
 {#if app.exportOpen}
   <ExportDialog />
+{/if}
+{#if app.layerExport && app.active}
+  <LayerExportDialog />
 {/if}
 {#if app.liquifyOpen}
   <LiquifyDialog />
@@ -451,9 +515,44 @@
 {/if}
 <ShortcutsDialog />
 <FeatherDialog />
+<PrintSetupDialog />
+<CorrectInkDialog />
+<PreflightDialog />
+<!-- Image › Mode › Bitmap… et Couleurs CMJN… -->
+<BitmapDialog />
+<CmykModeDialog />
+<ColorSettingsDialog />
+{#if app.rawDevelop}
+  <!-- Développement RAW : une fenêtre par fichier (série ouverte d'un coup : l'une après l'autre). -->
+  {#key app.rawDevelop}
+    <RawDevelopDialog request={app.rawDevelop} />
+  {/key}
+{/if}
 <ErrorToast />
 
 <style>
+  .fill-properties {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 12px 14px;
+  }
+  .fill-properties button {
+    align-self: flex-start;
+    height: 26px;
+    padding: 0 12px;
+    border-radius: var(--radius-pill);
+    border: 1px solid var(--border-strong);
+    color: var(--text-2);
+  }
+  .fill-properties button:hover {
+    color: var(--text);
+  }
+  .fill-properties p {
+    margin: 0;
+    color: var(--text-muted);
+    line-height: 1.5;
+  }
   .savebar {
     position: fixed;
     left: 0;

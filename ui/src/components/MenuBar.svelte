@@ -1,4 +1,5 @@
 <script lang="ts">
+  import logo from "../assets/logo/logo-64.png";
   import { t } from "../lib/i18n.svelte";
   import { ACTION_LABELS } from "../lib/action-catalog";
   import { type ActionId, isActionChecked, isActionEnabled, runAction } from "../lib/actions";
@@ -8,7 +9,27 @@
   import WindowControls from "./WindowControls.svelte";
   import { getCurrentWindow } from "@tauri-apps/api/window";
 
-  type Item = ActionId | "separator";
+  /** Sous-menu : un libellé, et ses entrées calculées à l'ouverture. */
+  interface Submenu {
+    submenu: string;
+    entries: () => SubEntry[];
+  }
+  interface SubEntry {
+    label: string;
+    run: () => void;
+    /** Entrée grisée (action indisponible). */
+    disabled?: boolean;
+    /** Trait de séparation (le libellé est ignoré). */
+    separator?: boolean;
+    shortcut?: string;
+    /** Vignette montrée au survol (filtres). */
+    preview?: string;
+    hint?: string;
+    isNew?: boolean;
+    /** Option cochée (`true`) ou cochable non cochée (`false`) : une colonne de coche aligne les libellés. */
+    checked?: boolean;
+  }
+  type Item = ActionId | "separator" | Submenu;
   interface Menu {
     label: string;
     items: Item[];
@@ -17,7 +38,75 @@
      * ouvrir une liste dont toutes les entrées sont inactives ne renseigne personne.
      */
     alwaysOn?: boolean;
+    /** Menu sans liste : un clic lance directement cette action (Plans de travail). */
+    direct?: ActionId;
   }
+
+  // Menu Filtre : un sous-menu par catégorie de la galerie. Chaque filtre ouvre la galerie sur lui (la
+  // Fluidité, sa propre fenêtre) ; au survol, sa vignette et sa description s'affichent à côté.
+  const filterEntry = (type: GalleryKind): SubEntry => {
+    const spec = specOf(type);
+    return {
+      label: `${t(spec?.label ?? type)}…`,
+      shortcut: (FILTER_ACTIONS as readonly string[]).includes(`filter.${type}`) ? keymap.label(`filter.${type}` as ActionId) : "",
+      preview: previewOf(type),
+      hint: spec ? t(spec.hint) : "",
+      isNew: NEW_FILTERS.has(type),
+      disabled: !isActionEnabled("filter.gallery"),
+      run: () => (type === "liquify" ? runAction("filter.liquify") : (app.filterDialog = type)),
+    };
+  };
+  const FILTER_SUBMENUS: Submenu[] = CATEGORIES.map((category) => ({ submenu: category.label, entries: () => category.types.map(filterEntry) }));
+  const FAVORITE_FILTERS: Submenu = { submenu: "Favoris", entries: () => favorites().map(filterEntry) };
+  /** Filtres qui ont aussi leur propre action (raccourci possible). */
+  const FILTER_ACTIONS = Object.keys(ACTION_LABELS).filter((id) => id.startsWith("filter."));
+
+  /** Sous-menu fait d'actions ordinaires (Calque › Nouveau calque de réglage…). */
+  const actionSubmenu = (label: string, ids: (ActionId | "separator")[]): Submenu => ({
+    submenu: label,
+    entries: () =>
+      ids.map((id, n) =>
+        id === "separator"
+          ? { label: `—${n}`, separator: true, run: () => undefined }
+          : { label: t(ACTION_LABELS[id]).replace(/^(Réglage|Calque de remplissage) /, ""), shortcut: keymap.label(id), disabled: !isActionEnabled(id), run: () => runAction(id) },
+      ),
+  });
+
+  // Image › Mode, comme Photoshop : le mode du document coché ; « 8 bits/couche », seule profondeur, coché et grisé.
+  const modeEntry = (id: ActionId, label: string): SubEntry => ({
+    label: t(label),
+    shortcut: keymap.label(id),
+    disabled: !isActionEnabled(id),
+    checked: isActionChecked(id) === true,
+    run: () => runAction(id),
+  });
+  const MODE_SUBMENU: Submenu = {
+    submenu: "Mode",
+    entries: () => [
+      modeEntry("image.modeBitmap", "Bitmap…"),
+      modeEntry("image.modeGrayscale", "Niveaux de gris"),
+      { label: "—1", separator: true, run: () => undefined },
+      modeEntry("image.modeRgb", "Couleurs RVB"),
+      modeEntry("image.modeCmyk", "Couleurs CMJN…"),
+      { label: "—2", separator: true, run: () => undefined },
+      modeEntry("image.mode8Bits", "8 bits/couche"),
+    ],
+  };
+
+  // Affichage › Impression : cadres, traits de coupe, alerte d'encrage et séparations, cochables ; puis la vérification.
+  const PRINT_SUBMENU: Submenu = {
+    submenu: "Impression",
+    entries: () => [
+      modeEntry("view.printBleed", "Fonds perdus"),
+      modeEntry("view.printSafe", "Zone de sécurité"),
+      modeEntry("view.printMarks", "Traits de coupe"),
+      { label: "—1", separator: true, run: () => undefined },
+      modeEntry("view.inkAlert", "Alerte d'encrage"),
+      modeEntry("view.separations", "Séparations (C/M/J/N)"),
+      { label: "—2", separator: true, run: () => undefined },
+      { label: t("Vérifier avant impression…"), shortcut: keymap.label("file.preflight"), disabled: !isActionEnabled("file.preflight"), run: () => runAction("file.preflight") },
+    ],
+  };
 
   // Les menus sans entrée sont ceux des étapes suivantes : visibles, mais inactifs.
   const MENUS: Menu[] = [
@@ -28,20 +117,49 @@
     },
     {
       label: "Édition",
-      items: ["edit.undo", "edit.redo", "edit.toggleLastState", "separator", "edit.cut", "edit.copy", "edit.paste", "separator", "edit.fillForeground", "edit.fillBackground", "separator", "edit.freeTransform", "separator", "edit.preferences", "edit.shortcuts"],
+      items: ["edit.undo", "edit.redo", "edit.toggleLastState", "separator", "edit.cut", "edit.copy", "edit.paste", "separator", "edit.fillForeground", "edit.fillBackground", "separator", "edit.freeTransform", "separator", "edit.colorSettings", "edit.preferences", "edit.shortcuts"],
     },
-    { label: "Image", items: ["image.invert"] },
+    { label: "Image", items: [MODE_SUBMENU, "separator", "image.printSetup", "image.correctInk", "separator", "image.invert"] },
     {
       label: "Calque",
-      items: ["layer.new", "layer.newGroup", "layer.group", "layer.duplicate", "layer.delete", "separator", "adjust.develop", "adjust.brightnessContrast", "adjust.hueSaturation", "adjust.levels", "adjust.gradientMap", "adjust.invert", "adjust.negative", "separator", "layer.addMask", "layer.effects", "layer.toggleClipping", "separator", "layer.convertToSmart", "layer.editSmartContent", "layer.replaceSmartContent", "layer.newSmartByCopy", "layer.exportSmartContent", "layer.embedSmartLink", "layer.relinkSmart", "layer.resetSmartTransform", "separator", "layer.rasterize", "layer.mergeGroup"],
+      items: [
+        "layer.new",
+        "layer.newGroup",
+        "layer.group",
+        "layer.duplicate",
+        "layer.delete",
+        "separator",
+        // Comme Photoshop : réglages, remplissages et style de calque en sous-menus (le menu tient à l'écran).
+        actionSubmenu("Nouveau calque de réglage", ["adjust.develop", "separator", "adjust.brightnessContrast", "adjust.levels", "adjust.curves", "adjust.exposure", "separator", "adjust.hueSaturation", "adjust.colorBalance", "adjust.blackWhite", "adjust.channelMixer", "adjust.selectiveColor", "separator", "adjust.invert", "adjust.negative", "adjust.posterize", "adjust.threshold", "adjust.gradientMap"]),
+        actionSubmenu("Nouveau calque de remplissage", ["layer.fillSolidColor", "layer.fillGradient", "layer.fillPattern"]),
+        actionSubmenu("Style de calque", ["layer.effects", "separator", "layer.copyStyle", "layer.pasteStyle", "layer.clearStyle"]),
+        "separator",
+        "layer.addMask",
+        "layer.toggleClipping",
+        "separator",
+        "layer.convertToSmart",
+        "layer.editSmartContent",
+        "layer.replaceSmartContent",
+        "layer.newSmartByCopy",
+        "layer.exportSmartContent",
+        "layer.embedSmartLink",
+        "layer.relinkSmart",
+        "layer.resetSmartTransform",
+        "separator",
+        "layer.rasterize",
+        "layer.mergeGroup",
+      ],
     },
     { label: "Texte", items: [] },
-    { label: t("Sélection"), items: ["select.all", "select.none", "select.invert", "separator", "select.feather", "select.modify", "select.quickMask"] },
-    { label: "Filtre", items: ["filter.liquify", "separator", "filter.gaussianBlur", "filter.fieldBlur", "filter.motionBlur", "filter.lensBlur", "separator", "filter.sharpen", "filter.presence", "filter.noise", "filter.gaussianNoise", "filter.chromaticAberration", "filter.glass", "separator", "filter.dither", "filter.colorDither", "filter.ascii"] },
-    { label: "Affichage", items: ["view.zoomIn", "view.zoomOut", "view.fit", "view.actualSize", "separator", "view.toggleRulers", "view.toggleGuides", "view.lockGuides", "view.toggleSnap", "separator", "view.guideLayout", "view.clearGuides", "separator", "view.proofCmyk", "view.proofFogra39", "view.proofFogra51", "view.proofFogra52", "view.proofGracol2006", "view.proofSwop2006c3"] },
+    { label: t("Sélection"), items: ["select.all", "select.none", "select.invert", "separator", "select.advanced", "select.feather", "select.modify", "select.quickMask"] },
+    // Comme Photoshop : Filtre Camera Raw et Fluidité, hors galerie, sous elle.
+    { label: "Filtre", items: ["filter.lastFilter", "filter.gallery", "separator", "filter.cameraRaw", "filter.liquify", "separator", ...FILTER_SUBMENUS, "separator", FAVORITE_FILTERS] },
+    { label: "Affichage", items: ["view.zoomIn", "view.zoomOut", "view.fit", "view.actualSize", "view.resetRotation", "view.mirror", "separator", "view.toggleRulers", "view.toggleGuides", "view.lockGuides", "view.toggleSnap", "separator", "view.guideLayout", "view.clearGuides", "separator", PRINT_SUBMENU, "view.proofCmyk"] },
     { label: t("Fenêtre"), items: [] },
-    { label: "Aide", items: ["help.about"], alwaysOn: true },
+    { label: "Plans de travail", items: ["artboard.open"], direct: "artboard.open" },
+    // Toujours les deux derniers, dans cet ordre : Copyright, puis Aide.
     { label: "Copyright", items: ["copyright.metadata"], alwaysOn: true },
+    { label: "Aide", items: ["help.manual", "separator", "help.reportBug", "help.openLogs", "separator", "help.about"], alwaysOn: true },
   ];
 
   /**
@@ -49,6 +167,12 @@
    * Fichier et Aide, qui servent aussi depuis l'accueil.
    */
   const usable = (menu: Menu): boolean => menu.items.length > 0 && (menu.alwaysOn === true || !app.homeVisible);
+  const isSubmenu = (item: Item): item is Submenu => typeof item === "object";
+  /** Sous-menu ouvert (son libellé), position verticale de son entrée dans le menu. */
+  let openSub = $state<{ label: string; top: number } | null>(null);
+  $effect(() => {
+    if (openMenu === null) openSub = null;
+  });
 
   let openMenu = $state<string | null>(null);
 
@@ -56,9 +180,10 @@
     openMenu = null;
     runAction(action);
   }
-  import { previewOf, specOf } from "../lib/filters";
+  import { CATEGORIES, NEW_FILTERS, type GalleryKind, previewOf, specOf } from "../lib/filters";
+  import { favorites, lastApplied } from "../lib/filter-memory";
 
-  let hoveredFilter = $state<{ type: string; top: number; left: number } | null>(null);
+  let hoveredFilter = $state<{ image: string; hint: string; label: string; top: number; left: number } | null>(null);
   $effect(() => {
     if (openMenu === null) hoveredFilter = null;
   });
@@ -90,7 +215,7 @@
 
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <header class="menubar" onpointerdown={onFramePointerDown} ondblclick={onFrameDoubleClick}>
-  <div class="brand" aria-hidden="true"><span class="mark">LT</span><span class="name">Lumitype</span></div>
+  <div class="brand" aria-hidden="true"><img class="mark" src={logo} alt="" width="20" height="20" draggable="false" /><span class="name">Lumitype</span></div>
   <HomeButton />
   {#each MENUS as menu (menu.label)}
     <div class="menu">
@@ -100,46 +225,82 @@
         disabled={!usable(menu)}
         aria-haspopup="menu"
         aria-expanded={openMenu === menu.label}
-        onclick={() => (openMenu = openMenu === menu.label ? null : menu.label)}
+        onclick={() => (menu.direct ? ((openMenu = null), choose(menu.direct)) : (openMenu = openMenu === menu.label ? null : menu.label))}
         onpointerenter={() => {
-          if (openMenu && usable(menu)) openMenu = menu.label;
+          if (openMenu && usable(menu) && !menu.direct) openMenu = menu.label;
         }}
       >
         {t(menu.label)}
       </button>
-      {#if openMenu === menu.label}
+      {#if openMenu === menu.label && !menu.direct}
         <!-- Un menu long (Calque) défile plutôt que de sortir de la fenêtre ; pas Filtre, dont l'aperçu déborde à droite. -->
-        <div class="dropdown" class:scroll={!menu.items.some((item) => item.startsWith("filter."))} role="menu">
+        <div class="dropdown" class:scroll={!menu.items.some(isSubmenu)} role="menu">
           {#each menu.items as item, index (index)}
             {#if item === "separator"}
               <div class="separator" role="separator"></div>
+            {:else if isSubmenu(item)}
+              {@const entries = item.entries()}
+              <button
+                role="menuitem"
+                aria-haspopup="menu"
+                aria-expanded={openSub?.label === item.submenu}
+                class:active={openSub?.label === item.submenu}
+                disabled={entries.every((entry) => entry.disabled || entry.separator)}
+                onpointerenter={(event) => {
+                  hoveredFilter = null;
+                  openSub = { label: item.submenu, top: event.currentTarget.offsetTop - 7 };
+                }}
+                onclick={(event) => (openSub = { label: item.submenu, top: event.currentTarget.offsetTop - 7 })}
+              >
+                <span class="label">{t(item.submenu)}</span>
+                <span class="shortcut arrow">›</span>
+              </button>
+              {#if openSub?.label === item.submenu}
+                <div class="dropdown sub" role="menu" style:top="{openSub.top}px">
+                  {#each entries as entry (entry.label)}
+                    {#if entry.separator}
+                      <div class="separator" role="separator"></div>
+                    {:else}
+                    <button
+                      disabled={entry.disabled}
+                      role="menuitem"
+                      onclick={() => {
+                        openMenu = null;
+                        entry.run();
+                      }}
+                      onpointerenter={(event) => {
+                        const box = event.currentTarget.parentElement;
+                        hoveredFilter = entry.preview && box ? { image: entry.preview, hint: entry.hint ?? "", label: entry.label, top: (openSub?.top ?? 0) + event.currentTarget.offsetTop - 40, left: box.offsetLeft + box.offsetWidth + 8 } : null;
+                      }}
+                    >
+                      <span class="label" class:checked={entry.checked === true} class:checkable={entry.checked === false}>{#if entry.isNew}<i class="new" aria-label={t("Nouveau")}></i>{/if}{entry.label}</span>
+                      <span class="shortcut">{entry.shortcut ?? ""}</span>
+                    </button>
+                    {/if}
+                  {/each}
+                </div>
+              {/if}
             {:else}
               <button
                 role="menuitem"
                 disabled={!isActionEnabled(item)}
                 onclick={() => choose(item)}
-                onpointerenter={(event) => {
-                  // Survol d'un filtre : vignette de démonstration à droite du menu, à hauteur de l'entrée.
-                  const type = item.startsWith("filter.") ? item.slice(7) : "";
-                  const dropdown = event.currentTarget.parentElement;
-                  hoveredFilter = type && previewOf(type) && dropdown ? { type, top: Math.max(0, event.currentTarget.offsetTop - 60), left: dropdown.offsetWidth + 8 } : null;
+                onpointerenter={() => {
+                  openSub = null;
+                  hoveredFilter = null;
                 }}
               >
                 <!-- Option à bascule : une coche dit si elle est active. -->
-                <span class="label" class:checked={isActionChecked(item) === true}>{t(ACTION_LABELS[item])}</span>
+                <span class="label" class:checked={isActionChecked(item) === true}>{t(ACTION_LABELS[item])}{#if item === "filter.lastFilter" && lastApplied()}{` : ${t(specOf(lastApplied()?.type ?? "")?.label ?? "")}`}{/if}</span>
                 <span class="shortcut">{keymap.label(item)}</span>
               </button>
             {/if}
           {/each}
           {#if hoveredFilter}
-            {@const spec = specOf(hoveredFilter.type)}
-            <figure class="preview" style:top="{hoveredFilter.top}px" style:left="{hoveredFilter.left}px" aria-hidden="true">
-              <div class="split">
-                <img src={previewOf(hoveredFilter.type)} alt="" width="336" height="224" />
-                <span class="tag left">{t("Filtré")}</span>
-                <span class="tag right">{t("Original")}</span>
-              </div>
-              <figcaption>{spec?.hint ?? ""}</figcaption>
+            <figure class="preview" style:top="{Math.max(0, hoveredFilter.top)}px" style:left="{hoveredFilter.left}px" aria-hidden="true">
+              <img src={hoveredFilter.image} alt="" width="320" height="213" />
+              <b>{hoveredFilter.label.replace(/…$/, "")}</b>
+              <figcaption>{hoveredFilter.hint}</figcaption>
             </figure>
           {/if}
         </div>
@@ -175,19 +336,13 @@
     height: 22px;
     margin-right: 10px;
     padding-right: 14px;
-    border-right: 1px solid rgba(255, 255, 255, 0.08);
+    border-right: 1px solid rgb(var(--ink) / 0.08);
     pointer-events: none;
   }
   .brand .mark {
     width: 20px;
     height: 20px;
-    display: grid;
-    place-items: center;
-    background: var(--accent);
-    color: #fff;
-    font-size: 10px;
-    font-weight: 800;
-    letter-spacing: 0.5px;
+    display: block;
   }
   .brand .name {
     font-weight: 600;
@@ -277,7 +432,7 @@
   }
   .preview {
     position: absolute;
-    z-index: 1;
+    z-index: 2;
     width: 336px;
     margin: 0;
     padding: 8px;
@@ -287,43 +442,37 @@
     box-shadow: var(--shadow-menu);
     pointer-events: none;
   }
-  .split {
-    position: relative;
-    border-radius: var(--radius-m);
-    overflow: hidden;
-    line-height: 0;
-  }
-  .split img {
+  .preview img {
     display: block;
     width: 100%;
     height: auto;
+    border-radius: var(--radius-m);
   }
-  /* Trait de séparation entre la moitié filtrée et la moitié d'origine. */
-  .split::after {
-    content: "";
-    position: absolute;
+  .preview b {
+    display: block;
+    padding: 8px 4px 0;
+    font-weight: 600;
+  }
+  /* Sous-menu : à droite du menu, à hauteur de son entrée. */
+  .dropdown.sub {
     top: 0;
-    bottom: 0;
-    left: 50%;
-    width: 1px;
-    background: rgba(255, 255, 255, 0.85);
-    box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.35);
+    left: calc(100% - 4px);
+    min-width: 260px;
   }
-  .tag {
-    position: absolute;
-    bottom: 8px;
-    padding: 3px 8px;
-    border-radius: var(--radius-pill);
-    background: rgba(0, 0, 0, 0.6);
-    color: #fff;
-    font-size: 11px;
-    line-height: 1.3;
+  .dropdown button.active {
+    background: var(--bg-active);
   }
-  .tag.left {
-    left: 8px;
+  .arrow {
+    font-size: 15px;
+    line-height: 1;
   }
-  .tag.right {
-    right: 8px;
+  .new {
+    display: inline-block;
+    width: 6px;
+    height: 6px;
+    margin: 0 7px 1px -2px;
+    border-radius: 50%;
+    background: var(--accent);
   }
   figcaption {
     padding: 8px 4px 2px;
@@ -332,6 +481,12 @@
   }
   .label.checked::before {
     content: "✓";
+    display: inline-block;
+    width: 16px;
+    margin-left: -2px;
+  }
+  .label.checkable::before {
+    content: "";
     display: inline-block;
     width: 16px;
     margin-left: -2px;

@@ -1,0 +1,6 @@
+[Thumbnailer Entry]
+# Miniatures des RAW d'appareil photo dans l'explorateur de fichiers (Fichiers/Nautilus, Thunar, Nemo, Caja…),
+# fabriquées par Lumitype lui-même (aperçu embarqué, sinon développement) : `lumitype --miniature`, voir main.rs.
+TryExec=lumitype
+Exec=lumitype --miniature -s %s %i %o
+MimeType=image/x-adobe-dng;image/x-sony-arw;image/x-sony-srf;image/x-sony-sr2;image/x-canon-cr2;image/x-canon-cr3;image/x-canon-crw;image/x-nikon-nef;image/x-nikon-nrw;image/x-fuji-raf;image/x-olympus-orf;image/x-panasonic-rw2;image/x-panasonic-raw;image/x-panasonic-rwl;image/x-pentax-pef;image/x-samsung-srw;image/x-hasselblad-3fr;image/x-hasselblad-fff;image/x-phaseone-iiq;image/x-leaf-mos;image/x-epson-erf;image/x-kodak-dcr;image/x-kodak-dcs;image/x-kodak-kdc;image/x-mamiya-mef;image/x-minolta-mrw;image/x-sigma-x3f;image/x-arri-ari;image/x-dcraw;

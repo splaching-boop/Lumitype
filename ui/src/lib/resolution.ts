@@ -7,8 +7,12 @@
 // l'intervalle de rafraîchissement de l'écran, la résolution baisse d'un cran ; si les images repassent largement
 // sous le budget, elle remonte. Module pur, testable sans navigateur.
 
-/** Facteurs possibles, du plus fin au plus grossier (côté du canevas, pas surface : 0,5 = quatre fois moins de pixels). */
-export const STEPS = [1, 0.75, 0.5] as const;
+/**
+ * Facteurs possibles, du plus fin au plus grossier (côté du canevas, pas surface : 0,5 = quatre fois moins de pixels).
+ * Plancher à 35 % : en dessous, l'image devient trop floue. Une machine qui ne suit toujours pas à ce plancher garde
+ * cette netteté et affiche moins d'images par seconde, plutôt qu'une image plus floue.
+ */
+export const STEPS = [1, 0.75, 0.5, 0.35] as const;
 
 /** Images consécutives trop lentes avant de baisser, et images rapides avant de remonter : évite les oscillations. */
 const SLOW_FRAMES = 3;

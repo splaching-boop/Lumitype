@@ -1,18 +1,18 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "build": {
-    "beforeBundleCommand": "bash export/cef-paquet.sh"
+    "beforeBundleCommand": "bash packaging/lib/cef-bundle.sh"
   },
   "bundle": {
     "linux": {
       "deb": {
         "files": {
-          "/usr/lib/Lumitype": "../target/release/cef-paquet"
+          "/usr/lib/Lumitype": "../target/release/cef-bundle"
         }
       },
       "rpm": {
         "files": {
-          "/usr/lib/Lumitype": "../target/release/cef-paquet"
+          "/usr/lib/Lumitype": "../target/release/cef-bundle"
         },
         "compression": {
           "type": "zstd",
@@ -21,7 +21,7 @@
       },
       "appimage": {
         "files": {
-          "/usr/lib/Lumitype": "../target/release/cef-paquet"
+          "/usr/lib/Lumitype": "../target/release/cef-bundle"
         }
       }
     }

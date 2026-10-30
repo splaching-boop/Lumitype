@@ -209,7 +209,7 @@
   }
   .list button.current {
     background: var(--bg-active);
-    color: #fff;
+    color: var(--text-strong);
   }
   .separator {
     height: 1px;

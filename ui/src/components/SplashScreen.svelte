@@ -6,10 +6,10 @@
   import { startAutosave } from "../lib/autosave.svelte";
   import { loadRecents } from "../lib/recents.svelte";
   import { api } from "../lib/ipc";
-  import { loadLocale } from "../lib/i18n.svelte";
+  import { loadLocale, t } from "../lib/i18n.svelte";
   import { loadMetadata } from "../lib/metadata";
   import { loadPerformance } from "../lib/performance.svelte";
-  import { loadProofProfile } from "../lib/proof-profiles";
+  import { loadColorSettings } from "../lib/color-settings.svelte";
   import { app } from "../state/app.svelte";
   import { keymap } from "../state/keymap.svelte";
 
@@ -35,7 +35,7 @@
         if (typeof minutes === "number") app.autosaveMinutes = Math.min(60, Math.max(2, Math.round(minutes)));
       }],
       ["Métadonnées par défaut", () => loadMetadata()],
-      ["Profil d'épreuve", () => loadProofProfile()],
+      ["Paramètres de couleur", () => loadColorSettings()],
       ["Fichiers récents", () => loadRecents()],
       ["Polices", async () => (app.fonts = await api.listFonts())],
       ["Bibliothèque de pinceaux", async () => {
@@ -46,10 +46,10 @@
     ];
     void (async () => {
       for (const [name, run] of tasks) {
-        label = name;
+        label = t(name); // la langue est la première étape : les suivantes s'affichent déjà traduites
         await run().catch(() => undefined);
       }
-      [label, loaded] = ["Prêt", true];
+      [label, loaded] = [t("Prêt"), true];
     })();
 
     // La barre avance avec le temps écoulé, mais n'atteint 100 % qu'une fois le chargement terminé.

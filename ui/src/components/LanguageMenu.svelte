@@ -95,7 +95,7 @@
     flex-shrink: 0;
     border-radius: var(--radius-xs);
     overflow: hidden;
-    box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.14);
+    box-shadow: 0 0 0 1px rgb(var(--ink) / 0.14);
   }
   .flag svg {
     display: block;

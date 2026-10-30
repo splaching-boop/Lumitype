@@ -27,9 +27,19 @@ jpeg-encoder = { version = "0.7", features = ["simd"] }
 # Export WebP avec perte (VP8 + alpha) et sans perte (VP8L) : libwebp, la bibliothèque de référence, compilée avec
 # le projet (libwebp-sys, via cc). L'encodeur 100 % Rust de `image` ne sait faire que du sans perte.
 webp = { version = "0.3", default-features = false }
+# Export AVIF (AV1 en conteneur HEIF) : encodeur rav1e, 100 % Rust, via `ravif` (couleur 4:4:4 et alpha). Fils de
+# calcul : le réservoir rayon déjà présent (fonction `threading`). L'assembleur x86-64 de rav1e (fonction `asm`, 3 à
+# 5 fois plus rapide) demande l'outil `nasm` À LA COMPILATION : voir la fonction `avif-asm` ci-dessous.
+# `avif-serialize` (même version que celle de ravif) réécrit le conteneur pour y joindre l'EXIF (metadata.rs).
+ravif = { version = "0.11", default-features = false, features = ["threading"] }
+avif-serialize = "0.8"
 # Format de projet : structure JSON + archive zip non compressée (les PNG le sont déjà).
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Gestion des couleurs CMJN (Édition › Paramètres de couleur) : LittleCMS, la référence des moteurs de couleurs,
+# compilé avec le projet (fonction `static` : aucune bibliothèque système). Calcule à la demande les tables de
+# l'épreuve et de l'export pour n'importe quel profil de presse, y compris un profil installé par Photoshop.
+lcms2 = { version = "6.1", features = ["static"] }
 zip = { version = "2", default-features = false }
 # Erreurs typées sans code répétitif.
 thiserror = "2"
@@ -43,6 +53,14 @@ unicode-script = "0.5"
 # Disque de travail de l'historique : compression LZ4 des tuiles écrites sur le disque, très rapide dans les deux
 # sens (le but est de libérer la mémoire vite et de relire un état sans attendre, pas de gagner le dernier octet).
 lz4_flex = { version = "0.14", default-features = false, features = ["std", "safe-encode", "safe-decode", "checked-decode"] }
+
+[features]
+default = ["avif-asm"]
+# Assembleur de rav1e (x86-64 : nasm ≥ 2.14 requis pour compiler ; ARM : NEON via le compilateur C, sans nasm).
+# Sans nasm, la compilation s'arrête sur un message explicite de rav1e (« NASM build failed… ») ; les scripts
+# de packaging/ vérifient et installent nasm avant. Pour tester le moteur seul sans nasm :
+# `cargo test -p engine --no-default-features` (encodage AVIF alors 3 à 5 fois plus lent).
+avif-asm = ["ravif/asm"]
 
 [dev-dependencies]
 criterion = { version = "0.5", default-features = false }

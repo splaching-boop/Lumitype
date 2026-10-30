@@ -24,10 +24,14 @@ export const PHOTOSHOP_KEYMAP: readonly Binding<ActionId>[] = [
   { action: "edit.cut", chord: key("x", CTRL) },
   { action: "edit.freeTransform", chord: key("t", CTRL) },
   { action: "edit.shortcuts", chord: key("k", CTRL | ALT | SHIFT) },
+  // F1 : la notice, comme l'aide de la plupart des logiciels (touche libre jusqu'ici).
+  { action: "help.manual", chord: code("F1") },
 
   { action: "select.all", chord: key("a", CTRL) },
   { action: "select.none", chord: key("d", CTRL) },
   { action: "select.invert", chord: key("i", CTRL | SHIFT) },
+  { action: "select.advanced", chord: key("r", CTRL | ALT) },
+  { action: "view.mirror", chord: key("m", CTRL | ALT) },
   { action: "select.feather", chord: code("F6", SHIFT) },
 
   { action: "layer.new", chord: key("n", CTRL | SHIFT) },
@@ -56,6 +60,7 @@ export const PHOTOSHOP_KEYMAP: readonly Binding<ActionId>[] = [
   { action: "view.toggleGuides", chord: key(";", CTRL, true) },
   { action: "view.toggleSnap", chord: key(";", CTRL | SHIFT) },
   { action: "view.proofCmyk", chord: key("y", CTRL) },
+  { action: "edit.colorSettings", chord: key("k", CTRL | SHIFT) },
   { action: "view.lockGuides", chord: key(";", CTRL | ALT) },
   { action: "doc.next", chord: code("Tab", CTRL) },
   { action: "doc.previous", chord: code("Tab", CTRL | SHIFT) },
@@ -77,6 +82,10 @@ export const PHOTOSHOP_KEYMAP: readonly Binding<ActionId>[] = [
   { action: "tool.shape", chord: key("u") },
   { action: "tool.shapeCycle", chord: key("u", SHIFT) },
   { action: "filter.liquify", chord: key("x", CTRL | SHIFT) },
+  { action: "filter.lastFilter", chord: key("f", CTRL) },
+  { action: "filter.gallery", chord: key("f", CTRL | ALT) },
+  { action: "filter.cameraRaw", chord: key("a", CTRL | SHIFT) },
+  { action: "layer.search", chord: key("f", CTRL | SHIFT) },
   { action: "layer.mergeGroup", chord: key("e", CTRL) },
   { action: "tool.heal", chord: key("j") },
   { action: "tool.wandCycle", chord: key("w", SHIFT) },
@@ -90,5 +99,7 @@ export const PHOTOSHOP_KEYMAP: readonly Binding<ActionId>[] = [
   { action: "tool.brush", chord: key("b") },
   { action: "tool.eraser", chord: key("e") },
   { action: "tool.hand", chord: key("h") },
+  // R : Rotation de l'affichage, rangée avec la Main comme dans Photoshop (Ctrl+R reste aux règles).
+  { action: "tool.rotateView", chord: key("r") },
   { action: "tool.zoom", chord: key("z") },
 ];

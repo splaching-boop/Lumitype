@@ -1,16 +1,11 @@
-// Images, animations et démonstrations filmées de l'aide, en un seul endroit.
+// Démonstrations filmées des outils, en un seul endroit : la bulle de la barre d'outils (ToolTip.svelte) et les
+// cartes d'outils de la notice (components/home/ToolDemoCard.svelte) lisent le même film.
 //
-// - `assets/media/demos/<article>.mp4`     démonstration filmée d'un guide : elle sert à la fois à la
-//   bulle de la barre d'outils, au bandeau du guide et au lecteur dans son corps ;
-// - `assets/media/tools/<outil>.gif`       ancienne animation d'un outil, encore acceptée ;
-// - `assets/media/tutorials/<article>.gif` ancienne animation d'un tutoriel, encore acceptée ;
-// - `assets/media/placeholder.gif`         ce qui s'affiche tant que rien n'a été tourné ;
-// - `assets/help/<nom>.jpg`                illustrations fixes fabriquées par le moteur
-//   (`cargo run -p engine --release --example adjust_previews`).
+// - `assets/media/demos/<nom>.webm` et `.mp4`  le film, en deux encodages (voir le README du dossier) ;
+// - `assets/media/demos/<nom>.jpg`             son image fixe, montrée au repos.
 //
-// Déposer un fichier au bon nom suffit : rien à déclarer ici ni ailleurs, sauf pour rattacher un
-// outil à son guide (table `TOOL_DEMO` ci-dessous).
-import placeholder from "../assets/media/placeholder.gif";
+// Déposer un fichier au bon nom suffit : rien à déclarer ici ni ailleurs, sauf pour rattacher un outil à son film
+// (table `TOOL_DEMO` ci-dessous).
 
 // Deux encodages du même film. **WebM/VP9 d'abord** : c'est le seul décodé partout sans greffon
 // supplémentaire — les compilations libres de Chromium et WebKitGTK sur Fedora n'ont pas H.264 par
@@ -19,13 +14,10 @@ const demoWebm = import.meta.glob<string>("../assets/media/demos/*.webm", { eage
 const demoMp4 = import.meta.glob<string>("../assets/media/demos/*.mp4", { eager: true, import: "default" });
 /** Image fixe de chaque film (`<id>.jpg`, une image prise à 1,5 s) : la vignette au repos, avant que le film ne tourne. */
 const demoPosters = import.meta.glob<string>("../assets/media/demos/*.jpg", { eager: true, import: "default" });
-const toolGifs = import.meta.glob<string>("../assets/media/tools/*.gif", { eager: true, import: "default" });
-const tutorialGifs = import.meta.glob<string>("../assets/media/tutorials/*.gif", { eager: true, import: "default" });
-const pictures = import.meta.glob<string>("../assets/help/*.jpg", { eager: true, import: "default" });
 
 /**
- * Quel guide démontre quel outil. Les démonstrations sont nommées d'après l'article et non d'après
- * l'outil : un même film sert au guide et à la bulle, et rien n'est stocké deux fois.
+ * Quel film démontre quel outil. Les films gardent le nom des anciens guides (`outil-…`) : un même fichier sert à
+ * la bulle et à la notice, et rien n'est stocké deux fois.
  */
 const TOOL_DEMO: Record<string, string> = {
   move: "outil-deplacement",
@@ -57,11 +49,8 @@ export function demoSources(article: string): { src: string; type: string }[] {
   return sources;
 }
 
-/** Vraie tant que le guide a une démonstration filmée : l'appelant choisit alors la vidéo plutôt qu'un repli. */
-export const hasDemo = (article: string): boolean => demoSources(article).length > 0;
-
 /**
- * Le film d'un guide, chargé en mémoire puis servi par une adresse `blob:` — avec son type d'encodage.
+ * Un film, chargé en mémoire puis servi par une adresse `blob:` — avec son type d'encodage.
  *
  * Les fichiers de l'application sont servis par le protocole interne de Tauri, d'un seul bloc et sans lecture par
  * morceaux (requêtes partielles) ; les lecteurs vidéo de WebKitGTK comme de Chromium refusent souvent de lire un
@@ -86,37 +75,21 @@ export function loadFilm(article: string): Promise<{ src: string; type: string }
   }
   return loading;
 }
-/** Vignette fixe du film d'un guide ; vide s'il n'y en a pas. */
+/** Image fixe d'un film ; vide s'il n'y en a pas. */
 export const demoPoster = (article: string): string => demoPosters[`../assets/media/demos/${article}.jpg`] ?? "";
 
-/** Le guide qui démontre cet outil, ou `null`. */
+/** Le film qui démontre cet outil, ou `null`. */
 export const toolDemoArticle = (tool: string): string | null => TOOL_DEMO[tool] ?? null;
-/** Les encodages de la démonstration de l'outil, par son guide. */
+/** Les encodages du film de l'outil. */
 export const toolDemoSources = (tool: string): { src: string; type: string }[] => demoSources(TOOL_DEMO[tool] ?? "");
-
-/** Animation d'un outil, ou l'animation de remplacement. */
-export const toolAnimation = (tool: string): string => toolGifs[`../assets/media/tools/${tool}.gif`] ?? placeholder;
-
-/** Animation d'un tutoriel, ou l'animation de remplacement. */
-export const tutorialAnimation = (name: string): string => tutorialGifs[`../assets/media/tutorials/${name}.gif`] ?? placeholder;
-
-/** Faux tant que rien n'a été tourné pour ce tutoriel, film ou animation : l'article le signale au lecteur. */
-export const hasTutorialAnimation = (name: string): boolean => hasDemo(name) || `../assets/media/tutorials/${name}.gif` in tutorialGifs;
-
-/** Illustration fixe (moitié gauche corrigée, moitié droite d'origine), vide si elle n'a pas été produite. */
-export const illustration = (name: string): string => pictures[`../assets/help/${name}.jpg`] ?? "";
 
 let preloaded = false;
 /**
- * Met les médias en cache quand l'application n'a rien à faire : sans cela, la toute première bulle
- * attendrait le chargement de son média et s'afficherait vide pendant un instant. Les vidéos sont
- * demandées en `metadata` seulement — de quoi connaître leurs dimensions et amorcer le cache du
- * navigateur, sans télécharger deux mégaoctets au démarrage.
+ * Met les films des outils en mémoire quand l'application n'a rien à faire : sans cela, la toute première bulle
+ * attendrait le chargement de son film et s'afficherait vide pendant un instant.
  */
 export function preloadAnimations(): void {
   if (preloaded) return;
   preloaded = true;
-  for (const url of new Set([placeholder, ...Object.values(toolGifs)])) new Image().src = url;
-  // Les films des outils, en mémoire : la première bulle s'affiche sans attendre.
   for (const article of new Set(Object.values(TOOL_DEMO))) void loadFilm(article);
 }

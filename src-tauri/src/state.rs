@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-use engine::brushes::BrushTip;
+use engine::brushes::{BrushPattern, BrushPreset, BrushTip};
 use engine::document::Clip;
 use engine::{Document, Session};
 
@@ -74,6 +74,24 @@ pub struct Inner {
     layer_clipboard: RwLock<Option<engine::document::LayerClip>>,
     /// Pointes de pinceau importées (ABR, GBR, images), par identifiant.
     brushes: RwLock<Vec<(u32, Arc<BrushTip>)>>,
+    /// Motifs des fichiers ABR (textures des pinceaux), par identifiant.
+    patterns: RwLock<Vec<(u32, Arc<BrushPattern>)>>,
+    /// Préréglages des fichiers de pinceaux, regroupés par fichier.
+    presets: RwLock<Vec<PresetFile>>,
+}
+
+/// Préréglages d'un fichier importé : `tips` et `patterns` relient les identifiants du fichier à ceux de la bibliothèque.
+#[derive(Clone, Debug)]
+pub struct PresetFile {
+    /// Nom du fichier sans extension : le dossier du panneau des pinceaux.
+    pub folder: String,
+    pub presets: Vec<BrushPreset>,
+    pub tips: Vec<(String, u32)>,
+    pub patterns: Vec<(String, u32)>,
+    /// Toutes les pointes du fichier : sans préréglage (GBR, image, ABR ancien), chacune devient un pinceau du dossier.
+    pub all_tips: Vec<u32>,
+    /// Fichier recopié dans le dossier de l'application (pour pouvoir retirer le pack).
+    pub file: Option<PathBuf>,
 }
 
 /// Clonable à faible coût pour être déplacé dans les tâches bloquantes.
@@ -129,12 +147,49 @@ impl AppState {
         added
     }
 
+    /// Ajoute des motifs et retourne leurs identifiants.
+    pub fn add_patterns(&self, patterns: Vec<BrushPattern>) -> Vec<(u32, Arc<BrushPattern>)> {
+        let mut library = self.0.patterns.write().unwrap_or_else(PoisonError::into_inner);
+        let mut next = library.last().map_or(1, |(id, _)| id + 1);
+        let added: Vec<(u32, Arc<BrushPattern>)> = patterns
+            .into_iter()
+            .map(|pattern| {
+                let entry = (next, Arc::new(pattern));
+                next += 1;
+                entry
+            })
+            .collect();
+        library.extend(added.iter().cloned());
+        added
+    }
+
+    pub fn pattern(&self, id: u32) -> Option<Arc<BrushPattern>> {
+        self.0.patterns.read().unwrap_or_else(PoisonError::into_inner).iter().find(|(pattern_id, _)| *pattern_id == id).map(|(_, p)| Arc::clone(p))
+    }
+
+    pub fn add_preset_file(&self, file: PresetFile) {
+        let mut files = self.0.presets.write().unwrap_or_else(PoisonError::into_inner);
+        files.retain(|f| f.folder != file.folder);
+        files.push(file);
+    }
+
+    /// Retire un fichier de la bibliothèque ; retourne le chemin de sa copie.
+    pub fn remove_preset_file(&self, folder: &str) -> Option<PathBuf> {
+        let mut files = self.0.presets.write().unwrap_or_else(PoisonError::into_inner);
+        let index = files.iter().position(|f| f.folder == folder)?;
+        files.remove(index).file
+    }
+
+    pub fn preset_files(&self) -> Vec<PresetFile> {
+        self.0.presets.read().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+
     pub fn brushes(&self) -> Vec<(u32, Arc<BrushTip>)> {
         self.0.brushes.read().unwrap_or_else(PoisonError::into_inner).clone()
     }
 
     pub fn brush(&self, id: u32) -> Option<Arc<BrushTip>> {
-        self.brushes().into_iter().find(|(tip_id, _)| *tip_id == id).map(|(_, tip)| tip)
+        self.0.brushes.read().unwrap_or_else(PoisonError::into_inner).iter().find(|(tip_id, _)| *tip_id == id).map(|(_, tip)| Arc::clone(tip))
     }
 
     pub fn set_layer_clipboard(&self, clip: engine::document::LayerClip) {

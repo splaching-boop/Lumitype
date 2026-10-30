@@ -9,7 +9,7 @@
 // chaque changement du calque) ; la carte graphique les fond dans l'image comme lui : ceux qui se fondent au calque
 // font partie de ses pixels, les autres (ombre en Produit, contour en Incrustation…) sont fondus à part, dessous
 // ou dessus, chacun avec son mode.
-import type { Adjustment, BlendMode, DocumentInfo, LayerInfo } from "./ipc";
+import type { Adjustment, BlendIf, BlendMode, DocumentInfo, LayerInfo } from "./ipc";
 
 /** Calque porteur de pixels (pixels, texte, forme), du bas vers le haut. */
 export interface GpuLayer {
@@ -33,7 +33,8 @@ export type GpuOp =
   | { op: "clear"; target: number }
   | { op: "load"; target: number; layer: number }
   | { op: "copy"; target: number; source: number }
-  | { op: "blend"; target: number; source: GpuSource; mode: BlendMode; layer: number }
+  /** `range` : comparaison du calque (options de fusion), qui lit l'image dessous (jamais en dessin direct). */
+  | { op: "blend"; target: number; source: GpuSource; mode: BlendMode; layer: number; range?: BlendIf }
   | { op: "mix"; target: number; before: number; layer: number }
   | { op: "adjust"; target: number; mode: BlendMode; layer: number }
   | {
@@ -85,12 +86,27 @@ export interface GpuPlanOptions {
    * garde alors son interpolation même à 100 %.
    */
   live?: number | null;
+  /**
+   * Groupe dont le contenu est remplacé par une texture aplatie (`p<id>`, voir GpuLayers.setCollapse) pendant son
+   * déplacement : il se fond alors comme un calque, avec son opacité et son masque. À réserver à un groupe isolé, ou
+   * en Transfert sur des calques normaux (même image) : le moteur le dit (`MoveLayout.collapsible`).
+   */
+  collapsed?: number | null;
 }
 
 /** Même opacité que le moteur (`Pass::opacity`) : opacité × fond. */
 export const layerOpacity = (layer: Pick<LayerInfo, "opacity" | "fill">): number => layer.opacity * layer.fill;
 
 const hasMask = (layer: LayerInfo) => layer.hasMask && layer.maskEnabled;
+
+const FULL = [0, 0, 255, 255];
+/** Comparaison qui agit vraiment (même règle que `LayerProps::range` du moteur) : ni plages entières, ni Transfert. */
+export const rangeOf = (layer: Pick<LayerInfo, "blendIf" | "blend">): BlendIf | undefined => {
+  const r = layer.blendIf;
+  if (!r || layer.blend === "pass_through") return undefined;
+  const full = (v: readonly number[]) => v.every((x, i) => x === FULL[i]);
+  return full(r.this) && full(r.under) ? undefined : r;
+};
 const hasEffects = (layer: LayerInfo) => layer.effects.some((e) => e.enabled);
 
 export function gpuPlan(doc: DocumentInfo, options: GpuPlanOptions = {}): GpuPlan {
@@ -127,7 +143,7 @@ export function gpuPlan(doc: DocumentInfo, options: GpuPlanOptions = {}): GpuPla
   /** Contenu d'un calque : ses pixels, ou pour un groupe un tampon où sa composition isolée est écrite. */
   const content = (layer: LayerInfo): { source: GpuSource; scratch: number | null } | null => {
     if (layer.adjustment) return null;
-    if (!layer.isGroup) {
+    if (!layer.isGroup || layer.id === options.collapsed) {
       if (!layers.some((l) => l.id === layer.id)) layers.push({ id: layer.id, offset: layer.offset, alpha: layerOpacity(layer), fill: layer.fill });
       return { source: { layer: layer.id }, scratch: null };
     }
@@ -180,6 +196,14 @@ export function gpuPlan(doc: DocumentInfo, options: GpuPlanOptions = {}): GpuPla
 
       if (!base.visible) continue;
       if (clipped.length === 0 && base.isGroup && base.blend === "pass_through") {
+        if (base.id === options.collapsed) {
+          // Groupe aplati : son contenu (déjà composé) se pose comme un calque normal, opacité et masque du groupe
+          // compris — pour des calques normaux, c'est exactement l'interpolation du Transfert.
+          const made = content(base);
+          use(base);
+          if (made) ops.push({ op: "blend", target, source: made.source, mode: "normal", layer: base.id });
+          continue;
+        }
         passThrough(base, target);
         continue;
       }
@@ -220,7 +244,8 @@ export function gpuPlan(doc: DocumentInfo, options: GpuPlanOptions = {}): GpuPla
         effects.add(base.id);
         ops.push({ op: "effects", target, layer: base.id, side: "under" });
       }
-      ops.push({ op: "blend", target, source, mode: base.blend, layer: base.id });
+      const range = rangeOf(base);
+      ops.push({ op: "blend", target, source, mode: base.blend, layer: base.id, ...(range ? { range } : {}) });
       if (styled) ops.push({ op: "effects", target, layer: base.id, side: "over" });
       if (scratch !== null) release(scratch);
     }
@@ -228,7 +253,10 @@ export function gpuPlan(doc: DocumentInfo, options: GpuPlanOptions = {}): GpuPla
 
   compositeList(children.get(null) ?? [], 0);
 
-  const simple = ops.every((op) => op.op === "blend" && op.target === 0 && "layer" in op.source && op.mode === "normal" && !masks.has(op.layer));
+  // Document en gris ou en bitmap : le rendu final (désaturation, seuil) se fait à la présentation du tampon 0 (voir
+  // gpu-layers.ts, `finishColor`) — jamais en dessin direct à l'écran.
+  const plainMode = (doc.colorMode?.kind ?? "rgb") === "rgb" || doc.colorMode?.kind === "cmykWorkflow";
+  const simple = plainMode && ops.every((op) => op.op === "blend" && op.target === 0 && "layer" in op.source && op.mode === "normal" && !op.range && !masks.has(op.layer));
   return { ok: true, layers, program: { ops, buffers: peak }, simple, masks: [...masks], adjustments, effects: [...effects], raws: [...raws] };
 }
 

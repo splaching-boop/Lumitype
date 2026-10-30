@@ -1,4 +1,5 @@
-/* Design tokens. Un thème clair redéfinira ces variables sous [data-theme="light"]. */
+/* Design tokens. Thème « Legacy » (noir chaud) par défaut ; les autres thèmes (Préférences › Apparence) les redéfinissent
+   sous [data-theme] ; la couleur d'accent est posée en ligne sur <html> (lib/appearance.svelte.ts). */
 :root {
   color-scheme: dark;
 
@@ -13,6 +14,13 @@
   --bg-active: rgba(255, 255, 255, 0.1);
   /* Gris neutre : le fond du canevas ne doit pas fausser la perception des couleurs. */
   --bg-canvas: #1d1d1e;
+  /* Creux (fond des aperçus, des vignettes) et cartes (tuiles de l'accueil, lignes). */
+  --bg-well: #0f0f11;
+  --bg-card: #1e1b1c;
+  /* Encre des voiles et des filets (« rgb(var(--ink) / 0.08) ») : blanche sur fond sombre, brune sur fond clair. */
+  --ink: 255 255 255;
+  /* Aperçus d'encre blanche (traits et pointes des pinceaux) : inversés sur un thème clair. */
+  --ink-invert: 0;
 
   --border: rgba(255, 255, 255, 0.06);
   --border-strong: rgba(255, 255, 255, 0.1);
@@ -22,6 +30,9 @@
   --text-3: #a1a1a8;
   --text-muted: #8b8b93;
   --text-disabled: #55555c;
+  /* Texte mis en avant (survol, sélection) ; et texte posé sur la couleur d'accent. */
+  --text-strong: #ffffff;
+  --on-accent: #ffffff;
 
   --pill-bg: #ec2a3c;
   --pill-text: #ffffff;
@@ -49,4 +60,376 @@
   /* Curseur de rotation : dessiné par lib/cursors.ts, orienté selon l'angle survolé. */
   /* Curseur pipette (dessin maison) : la pointe, en bas à gauche, est le point prélevé. */
   --cursor-pipette: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke-linecap='round' stroke-linejoin='round'><g stroke='black' stroke-width='4'><path d='M16 4l4 4-3 3-4-4zM13 9l-9 9v2h2l9-9'/></g><g stroke='white' stroke-width='1.6'><path d='M16 4l4 4-3 3-4-4zM13 9l-9 9v2h2l9-9'/></g></svg>") 4 20, crosshair;
+}
+
+/* OLED : noir absolu, pour les écrans OLED et le travail de nuit. */
+:root[data-theme="oled"] {
+  --bg-app: #000000;
+  --bg-bar: #000000;
+  --bg-bar-2: #030303;
+  --bg-panel: #050505;
+  --bg-field: #0e0e0e;
+  --bg-menu: #101010;
+  --bg-canvas: #0a0a0a;
+  --bg-well: #000000;
+  --bg-card: #0b0b0b;
+  --border: rgba(255, 255, 255, 0.08);
+  --border-strong: rgba(255, 255, 255, 0.14);
+}
+
+/* Gris : gris moyen neutre, à la manière de Photoshop. */
+:root[data-theme="gris"] {
+  --bg-app: #323232;
+  --bg-bar: #2a2a2a;
+  --bg-bar-2: #2e2e2e;
+  --bg-panel: #3a3a3a;
+  --bg-field: #2b2b2b;
+  --bg-menu: #444444;
+  --bg-canvas: #262626;
+  --bg-well: #242424;
+  --bg-card: #404040;
+  --bg-hover: rgba(255, 255, 255, 0.07);
+  --bg-active: rgba(255, 255, 255, 0.13);
+  --border: rgba(255, 255, 255, 0.08);
+  --border-strong: rgba(255, 255, 255, 0.14);
+  --text: #ededed;
+  --text-2: #d0d0d0;
+  --text-3: #b0b0b0;
+  --text-muted: #9a9a9a;
+  --text-disabled: #6a6a6a;
+}
+
+/* Charcoal : gris ardoise, légèrement bleuté. */
+:root[data-theme="charcoal"] {
+  --bg-app: #232528;
+  --bg-bar-2: #1f2124;
+  --bg-bar: #1c1e21;
+  --bg-panel: #2a2d31;
+  --bg-field: #1f2124;
+  --bg-menu: #2f3236;
+  --bg-canvas: #26282b;
+  --bg-well: #1a1c1f;
+  --bg-card: #2e3135;
+  --bg-hover: rgba(255, 255, 255, 0.07);
+  --bg-active: rgba(255, 255, 255, 0.12);
+  --border: rgba(255, 255, 255, 0.08);
+  --border-strong: rgba(255, 255, 255, 0.14);
+  --text-muted: #9196a0;
+  --text-disabled: #5c6069;
+}
+
+/* Purple : violet profond. */
+:root[data-theme="purple"] {
+  --bg-app: #1a1526;
+  --bg-bar-2: #181223;
+  --bg-bar: #150f1f;
+  --bg-panel: #221b31;
+  --bg-field: #1a1426;
+  --bg-menu: #2a2240;
+  --bg-canvas: #1f1a2a;
+  --bg-well: #120d1b;
+  --bg-card: #261f38;
+  --bg-hover: rgba(220, 200, 255, 0.07);
+  --bg-active: rgba(220, 200, 255, 0.12);
+  --border: rgba(220, 200, 255, 0.08);
+  --border-strong: rgba(220, 200, 255, 0.14);
+  --text: #ece8f2;
+  --text-2: #c9c2d6;
+  --text-3: #a79fb8;
+  --text-muted: #9088a4;
+  --text-disabled: #5a5268;
+}
+
+/* Burgundy : bordeaux sombre. */
+:root[data-theme="burgundy"] {
+  --bg-app: #231316;
+  --bg-bar-2: #1f1114;
+  --bg-bar: #1b0e11;
+  --bg-panel: #2b181c;
+  --bg-field: #201114;
+  --bg-menu: #33202a;
+  --bg-canvas: #221a1c;
+  --bg-well: #170a0c;
+  --bg-card: #2f1b20;
+  --bg-hover: rgba(255, 220, 225, 0.07);
+  --bg-active: rgba(255, 220, 225, 0.12);
+  --border: rgba(255, 220, 225, 0.08);
+  --border-strong: rgba(255, 220, 225, 0.14);
+  --text: #f0e8ea;
+  --text-2: #d2c4c8;
+  --text-3: #b09fa4;
+  --text-muted: #9a868c;
+  --text-disabled: #5e4d52;
+}
+
+/* Navy Blue : bleu marine. */
+:root[data-theme="navy"] {
+  --bg-app: #121a2b;
+  --bg-bar-2: #101727;
+  --bg-bar: #0d1322;
+  --bg-panel: #182236;
+  --bg-field: #111a2c;
+  --bg-menu: #1e2a42;
+  --bg-canvas: #161e2f;
+  --bg-well: #0b1120;
+  --bg-card: #1b2539;
+  --bg-hover: rgba(200, 215, 255, 0.07);
+  --bg-active: rgba(200, 215, 255, 0.12);
+  --border: rgba(200, 215, 255, 0.08);
+  --border-strong: rgba(200, 215, 255, 0.14);
+  --text: #e8ecf4;
+  --text-2: #c3cad8;
+  --text-3: #9fa8ba;
+  --text-muted: #8690a5;
+  --text-disabled: #525b6e;
+}
+
+/* Pine : vert sapin. */
+:root[data-theme="pine"] {
+  --bg-app: #121c17;
+  --bg-bar-2: #101914;
+  --bg-bar: #0d1511;
+  --bg-panel: #18241e;
+  --bg-field: #111b16;
+  --bg-menu: #1e2d25;
+  --bg-canvas: #15201a;
+  --bg-well: #0b120e;
+  --bg-card: #1b2821;
+  --bg-hover: rgba(200, 255, 220, 0.07);
+  --bg-active: rgba(200, 255, 220, 0.12);
+  --border: rgba(200, 255, 220, 0.08);
+  --border-strong: rgba(200, 255, 220, 0.14);
+  --text: #e8f0ea;
+  --text-2: #c3d2c8;
+  --text-3: #9fb3a6;
+  --text-muted: #86998d;
+  --text-disabled: #4f5f56;
+}
+
+/* Teal : bleu canard. */
+:root[data-theme="teal"] {
+  --bg-app: #0f1f21;
+  --bg-bar-2: #0d1c1e;
+  --bg-bar: #0b181a;
+  --bg-panel: #152a2d;
+  --bg-field: #0f2022;
+  --bg-menu: #1a3337;
+  --bg-canvas: #122426;
+  --bg-well: #0a1517;
+  --bg-card: #182e31;
+  --bg-hover: rgba(190, 240, 245, 0.07);
+  --bg-active: rgba(190, 240, 245, 0.12);
+  --border: rgba(190, 240, 245, 0.08);
+  --border-strong: rgba(190, 240, 245, 0.14);
+  --text: #e6f1f2;
+  --text-2: #c0d4d6;
+  --text-3: #9bb5b8;
+  --text-muted: #829a9d;
+  --text-disabled: #4c5f62;
+}
+
+/* Brown : brun chaud. */
+:root[data-theme="brown"] {
+  --bg-app: #241c16;
+  --bg-bar-2: #201813;
+  --bg-bar: #1c1510;
+  --bg-panel: #2d241d;
+  --bg-field: #221a14;
+  --bg-menu: #362c24;
+  --bg-canvas: #272019;
+  --bg-well: #171109;
+  --bg-card: #31271f;
+  --bg-hover: rgba(255, 230, 200, 0.07);
+  --bg-active: rgba(255, 230, 200, 0.12);
+  --border: rgba(255, 230, 200, 0.08);
+  --border-strong: rgba(255, 230, 200, 0.14);
+  --text: #f0ebe5;
+  --text-2: #d3c9bf;
+  --text-3: #b1a496;
+  --text-muted: #9a8c7d;
+  --text-disabled: #5e5247;
+}
+
+/* Gold : brun doré. */
+:root[data-theme="gold"] {
+  --bg-app: #1f1a10;
+  --bg-bar-2: #1b160d;
+  --bg-bar: #17130b;
+  --bg-panel: #282215;
+  --bg-field: #1d1810;
+  --bg-menu: #322a1a;
+  --bg-canvas: #221d12;
+  --bg-well: #130f08;
+  --bg-card: #2c2518;
+  --bg-hover: rgba(255, 225, 150, 0.07);
+  --bg-active: rgba(255, 225, 150, 0.12);
+  --border: rgba(255, 225, 150, 0.09);
+  --border-strong: rgba(255, 225, 150, 0.16);
+  --text: #f3ecda;
+  --text-2: #d9cfb4;
+  --text-3: #b8ab8a;
+  --text-muted: #a09377;
+  --text-disabled: #5f5640;
+}
+
+/* Mint : vert d'eau, clair. */
+:root[data-theme="mint"] {
+  color-scheme: light;
+  --bg-app: #dcebe3;
+  --bg-bar-2: #d6e7de;
+  --bg-bar: #cfe2d8;
+  --bg-panel: #eaf4ee;
+  --bg-field: #f6fbf8;
+  --bg-menu: #f2f9f5;
+  --bg-hover: rgba(20, 70, 45, 0.06);
+  --bg-active: rgba(20, 70, 45, 0.11);
+  --bg-canvas: #cadfd3;
+  --bg-well: #d3e5db;
+  --bg-card: #eef7f2;
+  --ink: 20 40 30;
+  --ink-invert: 1;
+  --border: rgba(20, 70, 45, 0.13);
+  --border-strong: rgba(20, 70, 45, 0.22);
+  --text: #1f2b25;
+  --text-2: #3b4a42;
+  --text-3: #56675d;
+  --text-muted: #75877c;
+  --text-disabled: #a9bbb0;
+  --text-strong: #0f1a14;
+  --shadow-menu: 0 14px 40px rgba(20, 50, 35, 0.2);
+}
+
+/* Silver : gris argent, clair. */
+:root[data-theme="silver"] {
+  color-scheme: light;
+  --bg-app: #dfe1e5;
+  --bg-bar-2: #d9dce0;
+  --bg-bar: #d3d6db;
+  --bg-panel: #eceef1;
+  --bg-field: #f7f8fa;
+  --bg-menu: #f3f4f6;
+  --bg-hover: rgba(30, 35, 45, 0.06);
+  --bg-active: rgba(30, 35, 45, 0.11);
+  --bg-canvas: #cfd2d8;
+  --bg-well: #d7dadf;
+  --bg-card: #f0f1f4;
+  --ink: 22 22 26;
+  --ink-invert: 1;
+  --border: rgba(30, 35, 45, 0.13);
+  --border-strong: rgba(30, 35, 45, 0.22);
+  --text: #20232a;
+  --text-2: #3d4149;
+  --text-3: #585d66;
+  --text-muted: #777c86;
+  --text-disabled: #adb1b9;
+  --text-strong: #0f1115;
+  --shadow-menu: 0 14px 40px rgba(20, 25, 35, 0.18);
+}
+
+/* Lime : vert tilleul, clair. */
+:root[data-theme="lime"] {
+  color-scheme: light;
+  --bg-app: #e4ecd2;
+  --bg-bar-2: #dde6c9;
+  --bg-bar: #d8e2c2;
+  --bg-panel: #f0f5e4;
+  --bg-field: #f9fbf3;
+  --bg-menu: #f5f9ec;
+  --bg-hover: rgba(50, 70, 10, 0.06);
+  --bg-active: rgba(50, 70, 10, 0.11);
+  --bg-canvas: #d3dec0;
+  --bg-well: #dbe4c7;
+  --bg-card: #f3f7e9;
+  --ink: 40 50 10;
+  --ink-invert: 1;
+  --border: rgba(50, 70, 10, 0.13);
+  --border-strong: rgba(50, 70, 10, 0.22);
+  --text: #232a18;
+  --text-2: #414a32;
+  --text-3: #5b664a;
+  --text-muted: #7a866a;
+  --text-disabled: #aeb99e;
+  --text-strong: #121708;
+  --shadow-menu: 0 14px 40px rgba(40, 55, 10, 0.2);
+}
+
+/* Peach : pêche, clair et chaud. */
+:root[data-theme="peach"] {
+  color-scheme: light;
+  --bg-app: #f3dfd2;
+  --bg-bar-2: #eed7c7;
+  --bg-bar: #ebd1c0;
+  --bg-panel: #faede5;
+  --bg-field: #fff8f3;
+  --bg-menu: #fdf3ec;
+  --bg-hover: rgba(90, 40, 20, 0.06);
+  --bg-active: rgba(90, 40, 20, 0.11);
+  --bg-canvas: #e8cfbf;
+  --bg-well: #ecd6c8;
+  --bg-card: #fcf0e8;
+  --ink: 60 42 20;
+  --ink-invert: 1;
+  --border: rgba(90, 40, 20, 0.13);
+  --border-strong: rgba(90, 40, 20, 0.22);
+  --text: #2e221c;
+  --text-2: #4c3d35;
+  --text-3: #68574d;
+  --text-muted: #88766b;
+  --text-disabled: #bfaea3;
+  --text-strong: #1a110c;
+  --shadow-menu: 0 14px 40px rgba(90, 40, 20, 0.2);
+}
+
+/* Beige : papier crème, clair et chaud (remplace Vanille). */
+:root[data-theme="beige"] {
+  color-scheme: light;
+  --bg-app: #e6dccb;
+  --bg-bar-2: #e0d6c4;
+  --bg-bar: #ddd2bf;
+  --bg-panel: #f1ebe0;
+  --bg-field: #faf6ee;
+  --bg-menu: #f7f2e8;
+  --bg-hover: rgba(60, 45, 20, 0.06);
+  --bg-active: rgba(60, 45, 20, 0.11);
+  --bg-canvas: #d6ccb9;
+  --bg-well: #e0d6c4;
+  --bg-card: #f5efe3;
+  --ink: 60 42 20;
+  --ink-invert: 1;
+  --border: rgba(60, 45, 20, 0.14);
+  --border-strong: rgba(60, 45, 20, 0.24);
+  --text: #2b2620;
+  --text-2: #4a423a;
+  --text-3: #645a4f;
+  --text-muted: #85796b;
+  --text-disabled: #b7ab9c;
+  --text-strong: #171310;
+  --shadow-menu: 0 14px 40px rgba(60, 40, 20, 0.22);
+}
+
+/* Blanc : panneaux blanc pur, fond gris très clair, bordures fines ; sobre, pour travailler en plein jour. */
+:root[data-theme="blanc"] {
+  color-scheme: light;
+  --bg-app: #f4f4f6;
+  --bg-bar: #ffffff;
+  --bg-bar-2: #fafafb;
+  --bg-panel: #ffffff;
+  --bg-field: #f6f6f8;
+  --bg-menu: #ffffff;
+  --bg-hover: rgba(0, 0, 0, 0.045);
+  --bg-active: rgba(0, 0, 0, 0.08);
+  --bg-canvas: #e8e8ec;
+  --bg-well: #f1f1f4;
+  --bg-card: #ffffff;
+  --ink: 22 22 26;
+  --ink-invert: 1;
+  --border: rgba(0, 0, 0, 0.08);
+  --border-strong: rgba(0, 0, 0, 0.15);
+  --text: #1d1d1f;
+  --text-2: #3a3a3f;
+  --text-3: #56565c;
+  --text-muted: #85858c;
+  --text-disabled: #c4c4ca;
+  --text-strong: #000000;
+  --shadow-menu: 0 12px 32px rgba(0, 0, 0, 0.12);
 }

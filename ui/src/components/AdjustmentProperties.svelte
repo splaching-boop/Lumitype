@@ -2,7 +2,9 @@
   import { t } from "../lib/i18n.svelte";
   import { endAdjustmentPreview, previewAdjustment, warmAdjustment } from "../lib/adjust-preview";
   import { editLatest, whenIdle } from "../lib/engine";
-  import type { Adjustment, LayerInfo } from "../lib/ipc";
+  import type { Adjustment, CurvePoint, LayerInfo, MixerRow, SelectiveFamily, Triple } from "../lib/ipc";
+  import { IDENTITY } from "../lib/curves";
+  import CurveEditor from "./CurveEditor.svelte";
   import { app } from "../state/app.svelte";
   import type { GradientStop } from "../lib/gradient";
   import GradientStops from "./GradientStops.svelte";
@@ -27,6 +29,8 @@
     group?: string;
     /** Dégradé de fond de la piste : donne le sens du curseur (bleu -> jaune pour la température…). */
     track?: string;
+    /** Curseur affiché seulement si… (teinte du Noir et blanc). */
+    when?: (adjustment: Adjustment) => boolean;
   }
   const slider = (key: string, label: string, min: number, max: number, neutral = 0, step = 1, unit = "", extra: Partial<Control> = {}): Control => ({ key, label, min, max, step, neutral, unit, ...extra });
   const CONTROLS: Record<Adjustment["type"], Control[]> = {
@@ -57,6 +61,24 @@
       slider("greenHue", "Vert primaire", -100, 100, 0, 1, "", { track: "linear-gradient(90deg, #c6d22a, #43a047, #26b3a0)" }),
       slider("blueHue", "Bleu primaire", -100, 100, 0, 1, "", { track: "linear-gradient(90deg, #29a3d6, #3949ab, #8e44c9)" }),
     ],
+    curves: [],
+    exposure: [slider("exposure", "Exposition", -20, 20, 0, 0.01, " IL"), slider("offset", "Décalage", -0.5, 0.5, 0, 0.0001), slider("gamma", "Correction gamma", 0.01, 9.99, 1, 0.01)],
+    colorBalance: [],
+    // Poids de Photoshop par défaut ; double-clic : retour à cette valeur.
+    blackWhite: [
+      slider("reds", "Rouges", -200, 300, 40, 1, " %", { track: "linear-gradient(90deg, #111, #ff3b30)" }),
+      slider("yellows", "Jaunes", -200, 300, 60, 1, " %", { track: "linear-gradient(90deg, #111, #ffd60a)" }),
+      slider("greens", "Verts", -200, 300, 40, 1, " %", { track: "linear-gradient(90deg, #111, #34c759)" }),
+      slider("cyans", "Cyans", -200, 300, 60, 1, " %", { track: "linear-gradient(90deg, #111, #32d4e6)" }),
+      slider("blues", "Bleus", -200, 300, 20, 1, " %", { track: "linear-gradient(90deg, #111, #2f6bff)" }),
+      slider("magentas", "Magentas", -200, 300, 80, 1, " %", { track: "linear-gradient(90deg, #111, #e040fb)" }),
+      slider("tintHue", "Teinte", 0, 360, 35, 1, "°", { track: "linear-gradient(90deg, #ff0000, #ffff00, #00ff00, #00ffff, #0000ff, #ff00ff, #ff0000)", when: (a) => a.type === "blackWhite" && a.tint }),
+      slider("tintSaturation", "Saturation", 0, 100, 25, 1, " %", { when: (a) => a.type === "blackWhite" && a.tint }),
+    ],
+    channelMixer: [],
+    selectiveColor: [],
+    posterize: [slider("levels", "Niveaux", 2, 255, 4)],
+    threshold: [slider("level", "Seuil", 1, 255, 128, 1, "", { track: "linear-gradient(90deg, #000, #fff)" })],
   };
 
   // Le panneau vient de s'ouvrir sur ce calque : on prépare l'aperçu avant même le premier geste.
@@ -64,7 +86,7 @@
     warmAdjustment(layer.id, engineAdjustment);
   });
 
-  const controls = $derived(CONTROLS[adjustment.type]);
+  const controls = $derived(CONTROLS[adjustment.type].filter((control) => !control.when || control.when(adjustment)));
   const values = $derived(adjustment as unknown as Record<string, number>);
   function send(next: Adjustment): void {
     // Niveaux : le point noir reste sous le point blanc.
@@ -85,10 +107,105 @@
     if (Number.isFinite(value)) send({ ...adjustment, [key]: value } as Adjustment);
   }
 
+  /** Valeurs neutres (ou par défaut) des réglages qui ne sont pas de simples curseurs. */
+  const zero = (): MixerRow => [0, 0, 0, 0];
+  const RESETS: Partial<Record<Adjustment["type"], Adjustment>> = {
+    curves: { type: "curves", rgb: [...IDENTITY], red: [], green: [], blue: [] },
+    colorBalance: { type: "colorBalance", shadows: [0, 0, 0], midtones: [0, 0, 0], highlights: [0, 0, 0], preserveLuminosity: true },
+    channelMixer: { type: "channelMixer", red: [100, 0, 0, 0], green: [0, 100, 0, 0], blue: [0, 0, 100, 0], gray: [40, 40, 20, 0], monochrome: false },
+    selectiveColor: { type: "selectiveColor", absolute: false, reds: zero(), yellows: zero(), greens: zero(), cyans: zero(), blues: zero(), magentas: zero(), whites: zero(), neutrals: zero(), blacks: zero() },
+  };
+
   function reset(): void {
-    send({ ...adjustment, ...Object.fromEntries(controls.map((c) => [c.key, c.neutral])) } as Adjustment);
+    const preset = RESETS[adjustment.type];
+    // Le Mélangeur et la Correction sélective gardent leur option (monochrome, méthode) : seules les valeurs reviennent.
+    if (preset?.type === "channelMixer" && adjustment.type === "channelMixer") send({ ...preset, monochrome: adjustment.monochrome });
+    else if (preset?.type === "selectiveColor" && adjustment.type === "selectiveColor") send({ ...preset, absolute: adjustment.absolute });
+    else if (preset) send(preset);
+    else send({ ...adjustment, ...Object.fromEntries(CONTROLS[adjustment.type].map((c) => [c.key, c.neutral])) } as Adjustment);
     settle();
   }
+
+  /** Change une valeur d'un tableau du réglage (`key`[`index`]) : balance, mélangeur, correction sélective. */
+  function setAt(key: string, index: number, value: number): void {
+    if (!Number.isFinite(value)) return;
+    const record = adjustment as unknown as Record<string, number[]>;
+    const row = record[key] ?? [];
+    send({ ...adjustment, [key]: row.map((v, i) => (i === index ? value : v)) } as Adjustment);
+  }
+
+  /** Bascule une option booléenne du réglage (luminosité préservée, monochrome, teinte, méthode). */
+  function flag(key: string, value: boolean): void {
+    send({ ...adjustment, [key]: value } as Adjustment);
+    settle();
+  }
+
+  // ---- Courbes : couche éditée, et ses points (la diagonale tant qu'elle n'a pas été touchée).
+  type CurveChannel = "rgb" | "red" | "green" | "blue";
+  const CURVE_CHANNELS: { key: CurveChannel; label: string; color: string }[] = [
+    { key: "rgb", label: "RVB", color: "#f2f2f2" },
+    { key: "red", label: "Rouge", color: "#ff4d4d" },
+    { key: "green", label: "Vert", color: "#3ddc6a" },
+    { key: "blue", label: "Bleu", color: "#4d8dff" },
+  ];
+  let curveChannel = $state<CurveChannel>("rgb");
+  const curvePoints = (key: CurveChannel): CurvePoint[] => (adjustment.type === "curves" && adjustment[key].length >= 2 ? adjustment[key] : IDENTITY);
+  const curveGhosts = $derived(
+    adjustment.type === "curves"
+      ? CURVE_CHANNELS.filter((c) => c.key !== curveChannel && adjustment[c.key].length >= 2).map((c) => ({ points: curvePoints(c.key), color: c.color }))
+      : [],
+  );
+  function setCurve(points: CurvePoint[]): void {
+    if (adjustment.type === "curves") send({ ...adjustment, [curveChannel]: points });
+  }
+
+  // ---- Balance des couleurs : plage de tons éditée.
+  type ToneRange = "shadows" | "midtones" | "highlights";
+  let toneRange = $state<ToneRange>("midtones");
+  const TONES: { key: ToneRange; label: string }[] = [
+    { key: "shadows", label: "Tons foncés" },
+    { key: "midtones", label: "Tons moyens" },
+    { key: "highlights", label: "Tons clairs" },
+  ];
+  const BALANCE: { left: string; right: string; track: string }[] = [
+    { left: "Cyan", right: "Rouge", track: "linear-gradient(90deg, #00c8d7, #ff3b30)" },
+    { left: "Magenta", right: "Vert", track: "linear-gradient(90deg, #e040fb, #34c759)" },
+    { left: "Jaune", right: "Bleu", track: "linear-gradient(90deg, #ffd60a, #2f6bff)" },
+  ];
+  const balance = $derived<Triple>(adjustment.type === "colorBalance" ? adjustment[toneRange] : [0, 0, 0]);
+
+  // ---- Mélangeur de couches : couche de sortie éditée (Gris en monochrome).
+  type MixerChannel = "red" | "green" | "blue";
+  let mixerChannel = $state<MixerChannel>("red");
+  const mixerKey = $derived(adjustment.type === "channelMixer" && adjustment.monochrome ? "gray" : mixerChannel);
+  const mixerRow = $derived<MixerRow>(adjustment.type === "channelMixer" ? adjustment[mixerKey as MixerChannel | "gray"] : [0, 0, 0, 0]);
+  const MIXER_SOURCES: { label: string; track?: string }[] = [
+    { label: "Rouge", track: "linear-gradient(90deg, #111, #ff3b30)" },
+    { label: "Vert", track: "linear-gradient(90deg, #111, #34c759)" },
+    { label: "Bleu", track: "linear-gradient(90deg, #111, #2f6bff)" },
+    { label: "Constante", track: "linear-gradient(90deg, #000, #fff)" },
+  ];
+
+  // ---- Correction sélective : famille de couleurs éditée.
+  let family = $state<SelectiveFamily>("reds");
+  const FAMILIES: { key: SelectiveFamily; label: string; color: string }[] = [
+    { key: "reds", label: "Rouges", color: "#ff3b30" },
+    { key: "yellows", label: "Jaunes", color: "#ffd60a" },
+    { key: "greens", label: "Verts", color: "#34c759" },
+    { key: "cyans", label: "Cyans", color: "#32d4e6" },
+    { key: "blues", label: "Bleus", color: "#2f6bff" },
+    { key: "magentas", label: "Magentas", color: "#e040fb" },
+    { key: "whites", label: "Blancs", color: "#ffffff" },
+    { key: "neutrals", label: "Neutres", color: "#808080" },
+    { key: "blacks", label: "Noirs", color: "#000000" },
+  ];
+  const INKS: { label: string; track: string }[] = [
+    { label: "Cyan", track: "linear-gradient(90deg, #fff, #00c8d7)" },
+    { label: "Magenta", track: "linear-gradient(90deg, #fff, #e040fb)" },
+    { label: "Jaune", track: "linear-gradient(90deg, #fff, #ffd60a)" },
+    { label: "Noir", track: "linear-gradient(90deg, #fff, #000)" },
+  ];
+  const familyRow = $derived<MixerRow>(adjustment.type === "selectiveColor" ? adjustment[family] : [0, 0, 0, 0]);
 
   // ---- Teinte/Saturation : plage de teintes visée, choisie à la pipette sur l'image.
   const RAINBOW = "linear-gradient(90deg, #ff0000, #ffff00, #00ff00, #00ffff, #0000ff, #ff00ff, #ff0000)";
@@ -180,9 +297,10 @@
 
   const shown = (control: Control) => {
     const value = values[control.key] ?? control.neutral;
-    const text = control.step < 1 ? value.toFixed(2) : String(Math.round(value));
+    const text = control.step < 0.01 ? value.toFixed(4) : control.step < 1 ? value.toFixed(2) : String(Math.round(value));
     return `${value > 0 && control.min < 0 ? "+" : ""}${text}${control.unit}`;
   };
+  const signed = (value: number, unit = "") => `${value > 0 ? "+" : ""}${Math.round(value)}${unit}`;
 </script>
 
 <div class="adjust">
@@ -229,7 +347,84 @@
       </div>
     </div>
   {/if}
-  {#each controls as control (control.key)}
+  {#if adjustment.type === "curves"}
+    <div class="segmented" role="radiogroup" aria-label={t("Couche")}>
+      {#each CURVE_CHANNELS as channel (channel.key)}
+        <button role="radio" aria-checked={curveChannel === channel.key} class:on={curveChannel === channel.key} onclick={() => (curveChannel = channel.key)}>{t(channel.label)}</button>
+      {/each}
+    </div>
+    {#key curveChannel}
+      <CurveEditor points={curvePoints(curveChannel)} color={CURVE_CHANNELS.find((c) => c.key === curveChannel)?.color ?? "#fff"} ghosts={curveGhosts} onchange={setCurve} onsettle={settle} />
+    {/key}
+  {/if}
+  {#if adjustment.type === "colorBalance"}
+    <div class="segmented" role="radiogroup" aria-label={t("Tons")}>
+      {#each TONES as tone (tone.key)}
+        <button role="radio" aria-checked={toneRange === tone.key} class:on={toneRange === tone.key} onclick={() => (toneRange = tone.key)}>{t(tone.label)}</button>
+      {/each}
+    </div>
+    {#each BALANCE as axis, index (axis.left)}
+      <label>
+        <span class="pair"><span>{t(axis.left)}</span><span>{t(axis.right)}</span></span>
+        <output>{signed(balance[index] ?? 0)}</output>
+        <input type="range" class="tinted" style:--track={axis.track} min="-100" max="100" step="1" value={balance[index] ?? 0} oninput={(event) => setAt(toneRange, index, event.currentTarget.valueAsNumber)} onchange={settle} ondblclick={() => (setAt(toneRange, index, 0), settle())} />
+      </label>
+    {/each}
+    <label class="check"><input type="checkbox" checked={adjustment.preserveLuminosity} onchange={(event) => flag("preserveLuminosity", event.currentTarget.checked)} /> {t("Préserver la luminosité")}</label>
+  {/if}
+  {#if adjustment.type === "channelMixer"}
+    <div class="row">
+      <span>{t("Couche de sortie")}</span>
+      <select value={mixerKey} disabled={adjustment.monochrome} onchange={(event) => (mixerChannel = event.currentTarget.value as MixerChannel)}>
+        {#if adjustment.monochrome}<option value="gray">{t("Gris")}</option>{/if}
+        <option value="red">{t("Rouge")}</option>
+        <option value="green">{t("Vert")}</option>
+        <option value="blue">{t("Bleu")}</option>
+      </select>
+    </div>
+    <label class="check"><input type="checkbox" checked={adjustment.monochrome} onchange={(event) => flag("monochrome", event.currentTarget.checked)} /> {t("Monochrome")}</label>
+    {#each MIXER_SOURCES as source, index (source.label)}
+      <label>
+        <span>{t(source.label)}</span>
+        <output>{signed(mixerRow[index] ?? 0, " %")}</output>
+        <input type="range" class="tinted" style:--track={source.track} min="-200" max="200" step="1" value={mixerRow[index] ?? 0} oninput={(event) => setAt(mixerKey, index, event.currentTarget.valueAsNumber)} onchange={settle} ondblclick={() => (setAt(mixerKey, index, index === 3 ? 0 : mixerKey === "gray" ? [40, 40, 20][index] ?? 0 : (["red", "green", "blue"].indexOf(mixerKey) === index ? 100 : 0)), settle())} />
+      </label>
+    {/each}
+    {@const total = (mixerRow[0] ?? 0) + (mixerRow[1] ?? 0) + (mixerRow[2] ?? 0)}
+    <p class:warn={total > 100}>{t("Total")} : {signed(total, " %")}{total > 100 ? ` — ${t("au-delà de 100 %, les clairs sont écrêtés")}` : ""}</p>
+  {/if}
+  {#if adjustment.type === "selectiveColor"}
+    <div class="row">
+      <span>{t("Couleurs")}</span>
+      <div class="families" role="radiogroup" aria-label={t("Couleurs")}>
+        {#each FAMILIES as entry (entry.key)}
+          <button role="radio" aria-checked={family === entry.key} class:on={family === entry.key} title={t(entry.label)} aria-label={t(entry.label)} style:--swatch={entry.color} onclick={() => (family = entry.key)}></button>
+        {/each}
+      </div>
+    </div>
+    <h3>{t(FAMILIES.find((f) => f.key === family)?.label ?? "")}</h3>
+    {#each INKS as ink, index (ink.label)}
+      <label>
+        <span>{t(ink.label)}</span>
+        <output>{signed(familyRow[index] ?? 0, " %")}</output>
+        <input type="range" class="tinted" style:--track={ink.track} min="-100" max="100" step="1" value={familyRow[index] ?? 0} oninput={(event) => setAt(family, index, event.currentTarget.valueAsNumber)} onchange={settle} ondblclick={() => (setAt(family, index, 0), settle())} />
+      </label>
+    {/each}
+    <div class="segmented" role="radiogroup" aria-label={t("Méthode")}>
+      <button role="radio" aria-checked={!adjustment.absolute} class:on={!adjustment.absolute} onclick={() => flag("absolute", false)}>{t("Relative")}</button>
+      <button role="radio" aria-checked={adjustment.absolute} class:on={adjustment.absolute} onclick={() => flag("absolute", true)}>{t("Absolue")}</button>
+    </div>
+  {/if}
+  {#each controls.filter((c) => !c.when) as control (control.key)}
+    {@render sliderRow(control)}
+  {/each}
+  {#if adjustment.type === "blackWhite"}
+    <label class="check"><input type="checkbox" checked={adjustment.tint} onchange={(event) => flag("tint", event.currentTarget.checked)} /> {t("Teinte")}</label>
+  {/if}
+  {#each controls.filter((c) => c.when) as control (control.key)}
+    {@render sliderRow(control)}
+  {/each}
+  {#snippet sliderRow(control: Control)}
     {#if control.group}
       <h3>{t(control.group)}</h3>
     {/if}
@@ -249,10 +444,11 @@
         ondblclick={() => (set(control.key, control.neutral), settle())}
       />
     </label>
-  {:else}
+  {/snippet}
+  {#if adjustment.type === "invert" || adjustment.type === "negative"}
     <p>{adjustment.type === "negative" ? t("Négatif : sans paramètre, tout est retourné, le blanc devient noir — un négatif de pellicule.") : t("Inverser : sans paramètre, retourne les couleurs mais laisse le papier blanc (le blanc pur n'est pas touché). Écrêté (par défaut), il ne vise que le calque du dessous.")}</p>
-  {/each}
-  {#if controls.length > 0}
+  {/if}
+  {#if adjustment.type !== "invert" && adjustment.type !== "negative"}
     <button onclick={reset}>{t("Réinitialiser")}</button>
   {/if}
   <p>
@@ -264,12 +460,74 @@
   {#if adjustment.type === "gradientMap"}
     <p class="note">{t("La luminosité de chaque pixel choisit une couleur le long du dégradé : le noir prend l'arrêt de gauche, le blanc celui de droite. L'opacité d'un arrêt laisse passer la couleur d'origine.")}</p>
   {/if}
+  {#if adjustment.type === "curves"}
+    <p class="note">{t("Chaque couche passe d'abord par sa propre courbe, puis par la courbe RVB. Cliquer dans le carré ajoute un point ; le tirer hors du carré, ou Suppr, le retire.")}</p>
+  {/if}
+  {#if adjustment.type === "exposure"}
+    <p class="note">{t("Calculée en lumière linéaire, comme dans Photoshop : l'exposition multiplie la lumière (+1 IL la double), le décalage assombrit ou éclaircit les ombres, le gamma courbe les tons moyens.")}</p>
+  {/if}
+  {#if adjustment.type === "blackWhite"}
+    <p class="note">{t("Chaque curseur règle la clarté que prend, en gris, une famille de couleurs de l'image.")}</p>
+  {/if}
   {#if adjustment.type === "develop"}
     <p class="note">{t("Exposition et balance des blancs sont calculées en lumière linéaire, comme dans Lightroom. Clarté et Correction du voile sont ici des approximations pixel par pixel (un calque de réglage ne voit pas le voisinage) : pour le rendu exact, et pour la Texture, utilisez Filtre &gt; Texture, clarté, voile.")}</p>
   {/if}
 </div>
 
 <style>
+  .segmented {
+    display: flex;
+    gap: 2px;
+    padding: 2px;
+    border-radius: var(--radius-m);
+    background: var(--bg-field);
+    border: 1px solid var(--border);
+  }
+  .segmented button {
+    flex: 1;
+    align-self: auto;
+    height: 24px;
+    padding: 0 6px;
+    border: none;
+    border-radius: var(--radius-s);
+    color: var(--text-muted);
+    white-space: nowrap;
+  }
+  .segmented button.on {
+    background: var(--bg-active);
+    color: var(--text);
+  }
+  .pair {
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+  }
+  .row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    color: var(--text-3);
+  }
+  .families {
+    display: flex;
+    gap: 3px;
+  }
+  .families button {
+    width: 18px;
+    height: 18px;
+    padding: 0;
+    border-radius: var(--radius-xs);
+    border: 1px solid var(--border-strong);
+    background: var(--swatch);
+  }
+  .families button.on {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+  p.warn {
+    color: var(--danger);
+  }
   .map {
     display: flex;
     flex-direction: column;
@@ -286,6 +544,12 @@
     align-items: center;
     gap: 6px;
     color: var(--text-2);
+  }
+  /* Case à cocher : pas la largeur ni la ligne entière des curseurs. */
+  .check input {
+    width: auto;
+    grid-column: auto;
+    margin: 0;
   }
   .target {
     display: flex;
@@ -416,7 +680,7 @@
   }
   button:hover {
     color: var(--text);
-    border-color: #fff;
+    border-color: var(--text-strong);
   }
   p {
     margin: 0;

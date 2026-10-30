@@ -30,6 +30,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::blend::BlendMode;
+use crate::color_mode::{finish_tile, ColorMode};
 use crate::document::{Document, Layer, LayerId, LayerKind};
 use crate::effects::LayerEffect;
 use crate::pixel::unpremultiply;
@@ -93,7 +94,124 @@ pub fn cache_budget_under(cap: u64, fixed: u64, others: u64) -> u64 {
     if fixed == 0 { dynamic } else { dynamic.min(fixed) }
 }
 
-type MipCache<const C: usize> = Mutex<HashMap<(LayerId, u8, TileCoord), Option<Arc<TileBuf<C>>>>>;
+type MipCache<const C: usize> = Mutex<Counted<(LayerId, u8, TileCoord), Arc<TileBuf<C>>>>;
+
+/// Table de cache qui compte ses entrées remplies (`Some`) au fil des insertions et retraits : la mémoire occupée
+/// se lit d'un coup, sans parcourir la table. Avant, chaque tuile ajoutée faisait recompter les cinq tables du
+/// cache (plusieurs fois) pour savoir si le budget était dépassé. Les lectures passent par `Deref`.
+#[derive(Debug)]
+struct Counted<K, V> {
+    map: HashMap<K, Option<V>>,
+    filled: usize,
+}
+
+impl<K, V> Default for Counted<K, V> {
+    fn default() -> Self {
+        Self { map: HashMap::new(), filled: 0 }
+    }
+}
+
+impl<K: Eq + std::hash::Hash, V> Counted<K, V> {
+    fn insert(&mut self, key: K, value: Option<V>) {
+        let added = value.is_some();
+        if self.map.insert(key, value).is_some_and(|old| old.is_some()) {
+            self.filled -= 1;
+        }
+        if added {
+            self.filled += 1;
+        }
+    }
+
+    fn remove(&mut self, key: &K) {
+        if self.map.remove(key).is_some_and(|old| old.is_some()) {
+            self.filled -= 1;
+        }
+    }
+
+    fn retain(&mut self, mut keep: impl FnMut(&K, &Option<V>) -> bool) {
+        let filled = &mut self.filled;
+        self.map.retain(|key, value| {
+            let kept = keep(key, value);
+            if !kept && value.is_some() {
+                *filled -= 1;
+            }
+            kept
+        });
+    }
+
+    fn clear(&mut self) {
+        self.map.clear();
+        self.filled = 0;
+    }
+
+    /// Entrées remplies (les `None`, tuiles vides, ne pèsent rien).
+    fn filled(&self) -> usize {
+        self.filled
+    }
+}
+
+impl<K, V> std::ops::Deref for Counted<K, V> {
+    type Target = HashMap<K, Option<V>>;
+    fn deref(&self) -> &Self::Target {
+        &self.map
+    }
+}
+
+/// Versions gardées d'une tuile de groupe : l'empreinte de ce qui l'a produite, et la tuile.
+type GroupVersions = Vec<(Arc<Vec<Print>>, Option<Arc<Tile>>)>;
+
+/// Contenus figés des groupes, par tuile de leur repère (voir [`GroupCache`]), avec le compte des tuiles remplies.
+#[derive(Debug, Default)]
+struct CountedGroups {
+    map: HashMap<GroupKey, GroupVersions>,
+    filled: usize,
+}
+
+impl CountedGroups {
+    /// Version de `key` composée avec cette empreinte, remise en tête (la version servie est la plus récente).
+    fn find(&mut self, key: &GroupKey, print: &[PrintRef<'_>]) -> Option<Option<Arc<Tile>>> {
+        let versions = self.map.get_mut(key)?;
+        let at = versions.iter().position(|(cached, _)| same_print(cached, print))?;
+        let hit = versions.remove(at);
+        let tile = hit.1.clone();
+        versions.insert(0, hit);
+        Some(tile)
+    }
+
+    /// Nouvelle version en tête ; au-delà de [`GROUP_VERSIONS`], les plus anciennes partent.
+    fn push(&mut self, key: GroupKey, print: Arc<Vec<Print>>, tile: Option<Arc<Tile>>) {
+        let versions = self.map.entry(key).or_default();
+        self.filled += usize::from(tile.is_some());
+        versions.insert(0, (print, tile));
+        while versions.len() > GROUP_VERSIONS {
+            if let Some((_, Some(_))) = versions.pop() {
+                self.filled -= 1;
+            }
+        }
+    }
+
+    fn retain(&mut self, mut keep: impl FnMut(&GroupKey, &GroupVersions) -> bool) {
+        let filled = &mut self.filled;
+        self.map.retain(|key, versions| {
+            let kept = keep(key, versions);
+            if !kept {
+                *filled -= versions.iter().filter(|(_, tile)| tile.is_some()).count();
+            }
+            kept
+        });
+    }
+
+    fn filled(&self) -> usize {
+        self.filled
+    }
+}
+
+impl std::ops::Deref for CountedGroups {
+    type Target = HashMap<GroupKey, GroupVersions>;
+    fn deref(&self) -> &Self::Target {
+        &self.map
+    }
+}
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     // Les caches ne contiennent que des données recalculables : un verrou
@@ -101,25 +219,107 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Un calque dans l'empreinte d'un groupe (voir `Pass::fingerprint`). Pixels et masque sont repérés par la VERSION
+/// de leur contenu (voir `tiles::Store`) et non par leur adresse : un état relu du disque de travail (Ctrl+Z sur un
+/// gros document) a de nouveaux stockages aux mêmes pixels, et son contenu figé reste bon.
+///
+/// Les effets sont EMPRUNTÉS au document (`E = &[LayerEffect]`) le temps de consulter le cache, et copiés
+/// (`E = Vec<LayerEffect>`) seulement pour une entrée nouvelle : une empreinte est prise à chaque tuile, un cache
+/// qui répond ne doit pas copier les effets de tous les calques du groupe pour rien.
+#[derive(Debug, Clone, PartialEq)]
+struct Print<E = Vec<LayerEffect>> {
+    id: LayerId,
+    at: (i32, i32),
+    visible: bool,
+    blend: BlendMode,
+    opacity: u32,
+    fill: u32,
+    clipped: bool,
+    range: Option<crate::blend::BlendIf>,
+    pixels: Option<u64>,
+    mask: Option<(u64, bool)>,
+    effects: E,
+    children: usize,
+}
+
+/// Empreinte empruntée (voir [`Print`]).
+type PrintRef<'a> = Print<&'a [LayerEffect]>;
+
+impl PrintRef<'_> {
+    fn to_owned(&self) -> Print {
+        Print { id: self.id, at: self.at, visible: self.visible, blend: self.blend, opacity: self.opacity, fill: self.fill, clipped: self.clipped, range: self.range, pixels: self.pixels, mask: self.mask, effects: self.effects.to_vec(), children: self.children }
+    }
+}
+
+impl Print {
+    fn same(&self, probe: &PrintRef<'_>) -> bool {
+        self.id == probe.id
+            && self.at == probe.at
+            && self.visible == probe.visible
+            && self.blend == probe.blend
+            && self.opacity == probe.opacity
+            && self.fill == probe.fill
+            && self.clipped == probe.clipped
+            && self.range == probe.range
+            && self.pixels == probe.pixels
+            && self.mask == probe.mask
+            && self.effects.as_slice() == probe.effects
+            && self.children == probe.children
+    }
+}
+
+/// Même empreinte, comparée sans copie.
+fn same_print(cached: &[Print], probe: &[PrintRef<'_>]) -> bool {
+    cached.len() == probe.len() && cached.iter().zip(probe).all(|(a, b)| a.same(b))
+}
+
+/// Clé du cache des groupes : le groupe, le premier calque de la série figée (le groupe lui-même pour tout son
+/// contenu, voir `Pass::flat_run`), le niveau et la tuile, dans le repère du groupe.
+type GroupKey = (LayerId, LayerId, u8, TileCoord);
+/// Contenus figés gardés par tuile, du plus récent au plus ancien : déplacer puis annuler (Ctrl+Z), ou passer d'un
+/// état à l'autre dans l'Historique, retrouve le contenu d'avant au lieu de le recomposer.
+const GROUP_VERSIONS: usize = 3;
+/// Contenu composé d'un groupe (ou d'une série de ses calques), par tuile de son repère : l'empreinte de ce qui l'a
+/// produit, et la tuile — quelques versions par tuile (voir [`GROUP_VERSIONS`]).
+type GroupCache = Mutex<CountedGroups>;
+
+/// Clé des couches fixes de l'aperçu de déplacement : empreinte du contenu, niveau, tuile.
+type SliceKey = (u64, u8, TileCoord);
+
 /// Les caches de tuiles d'un document : ce que le plafond de mémoire peut vider. Ils sont partagés (`Arc`)
 /// entre le [`TileRenderer`] qui les remplit et le registre du module `memory`, qui peut les serrer tous
 /// quand une session grossit, même ceux des documents qui ne sont pas à l'écran.
+/// Tuiles composées, par niveau de mip et coordonnée (`None` : tuile entièrement transparente).
+type CompositeMap = Counted<(u8, TileCoord), Arc<Tile>>;
+/// Calque stylé en cache : les pixels d'origine et les effets qui ont servi, puis le résultat.
+type StyledEntry = (Arc<TileStore>, Vec<LayerEffect>, Arc<StyledStores>);
+
 #[derive(Debug, Default)]
 pub struct Caches {
-    composite: Mutex<HashMap<(u8, TileCoord), Option<Arc<Tile>>>>,
+    composite: Mutex<CompositeMap>,
     pixel_mips: MipCache<4>,
     mask_mips: MipCache<1>,
+    /// Contenu composé des groupes, dans leur repère : un groupe déplacé d'un bloc n'est pas recomposé.
+    groups: GroupCache,
+    /// Couches fixes de l'aperçu de déplacement (« dessous », « dessus »), par empreinte de leur contenu (voir
+    /// `MoveSlice::fingerprint`), niveau et tuile : un deuxième Ctrl+T sur le même groupe, ou un nouveau geste
+    /// après un déplacement, les retrouve au lieu de les recomposer (leur contenu n'a pas changé).
+    move_slices: Mutex<Counted<SliceKey, Arc<Tile>>>,
+    /// Tuiles de calque entièrement opaques, par version de contenu et tuile locale (voir `covered`).
+    opaque_tiles: Mutex<HashMap<(u64, TileCoord), bool>>,
 }
 
 impl Caches {
     /// Mémoire occupée par les caches, en octets (estimation : une tuile RGBA = 256 Kio, une tuile de masque 64 Kio).
+    /// Les tables comptent leurs entrées remplies au fil de l'eau (voir [`Counted`]) : lecture immédiate.
     pub fn bytes(&self) -> u64 {
         let rgba = (TILE_SIZE * TILE_SIZE * 4) as u64;
-        let filled = |cache: &HashMap<(u8, TileCoord), Option<Arc<Tile>>>| cache.values().filter(|t| t.is_some()).count() as u64;
-        let composite = filled(&lock(&self.composite)) * rgba;
-        let pixels = lock(&self.pixel_mips).values().filter(|t| t.is_some()).count() as u64 * rgba;
-        let masks = lock(&self.mask_mips).values().filter(|t| t.is_some()).count() as u64 * rgba / 4;
-        composite + pixels + masks
+        let composite = lock(&self.composite).filled() as u64 * rgba;
+        let pixels = lock(&self.pixel_mips).filled() as u64 * rgba;
+        let masks = lock(&self.mask_mips).filled() as u64 * rgba / 4;
+        let groups = lock(&self.groups).filled() as u64 * rgba;
+        let slices = lock(&self.move_slices).filled() as u64 * rgba;
+        composite + pixels + masks + groups + slices
     }
 
     /// Respecte le budget (appelé à chaque tuile ajoutée, et quand le budget ou le plafond de mémoire change) :
@@ -130,18 +330,98 @@ impl Caches {
         self.trim_to(cache_budget_for(self.bytes()));
     }
 
-    /// Vide les caches s'ils dépassent `budget` octets (0 = illimité).
+    /// Serre les caches s'ils dépassent `budget` octets (0 = illimité) : seulement une partie des entrées est
+    /// retirée, jusqu'à repasser sous les trois quarts du budget. Tout vider d'un coup, comme avant, faisait
+    /// que le cache plein se vidait à CHAQUE tuile ajoutée (la suivante le remettait au-dessus) : l'image
+    /// entière se recomposait sans cesse, d'où des gels brutaux à l'usage dès que la mémoire était juste.
+    /// Avec cette marge, le cache se vide un peu, puis se remplit tranquillement avant la prochaine coupe.
     pub fn trim_to(&self, budget: u64) {
-        if budget == 0 || self.bytes() <= budget {
+        if budget == 0 {
             return;
         }
-        // D'abord les réductions par calque, les plus volumineuses ; puis, si cela ne suffit pas, les tuiles composées.
-        lock(&self.pixel_mips).clear();
-        lock(&self.mask_mips).clear();
-        if self.bytes() > budget {
-            lock(&self.composite).clear();
+        let used = self.bytes();
+        if used <= budget {
+            return;
         }
+        let target = budget / 4 * 3;
+        let mut excess = used - target;
+        let rgba = (TILE_SIZE * TILE_SIZE * 4) as u64;
+        // D'abord les réductions par calque (vite recalculées depuis les pixels), puis les tuiles composées
+        // (plus coûteuses : toute la pile de calques). Les entrées « None » (tuiles vides) ne pèsent rien.
+        fn evict<K: Eq + std::hash::Hash, V>(map: &mut Counted<K, V>, each: u64, excess: &mut u64) {
+            if *excess == 0 {
+                return;
+            }
+            let wanted = (*excess).div_ceil(each) as usize;
+            let mut dropped = 0usize;
+            map.retain(|_, tile| {
+                if dropped >= wanted || tile.is_none() {
+                    return true;
+                }
+                dropped += 1;
+                false
+            });
+            *excess = excess.saturating_sub(dropped as u64 * each);
+        }
+        evict(&mut lock(&self.move_slices), rgba, &mut excess);
+        evict(&mut lock(&self.pixel_mips), rgba, &mut excess);
+        evict(&mut lock(&self.mask_mips), rgba / 4, &mut excess);
+        if excess > 0 {
+            let mut groups = lock(&self.groups);
+            let wanted = excess.div_ceil(rgba) as usize;
+            let mut dropped = 0usize;
+            groups.retain(|_, versions| {
+                let filled = versions.iter().filter(|(_, tile)| tile.is_some()).count();
+                if dropped >= wanted || filled == 0 {
+                    return true;
+                }
+                dropped += filled;
+                false
+            });
+            excess = excess.saturating_sub(dropped as u64 * rgba);
+        }
+        evict(&mut lock(&self.composite), rgba, &mut excess);
     }
+}
+
+/// Recalcul local des effets tant que les tuiles changées ne dépassent pas ce quart des tuiles du calque (et au moins
+/// [`LOCAL_RESTYLE_MIN`] tuiles) ; au-delà, tout le calque, c'est moins cher.
+const LOCAL_RESTYLE_SHARE: usize = 4;
+const LOCAL_RESTYLE_MIN: usize = 16;
+
+/// Rendu stylé `cached` (fait pour les pixels `known`) mis à jour pour `pixels` en ne recalculant les effets
+/// qu'autour des tuiles qui diffèrent (élargies de la portée des effets). `None` quand cela ne se prête pas :
+/// effet tendu sur tout le calque, trop de tuiles changées, rendu précédent sans effets (échec), ou calcul impossible.
+fn restyled_locally(known: &Arc<TileStore>, pixels: &TileStore, effects: &[LayerEffect], cached: &StyledStores) -> Option<StyledStores> {
+    if !crate::effects::locally_recomputable(effects) || Arc::ptr_eq(&cached.main, known) {
+        return None;
+    }
+    let changed = known.changed_coords(pixels);
+    let tiles = pixels.tile_count().max(known.tile_count());
+    if changed.is_empty() || changed.len() > (tiles / LOCAL_RESTYLE_SHARE).max(LOCAL_RESTYLE_MIN) {
+        return None;
+    }
+    let size = TILE_SIZE as i32;
+    let reach = crate::effects::reach_enabled(effects);
+    let (x0, y0, x1, y1) = changed.iter().fold((i32::MAX, i32::MAX, i32::MIN, i32::MIN), |(a, b, c, d), t| {
+        let (ox, oy) = t.origin();
+        (a.min(ox), b.min(oy), c.max(ox + size), d.max(oy + size))
+    });
+    let region = (x0 - reach, y0 - reach, x1 + reach, y1 + reach);
+    let fresh = crate::effects::restyle_region(pixels, effects, region).ok()?;
+    if fresh.under.len() != cached.under.len() || fresh.over.len() != cached.over.len() {
+        return None;
+    }
+    let patched = |store: &Arc<TileStore>, part: &TileStore| {
+        let mut store = TileStore::clone(store);
+        store.paste(part, region);
+        Arc::new(store)
+    };
+    Some(StyledStores {
+        main: patched(&cached.main, &fresh.main),
+        under: cached.under.iter().zip(&fresh.under).map(|((mode, store), (_, part))| (*mode, patched(store, part))).collect(),
+        over: cached.over.iter().zip(&fresh.over).map(|((mode, store), (_, part))| (*mode, patched(store, part))).collect(),
+    })
 }
 
 /// Calcule et met en cache les tuiles affichables. Les méthodes `invalidate_*`
@@ -155,7 +435,7 @@ pub struct TileRenderer {
     /// (et non leur seule adresse) : une adresse libérée peut être réattribuée à d'autres pixels, et le
     /// cache rendait alors l'ancien rendu — une forme redimensionnée gardait autour d'elle le fantôme de
     /// son ancienne silhouette, pris pour une ombre « blanche et nette ».
-    styled: Mutex<HashMap<LayerId, (Arc<TileStore>, Vec<LayerEffect>, Arc<StyledStores>)>>,
+    styled: Mutex<HashMap<LayerId, StyledEntry>>,
     /// Incrémenté à chaque invalidation : un calcul commencé avant n'est pas mis en cache.
     generation: AtomicU64,
 }
@@ -191,7 +471,13 @@ impl TileRenderer {
             return Program::Ready(None);
         }
         let generation = self.generation.load(Ordering::Acquire);
-        Pass { renderer: self, doc, level, coord, generation, include: None, opaque: None, replace: None }.program()
+        let program = Pass { renderer: self, doc, level, coord, generation, include: None, opaque: None, replace: None, shift: (0, 0) }.program();
+        // Mode gris ou bitmap : le rendu final (voir `color_mode::finish_tile`) suit la composition. La carte graphique
+        // l'applique à la présentation de l'image (`viewport/gpu-layers.ts`) ; ici, la tuile est livrée finie.
+        match doc.color_mode() {
+            ColorMode::Rgb | ColorMode::CmykWorkflow { .. } => program,
+            mode => Program::Ready(finish_tile(mode, level, program.run_on_cpu())),
+        }
     }
 
     /// Tuile composée au niveau demandé, ou `None` si elle est entièrement transparente.
@@ -203,13 +489,28 @@ impl TileRenderer {
             return hit.clone();
         }
         let generation = self.generation.load(Ordering::Acquire);
-        let pass = Pass { renderer: self, doc, level, coord, generation, include: None, opaque: None, replace: None };
-        let tile = pass.run();
+        let pass = Pass { renderer: self, doc, level, coord, generation, include: None, opaque: None, replace: None, shift: (0, 0) };
+        let tile = finish_tile(doc.color_mode(), level, pass.run());
         if self.generation.load(Ordering::Acquire) == generation {
             lock(&self.caches.composite).insert((level, coord), tile.clone());
             self.trim();
         }
         tile
+    }
+
+    /// Tuile composée sans passer par le cache des tuiles composées (qui ne garde rien d'elle) : pour les parcours
+    /// d'un seul tenant (export, aplat), où chaque tuile n'est demandée qu'une fois. Les caches par calque
+    /// (réductions, effets) servent toujours, c'est eux qui évitent de recalculer les effets à chaque tuile.
+    pub fn tile_uncached(&self, doc: &Document, level: u8, coord: TileCoord) -> Option<Arc<Tile>> {
+        if level > Self::max_level(doc) {
+            return None;
+        }
+        if let Some(hit) = lock(&self.caches.composite).get(&(level, coord)) {
+            return hit.clone();
+        }
+        let generation = self.generation.load(Ordering::Acquire);
+        let pass = Pass { renderer: self, doc, level, coord, generation, include: None, opaque: None, replace: None, shift: (0, 0) };
+        finish_tile(doc.color_mode(), level, pass.run())
     }
 
     /// Mémoire occupée par les caches de ce document, en octets (voir [`Caches::bytes`]).
@@ -241,19 +542,30 @@ impl TileRenderer {
 
     fn styled_stores(&self, id: LayerId, pixels: &Arc<TileStore>, effects: &[LayerEffect]) -> Arc<StyledStores> {
         let mut cache = lock(&self.styled);
+        let mut previous = None;
         if let Some((known, for_effects, stores)) = cache.get(&id) {
-            if Arc::ptr_eq(known, pixels) && for_effects == effects {
+            // Même version : mêmes pixels (un état relu du disque de travail a de nouveaux stockages, pas de nouveaux pixels).
+            if (Arc::ptr_eq(known, pixels) || known.version() == pixels.version()) && for_effects == effects {
                 return Arc::clone(stores);
             }
+            if for_effects == effects {
+                previous = Some((Arc::clone(known), Arc::clone(stores)));
+            }
         }
-        // En cas d'échec (calque démesuré), le calque s'affiche sans ses effets plutôt que pas du tout.
-        let stores = Arc::new(match crate::effects::styled_parts(pixels, effects) {
-            Ok(parts) => StyledStores {
-                main: Arc::new(parts.main),
-                under: parts.under.into_iter().map(|(mode, store)| (mode, Arc::new(store))).collect(),
-                over: parts.over.into_iter().map(|(mode, store)| (mode, Arc::new(store))).collect(),
+        // Mêmes effets, quelques tuiles changées (trait de pinceau en cours) : les effets ne sont recalculés
+        // qu'autour d'elles, et le reste du rendu précédent est gardé. Sinon, tout le calque. En cas d'échec
+        // (calque démesuré), le calque s'affiche sans ses effets plutôt que pas du tout.
+        let local = previous.and_then(|(known, stores)| restyled_locally(&known, pixels, effects, &stores));
+        let stores = Arc::new(match local {
+            Some(stores) => stores,
+            None => match crate::effects::styled_parts(pixels, effects) {
+                Ok(parts) => StyledStores {
+                    main: Arc::new(parts.main),
+                    under: parts.under.into_iter().map(|(mode, store)| (mode, Arc::new(store))).collect(),
+                    over: parts.over.into_iter().map(|(mode, store)| (mode, Arc::new(store))).collect(),
+                },
+                Err(_) => StyledStores { main: Arc::clone(pixels), under: Vec::new(), over: Vec::new() },
             },
-            Err(_) => StyledStores { main: Arc::clone(pixels), under: Vec::new(), over: Vec::new() },
         });
         cache.insert(id, (Arc::clone(pixels), effects.to_vec(), Arc::clone(&stores)));
         // Les réductions déjà calculées pour ce calque (et ses effets du dessous) viennent de l'ancien rendu.
@@ -266,7 +578,8 @@ impl TileRenderer {
     /// mis en cache (le remplaçant change à chaque réglage), mais les réductions des autres calques le sont.
     pub fn tile_replacing(&self, doc: &Document, level: u8, coord: TileCoord, id: LayerId, store: &TileStore) -> Option<Arc<Tile>> {
         let generation = self.generation.load(Ordering::Acquire);
-        Pass { renderer: self, doc, level: level.min(Self::max_level(doc)), coord, generation, include: None, opaque: None, replace: Some((id, store)) }.run()
+        let level = level.min(Self::max_level(doc));
+        finish_tile(doc.color_mode(), level, Pass { renderer: self, doc, level, coord, generation, include: None, opaque: None, replace: Some((id, store)), shift: (0, 0) }.run())
     }
 
     /// Composition restreinte aux calques de pixels retenus par `include`, les autres étant
@@ -300,7 +613,7 @@ impl TileRenderer {
             return None;
         }
         let generation = self.generation.load(Ordering::Acquire);
-        Pass { renderer: self, doc, level, coord, generation, include: Some(include), opaque, replace }.run()
+        Pass { renderer: self, doc, level, coord, generation, include: Some(include), opaque, replace, shift: (0, 0) }.run()
     }
 
     /// Tuiles du document à recomposer sans que les pixels d'aucun calque aient changé
@@ -367,6 +680,154 @@ impl TileRenderer {
         affected
     }
 
+    /// Couche `index` de l'aperçu de déplacement `layout` (voir `move_preview`), tuile `coord` du document au niveau
+    /// `level`, en RGBA prémultiplié. `own` : pour la couche déplacée, l'opacité et le masque du groupe (ou du
+    /// calque) déplacé seul sont compris ; sans eux (`own` faux), c'est le contenu aplati du groupe, que la carte
+    /// graphique fond elle-même avec l'opacité et le masque du groupe (voir `GpuPlanOptions.collapsed`). Couche de
+    /// réglage : la couverture de son masque, dans les quatre canaux.
+    pub fn move_slice_tile(&self, doc: &Document, layout: &crate::move_preview::MoveLayout, index: usize, level: u8, coord: TileCoord, own: bool) -> Option<Arc<Tile>> {
+        use crate::move_preview::SliceKind;
+        let slice = layout.slices.get(index)?;
+        if level > Self::max_level(doc) {
+            return None;
+        }
+        let generation = self.generation.load(Ordering::Acquire);
+        // « Dessous » entièrement caché par un calque opaque fixe du dessus : rien à composer (ce qui bouge passe
+        // aussi sous ce calque, donc reste caché).
+        if slice.kind == SliceKind::Below && self.covered(doc, &layout.occluders, level, coord) {
+            return None;
+        }
+        // Couche fixe déjà composée pour ce contenu : reprise telle quelle.
+        let fixed = !slice.moving && slice.kind != SliceKind::Adjust && slice.fingerprint != 0;
+        let key = (slice.fingerprint, level, coord);
+        if fixed {
+            if let Some(hit) = lock(&self.caches.move_slices).get(&key) {
+                return hit.clone();
+            }
+        }
+        let pass = Pass { renderer: self, doc, level, coord, generation, include: None, opaque: None, replace: None, shift: (0, 0) };
+        match slice.kind {
+            SliceKind::Adjust => {
+                let layer = doc.layer(slice.layer?).ok()?;
+                Some(Arc::new(match pass.mask_factor(layer) {
+                    Coverage::Uniform(v) => Tile::filled([(v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8; 4]),
+                    Coverage::Mask(mask) => {
+                        let mut tile = Tile::transparent();
+                        for (px, v) in tile.bytes_mut().chunks_exact_mut(4).zip(mask.bytes()) {
+                            px.copy_from_slice(&[*v; 4]);
+                        }
+                        tile
+                    }
+                }))
+            }
+            SliceKind::Moving if slice.layer.and_then(|id| doc.layer(id).ok()).is_some_and(Layer::is_group) => {
+                let group = doc.layer(slice.layer?).ok()?;
+                if !group.props.visible {
+                    return None;
+                }
+                // Contenu du groupe composé à part : celui du cache des groupes quand il s'y prête (empreinte
+                // indépendante de la position : valable tout le geste, et déjà prêt pour le rendu du relâchement).
+                let content = match pass.flat_group(group) {
+                    Some(tile) => tile,
+                    None => {
+                        let mut builder = Builder::new();
+                        pass.composite_children(group, 0, &mut builder);
+                        builder.finish(coord).run_on_cpu()
+                    }
+                };
+                if own { attenuate(content, pass.opacity(group), &pass.mask_factor(group)) } else { content }
+            }
+            _ => {
+                let set: std::collections::HashSet<LayerId> = slice.leaves.iter().copied().collect();
+                let include = |id: LayerId| set.contains(&id);
+                let tile = Pass { include: Some(&include), ..pass }.run();
+                if fixed && self.generation.load(Ordering::Acquire) == generation {
+                    lock(&self.caches.move_slices).insert(key, tile.clone());
+                    self.caches.trim();
+                }
+                tile
+            }
+        }
+    }
+
+    /// Vrai si la tuile `coord` du niveau `level` (limitée au document) est entièrement recouverte par l'un des
+    /// calques `occluders` (calques opaques fixes du dessus, voir `MoveLayout::occluders`) : chacune de ses tuiles
+    /// locales sur cette zone est présente et opaque. Prudent : une zone couverte par plusieurs calques à la fois,
+    /// ou par le bord d'un calque, n'est pas reconnue (elle est simplement composée).
+    fn covered(&self, doc: &Document, occluders: &[LayerId], level: u8, coord: TileCoord) -> bool {
+        if occluders.is_empty() {
+            return false;
+        }
+        let span = (TILE_SIZE as i32) << level;
+        let (x0, y0) = (coord.x * span, coord.y * span);
+        let (x1, y1) = ((x0 + span).min(doc.width() as i32), (y0 + span).min(doc.height() as i32));
+        if x0 >= x1 || y0 >= y1 {
+            return false;
+        }
+        let size = TILE_SIZE as i32;
+        occluders.iter().any(|id| {
+            let Ok(layer) = doc.layer(*id) else { return false };
+            let Some(store) = layer.pixels() else { return false };
+            let (ox, oy) = layer.offset;
+            let (tx0, ty0) = ((x0 - ox).div_euclid(size), (y0 - oy).div_euclid(size));
+            let (tx1, ty1) = ((x1 - 1 - ox).div_euclid(size), (y1 - 1 - oy).div_euclid(size));
+            // Une grande tuile de réduction couvre beaucoup de tuiles locales : au-delà de 64, on compose.
+            if (tx1 - tx0 + 1) * (ty1 - ty0 + 1) > 64 {
+                return false;
+            }
+            let version = store.version();
+            (ty0..=ty1).all(|ty| {
+                (tx0..=tx1).all(|tx| {
+                    let local = TileCoord::new(tx, ty);
+                    if let Some(known) = lock(&self.caches.opaque_tiles).get(&(version, local)) {
+                        return *known;
+                    }
+                    let opaque = store.get(local).is_some_and(|t| t.is_opaque());
+                    let mut memo = lock(&self.caches.opaque_tiles);
+                    if memo.len() > 65_536 {
+                        memo.clear();
+                    }
+                    memo.insert((version, local), opaque);
+                    opaque
+                })
+            })
+        })
+    }
+
+    /// Image de la couche `index` de l'aperçu de déplacement sur le rectangle `(x, y, largeur, hauteur)` du niveau
+    /// `level` (pixels de ce niveau, repère document), RGBA prémultiplié ligne par ligne. Tuiles composées en
+    /// parallèle.
+    pub fn move_slice_region(&self, doc: &Document, layout: &crate::move_preview::MoveLayout, index: usize, level: u8, (x, y, w, h): (i32, i32, u32, u32), own: bool) -> Vec<u8> {
+        use rayon::prelude::*;
+        let mut out = vec![0u8; w as usize * h as usize * 4];
+        if w == 0 || h == 0 {
+            return out;
+        }
+        let size = TILE_SIZE as i32;
+        let level = level.min(Self::max_level(doc));
+        // Pas de limite au document : la couche déplacée peut venir de dehors (contenu qui déborde du cadre).
+        let (x1, y1) = (x + w as i32, y + h as i32);
+        let (tx0, ty0) = (x.div_euclid(size), y.div_euclid(size));
+        let (tx1, ty1) = ((x1 - 1).div_euclid(size), (y1 - 1).div_euclid(size));
+        let coords: Vec<TileCoord> = (ty0..=ty1).flat_map(|ty| (tx0..=tx1).map(move |tx| TileCoord::new(tx, ty))).collect();
+        let tiles: Vec<(TileCoord, Option<Arc<Tile>>)> = coords.into_par_iter().map(|c| (c, self.move_slice_tile(doc, layout, index, level, c, own))).collect();
+        for (coord, tile) in tiles {
+            let Some(tile) = tile else { continue };
+            let (ox, oy) = coord.origin();
+            let (ix0, iy0, ix1, iy1) = (x.max(ox), y.max(oy), x1.min(ox + size), y1.min(oy + size));
+            if ix0 >= ix1 || iy0 >= iy1 {
+                continue;
+            }
+            let width = (ix1 - ix0) as usize * 4;
+            for row in iy0..iy1 {
+                let src = ((row - oy) * size + (ix0 - ox)) as usize * 4;
+                let dst = ((row - y) as usize * w as usize + (ix0 - x) as usize) * 4;
+                out[dst..dst + width].copy_from_slice(&tile.bytes()[src..src + width]);
+            }
+        }
+        out
+    }
+
     /// Tuile de la sélection au niveau demandé, pour l'affichage du contour animé.
     /// `None` = uniformément égale au fond de la sélection.
     pub fn selection_tile(&self, doc: &Document, level: u8, coord: TileCoord) -> Option<Arc<MaskTile>> {
@@ -381,6 +842,7 @@ impl TileRenderer {
         lock(&self.styled).remove(&layer);
         lock(&self.caches.pixel_mips).retain(|(id, _, _), _| *id != layer && *id != (layer | RAW_PIXELS));
         lock(&self.caches.mask_mips).retain(|(id, _, _), _| *id != layer);
+        lock(&self.caches.groups).retain(|(id, _, _, _), _| *id != layer);
     }
 
     /// Miniature d'un calque (ou de son masque) : RGBA à alpha droit, au plus 256 px de côté.
@@ -403,13 +865,47 @@ impl TileRenderer {
                 }
             }
         } else {
-            let tile =
-                gather(&self.caches.pixel_mips, &self.generation, generation, layer.pixels()?, layer.id, layer.offset, level, origin);
+            let store = layer.pixels()?;
+            let tile = gather(&self.caches.pixel_mips, &self.generation, generation, store, layer.id, layer.offset, level, origin);
+            // Sans tuile stockée, le calque vaut partout son fond (un remplissage uniforme n'a que lui) : la miniature
+            // était vide (damier) pour un fond de plan blanc ou un remplissage noir relus d'une copie de secours.
+            let background = unpremultiply(store.background());
             for y in 0..h {
                 for x in 0..w {
-                    out.extend_from_slice(&tile.as_ref().map_or([0; 4], |t| unpremultiply(t.pixel(x, y))));
+                    out.extend_from_slice(&tile.as_ref().map_or(background, |t| unpremultiply(t.pixel(x, y))));
                 }
             }
+        }
+        Some((w, h, out))
+    }
+
+    /// Miniature d'un calque cadrée comme dans le panneau : sur son plan de travail s'il est dans un plan (le calque
+    /// lui-même, son plus proche parent qui est un plan), sinon sur le document. Le masque d'un plan reste cadré sur le
+    /// document (il découpe tout l'espace de travail).
+    pub fn board_thumbnail(&self, doc: &Document, layer: LayerId, mask: bool) -> Option<(u32, u32, Vec<u8>)> {
+        let (full_w, full_h, full) = self.thumbnail(doc, layer, mask)?;
+        let own = doc.layer(layer).ok()?;
+        let mut current = Some(own);
+        let mut board = None;
+        while let Some(l) = current {
+            if let Some(b) = &l.artboard {
+                board = Some(b.clone());
+                break;
+            }
+            current = l.parent.and_then(|p| doc.layer(p).ok());
+        }
+        let Some(board) = board.filter(|_| !(mask && own.artboard.is_some())) else { return Some((full_w, full_h, full)) };
+        // Même réduction que la miniature entière : un pixel de miniature couvre `2^niveau` pixels du document.
+        let step = f64::from(1u32 << Self::max_level(doc));
+        let x0 = ((f64::from(board.x) / step).floor().max(0.0) as u32).min(full_w - 1);
+        let y0 = ((f64::from(board.y) / step).floor().max(0.0) as u32).min(full_h - 1);
+        let x1 = ((f64::from(board.x + board.width as i32) / step).ceil() as u32).clamp(x0 + 1, full_w);
+        let y1 = ((f64::from(board.y + board.height as i32) / step).ceil() as u32).clamp(y0 + 1, full_h);
+        let (w, h) = (x1 - x0, y1 - y0);
+        let mut out = Vec::with_capacity((w * h * 4) as usize);
+        for y in y0..y1 {
+            let start = ((y * full_w + x0) * 4) as usize;
+            out.extend_from_slice(&full[start..start + (w * 4) as usize]);
         }
         Some((w, h, out))
     }
@@ -499,6 +995,25 @@ fn gather<const C: usize>(
     out.map(Arc::new)
 }
 
+/// Tuile atténuée par une opacité et un masque (alpha prémultiplié : les quatre canaux), comme la fusion du moteur
+/// les applique à la source. Inchangée à pleine opacité sans masque ; `None` si rien ne reste.
+fn attenuate(tile: Option<Arc<Tile>>, opacity: f32, mask: &Coverage) -> Option<Arc<Tile>> {
+    let tile = tile?;
+    if opacity >= 1.0 && matches!(mask, Coverage::Uniform(v) if *v >= 1.0) {
+        return Some(tile);
+    }
+    let mut out = Tile::transparent();
+    let mut any = false;
+    for (i, (dst, src)) in out.bytes_mut().chunks_exact_mut(4).zip(tile.bytes().chunks_exact(4)).enumerate() {
+        let k = (opacity * mask.at(i)).clamp(0.0, 1.0);
+        for c in 0..4 {
+            dst[c] = (f32::from(src[c]) * k + 0.5) as u8;
+        }
+        any |= dst[3] > 0;
+    }
+    any.then(|| Arc::new(out))
+}
+
 /// Moyenne 2x2. En alpha prémultiplié, la moyenne directe des canaux est correcte.
 #[inline]
 fn box_filter<const C: usize>(tile: &TileBuf<C>, x: u32, y: u32) -> [u8; C] {
@@ -524,11 +1039,210 @@ struct Pass<'a> {
     /// Calque composé à pleine opacité, quelle que soit la sienne : l'interface applique
     /// elle-même l'opacité pendant qu'on glisse le curseur, sans rien redemander au moteur.
     opaque: Option<LayerId>,
+    /// Origine du repère de composition, en pixels du document : (0, 0) pour le document ; la position d'un
+    /// groupe quand on compose son contenu dans son propre repère (voir `group_tile`).
+    shift: (i32, i32),
 }
 
 impl Pass<'_> {
     fn run(&self) -> Option<Arc<Tile>> {
         self.program().run_on_cpu()
+    }
+
+    /// Position d'un calque dans le repère de cette composition.
+    fn at(&self, offset: (i32, i32)) -> (i32, i32) {
+        (offset.0 - self.shift.0, offset.1 - self.shift.1)
+    }
+
+    /// Contenu d'un groupe déjà composé dans son propre repère, ramené à la tuile en cours : `Some(tuile)`
+    /// (ou `Some(None)` si rien n'y est dessiné). `None` quand le groupe ne s'y prête pas (voir
+    /// `flattenable`) : il est alors composé par [`Self::composite_children`], qui fige ce qui peut l'être.
+    fn flat_group(&self, group: &Layer) -> Option<Option<Arc<Tile>>> {
+        if self.include.is_some() || self.replace.is_some() || self.opaque.is_some() || !self.flattenable(group) {
+            return None;
+        }
+        Some(self.flat_run(group, group.children(), group.id))
+    }
+
+    /// Série `ids` de calques du groupe (tout son contenu, ou une partie, voir [`Self::cacheable_run`]) composée à
+    /// part dans le repère du GROUPE, sur fond transparent, et ramenée à la tuile en cours.
+    ///
+    /// Le contenu figé est rangé par tuiles du repère du groupe, avec l'empreinte de ce qui le compose (calques,
+    /// positions relatives, versions des pixels et des masques, effets, propriétés). Déplacer le groupe entier ne
+    /// change rien à cette empreinte : les tuiles restent bonnes et sont seulement replacées, au lieu de recomposer
+    /// chaque calque du groupe à chaque pas du déplacement. Quelques versions sont gardées par tuile : un Ctrl+Z
+    /// retrouve celle d'avant. `first` distingue les séries d'un même groupe dans le cache.
+    fn flat_run(&self, group: &Layer, ids: &[LayerId], first: LayerId) -> Option<Arc<Tile>> {
+        let mut print = Vec::new();
+        Self::fingerprint(self.doc, ids, group.offset, &mut print);
+        // Copie des effets seulement pour une entrée nouvelle du cache, partagée entre les tuiles de ce passage.
+        let owned: std::cell::OnceCell<Arc<Vec<Print>>> = std::cell::OnceCell::new();
+        let r = self.renderer;
+        let size = TILE_SIZE as i32;
+        let scale = 1i32 << self.level;
+        let round = |v: i32| (v + scale / 2).div_euclid(scale);
+        let (x0, y0) = (self.coord.x * size - round(self.at(group.offset).0), self.coord.y * size - round(self.at(group.offset).1));
+        let (first_tile, fx, fy) = TileCoord::of_pixel(x0, y0);
+        let fetch = |coord: TileCoord| -> Option<Arc<Tile>> {
+            let key = (group.id, first, self.level, coord);
+            if let Some(tile) = lock(&r.caches.groups).find(&key, &print) {
+                return tile;
+            }
+            let inner = Pass { coord, shift: group.offset, ..*self };
+            let mut builder = Builder::new();
+            inner.composite_list(ids, 0, &mut builder);
+            let tile = builder.finish(coord).run_on_cpu();
+            let owned = owned.get_or_init(|| Arc::new(print.iter().map(PrintRef::to_owned).collect()));
+            lock(&r.caches.groups).push(key, Arc::clone(owned), tile.clone());
+            r.trim();
+            tile
+        };
+        if fx == 0 && fy == 0 {
+            return fetch(first_tile);
+        }
+        let mut out: Option<Tile> = None;
+        for ty in first_tile.y..=first_tile.y + 1 {
+            for tx in first_tile.x..=first_tile.x + 1 {
+                let Some(source) = fetch(TileCoord::new(tx, ty)) else { continue };
+                let (sx, sy) = (tx * size, ty * size);
+                let (ix0, iy0) = (x0.max(sx), y0.max(sy));
+                let (ix1, iy1) = ((x0 + size).min(sx + size), (y0 + size).min(sy + size));
+                if ix0 >= ix1 || iy0 >= iy1 {
+                    continue;
+                }
+                let width = (ix1 - ix0) as usize * 4;
+                let target = out.get_or_insert_with(|| TileBuf::filled([0; 4]));
+                for y in iy0..iy1 {
+                    let src = ((y - sy) * size + (ix0 - sx)) as usize * 4;
+                    let dst = ((y - y0) * size + (ix0 - x0)) as usize * 4;
+                    target.bytes_mut()[dst..dst + width].copy_from_slice(&source.bytes()[src..src + width]);
+                }
+            }
+        }
+        out.map(Arc::new)
+    }
+
+    /// Un groupe peut être composé à part puis posé d'un bloc, sans rien changer à l'image, si tout ce qu'il
+    /// contient se fond normalement (voir [`Self::blendable`]) et qu'il y a au moins deux calques à composer (sinon
+    /// il n'y a rien à gagner). Ses propres opacité et masque sont appliqués après : ils ne comptent pas.
+    fn flattenable(&self, group: &Layer) -> bool {
+        self.blendable(group.children()).is_some_and(|drawn| drawn >= 2)
+    }
+
+    /// Nombre de calques à dessiner dans `ids` (sous-groupes compris) si tout s'y fond normalement : pas de réglage
+    /// (il corrigerait l'image dessous), pas de mode de fusion autre que Normal, pas d'effet fondu dans l'image
+    /// dessous, des sous-groupes en Normal ou en Transfert sans opacité ni masque (sinon ils mélangent avec ce qui
+    /// est sous eux), et pas de calque de remplissage : il couvre toujours le document, son rendu dans le repère du
+    /// groupe change donc à chaque déplacement (on fige alors le reste du groupe, voir [`Self::cacheable_run`]).
+    /// `None` sinon. Un sous-groupe d'un seul calque ne l'empêche pas (auparavant, il rendait tout le groupe
+    /// inaplatissable).
+    fn blendable(&self, ids: &[LayerId]) -> Option<usize> {
+        let mut drawn = 0usize;
+        let mut stack: Vec<LayerId> = ids.to_vec();
+        while let Some(id) = stack.pop() {
+            let Some(layer) = self.layer(id) else { continue };
+            if !layer.props.visible {
+                continue;
+            }
+            if layer.is_group() {
+                let plain = self.opacity(layer) >= 1.0 && layer.mask.as_ref().is_none_or(|m| !m.enabled);
+                if layer.props.range().is_some() {
+                    return None;
+                }
+                match layer.props.blend {
+                    BlendMode::Normal => {}
+                    BlendMode::PassThrough if plain => {}
+                    _ => return None,
+                }
+                stack.extend_from_slice(layer.children());
+                continue;
+            }
+            if layer.adjustment().is_some() || layer.props.blend != BlendMode::Normal || layer.props.range().is_some() || layer.fill_content().is_some() {
+                return None;
+            }
+            if layer.effects.iter().any(|e| e.enabled() && e.blend() != BlendMode::Normal) {
+                return None;
+            }
+            drawn += 1;
+        }
+        Some(drawn)
+    }
+
+    /// La plus longue série de frères consécutifs de `ids` qui se fige (voir [`Self::blendable`]), avec au moins deux
+    /// calques à dessiner : `(début, fin)`, fin exclue. Un calque écrêté reste avec sa base. Sert aux groupes qui
+    /// ne se figent pas en entier — un calque de réglage au-dessus, un remplissage en fond, un calque en Produit :
+    /// tout le reste du groupe est figé, seul ce calque-là est composé à chaque fois.
+    fn cacheable_run(&self, ids: &[LayerId]) -> Option<(usize, usize)> {
+        let mut best: Option<(usize, usize, usize)> = None;
+        let mut run: Option<(usize, usize)> = None; // début, calques dessinés
+        let close = |run: Option<(usize, usize)>, end: usize, best: &mut Option<(usize, usize, usize)>| {
+            if let Some((start, drawn)) = run {
+                if drawn >= 2 && best.is_none_or(|(_, _, d)| drawn > d) {
+                    *best = Some((start, end, drawn));
+                }
+            }
+        };
+        let mut i = 0;
+        while i < ids.len() {
+            let mut end = i + 1;
+            while end < ids.len() && self.layer(ids[end]).is_some_and(|l| l.props.clipped) {
+                end += 1;
+            }
+            match self.blendable(&ids[i..end]) {
+                Some(drawn) => run = Some(run.map_or((i, drawn), |(start, d)| (start, d + drawn))),
+                None => {
+                    close(run, i, &mut best);
+                    run = None;
+                }
+            }
+            i = end;
+        }
+        close(run, ids.len(), &mut best);
+        best.map(|(start, end, _)| (start, end))
+    }
+
+    /// Compose les enfants d'un groupe dans `target`, en reprenant du cache la plus longue série qui se fige
+    /// (voir [`Self::cacheable_run`]) : ce qui est dessous est composé, la série posée d'un bloc en mode Normal (la
+    /// fusion normale est associative : même image), puis ce qui est dessus composé par-dessus.
+    fn composite_children(&self, group: &Layer, target: u16, builder: &mut Builder) {
+        let ids = group.children();
+        let run = if self.include.is_some() || self.replace.is_some() || self.opaque.is_some() { None } else { self.cacheable_run(ids) };
+        let Some((start, end)) = run else {
+            self.composite_list(ids, target, builder);
+            return;
+        };
+        self.composite_list(&ids[..start], target, builder);
+        let key = if start == 0 && end == ids.len() { group.id } else { ids[start] };
+        if let Some(tile) = self.flat_run(group, &ids[start..end], key) {
+            builder.push(Op::Blend { target, source: Source::Tile(tile), mode: BlendMode::Normal, opacity: 1.0, mask: Coverage::Uniform(1.0), range: None });
+        }
+        self.composite_list(&ids[end..], target, builder);
+    }
+
+    /// Empreinte du contenu d'une série de calques, positions relatives à `origin` : deux empreintes égales donnent
+    /// la même composition, où que soit le groupe.
+    fn fingerprint<'d>(doc: &'d Document, ids: &[LayerId], origin: (i32, i32), out: &mut Vec<PrintRef<'d>>) {
+        for id in ids {
+            let Ok(layer) = doc.layer(*id) else { continue };
+            let p = &layer.props;
+            out.push(Print {
+                id: layer.id,
+                at: (layer.offset.0 - origin.0, layer.offset.1 - origin.1),
+                visible: p.visible,
+                blend: p.blend,
+                opacity: p.opacity.to_bits(),
+                fill: p.fill.to_bits(),
+                clipped: p.clipped,
+                range: p.range(),
+                pixels: layer.pixels().map(|store| store.version()),
+                mask: layer.mask.as_ref().map(|m| (m.pixels.version(), m.enabled)),
+                effects: layer.effects.as_slice(),
+                children: layer.children().len(),
+            });
+            if layer.is_group() {
+                Self::fingerprint(doc, layer.children(), origin, out);
+            }
+        }
     }
 
     /// Traduit l'arbre des calques en programme de composition pour cette tuile.
@@ -554,11 +1268,11 @@ impl Pass<'_> {
         let r = self.renderer;
         let pixels = layer.pixels()?;
         if !crate::effects::any_enabled(&layer.effects) {
-            return gather(&r.caches.pixel_mips, &r.generation, self.generation, pixels, layer.id, layer.offset, self.level, self.coord);
+            return gather(&r.caches.pixel_mips, &r.generation, self.generation, pixels, layer.id, self.at(layer.offset), self.level, self.coord);
         }
         // Calque à effets : le compositeur travaille sur le calque stylé, pas sur les pixels bruts.
         let styled = r.styled_store(layer.id, pixels, &layer.effects);
-        gather(&r.caches.pixel_mips, &r.generation, self.generation, &styled, layer.id, layer.offset, self.level, self.coord)
+        gather(&r.caches.pixel_mips, &r.generation, self.generation, &styled, layer.id, self.at(layer.offset), self.level, self.coord)
     }
 
     /// Effets du dessous de ce calque qui se fondent dans l'image avec leur propre mode : (mode, tuile).
@@ -580,7 +1294,7 @@ impl Pass<'_> {
             .enumerate()
             .filter_map(|(rank, (mode, store))| {
                 let key = layer.id | UNDERLAY | (((first + rank as LayerId) & 0xFF) << UNDERLAY_SHIFT);
-                gather(&r.caches.pixel_mips, &r.generation, self.generation, store, key, layer.offset, self.level, self.coord).map(|tile| (*mode, tile))
+                gather(&r.caches.pixel_mips, &r.generation, self.generation, store, key, self.at(layer.offset), self.level, self.coord).map(|tile| (*mode, tile))
             })
             .collect()
     }
@@ -589,13 +1303,13 @@ impl Pass<'_> {
     /// ombre portée ni à sa lueur : c'est cet alpha-là qui sert de gabarit.
     fn raw_pixels(&self, layer: &Layer) -> Option<Arc<Tile>> {
         let r = self.renderer;
-        gather(&r.caches.pixel_mips, &r.generation, self.generation, layer.pixels()?, layer.id | RAW_PIXELS, layer.offset, self.level, self.coord)
+        gather(&r.caches.pixel_mips, &r.generation, self.generation, layer.pixels()?, layer.id | RAW_PIXELS, self.at(layer.offset), self.level, self.coord)
     }
 
     fn mask_factor(&self, layer: &Layer) -> Coverage {
         let Some(mask) = layer.mask.as_ref().filter(|m| m.enabled) else { return Coverage::Uniform(1.0) };
         let r = self.renderer;
-        match gather(&r.caches.mask_mips, &r.generation, self.generation, &mask.pixels, layer.id, layer.offset, self.level, self.coord) {
+        match gather(&r.caches.mask_mips, &r.generation, self.generation, &mask.pixels, layer.id, self.at(layer.offset), self.level, self.coord) {
             Some(tile) => Coverage::Mask(tile),
             None => Coverage::Uniform(f32::from(mask.pixels.background()[0]) / 255.0),
         }
@@ -608,7 +1322,7 @@ impl Pass<'_> {
         let mut found: Option<Arc<Tile>> = None;
         for (_, layer) in self.doc.walk_top_down() {
             let p = &layer.props;
-            let plain = p.visible && self.opacity(layer) >= 1.0 && !p.clipped && layer.mask.is_none();
+            let plain = p.visible && self.opacity(layer) >= 1.0 && !p.clipped && layer.mask.is_none() && p.range().is_none();
             if layer.is_group() {
                 if !(plain && matches!(p.blend, BlendMode::PassThrough | BlendMode::Normal)) {
                     return None;
@@ -618,6 +1332,10 @@ impl Pass<'_> {
             // Un calque de réglage visible modifie l'image : pas de raccourci possible.
             if layer.adjustment().is_some() && p.visible {
                 return None;
+            }
+            // Calque masqué : il ne compte pas, et ses pixels (réductions, effets) n'ont pas à être calculés.
+            if !p.visible {
+                continue;
             }
             let Some(tile) = self.pixels(layer) else { continue };
             if !plain || p.blend != BlendMode::Normal || found.is_some() {
@@ -697,11 +1415,11 @@ impl Pass<'_> {
             // sous le calque (avec l'opacité et le masque du calque, comme ses autres effets), puis le calque vient.
             let fuse = |parts: Vec<(BlendMode, Arc<Tile>)>, builder: &mut Builder| {
                 for (mode, tile) in parts {
-                    builder.push(Op::Blend { target, source: Source::Tile(tile), mode, opacity: base.props.opacity, mask: self.mask_factor(base) });
+                    builder.push(Op::Blend { target, source: Source::Tile(tile), mode, opacity: base.props.opacity, mask: self.mask_factor(base), range: None });
                 }
             };
             fuse(self.underlays(base), builder);
-            builder.push(Op::Blend { target, source: content, mode: base.props.blend, opacity: self.opacity(base), mask: self.mask_factor(base) });
+            builder.push(Op::Blend { target, source: content, mode: base.props.blend, opacity: self.opacity(base), mask: self.mask_factor(base), range: base.props.range() });
             // Effets du dessus dans un autre mode que Normal (contour en Incrustation…) : ils se fondent, là où ils
             // sont dessinés, dans tout ce qui est dessous — le calque et l'image.
             fuse(self.effect_parts(base, true), builder);
@@ -715,12 +1433,16 @@ impl Pass<'_> {
     /// (tampon à rendre au constructeur une fois utilisé).
     fn content(&self, layer: &Layer, builder: &mut Builder) -> Option<(Source, Option<u16>)> {
         match &layer.kind {
-            LayerKind::Pixel { .. } | LayerKind::Text { .. } | LayerKind::Shape { .. } | LayerKind::Smart { .. } => self.pixels(layer).map(|tile| (Source::Tile(tile), None)),
+            LayerKind::Pixel { .. } | LayerKind::Text { .. } | LayerKind::Shape { .. } | LayerKind::Smart { .. } | LayerKind::Fill { .. } => self.pixels(layer).map(|tile| (Source::Tile(tile), None)),
             LayerKind::Adjustment { .. } => None,
-            LayerKind::Group { children, .. } => {
+            LayerKind::Group { .. } => {
+                // Contenu figé du groupe (voir `flat_run`) : une seule tuile au lieu de toute sa pile.
+                if let Some(flat) = self.flat_group(layer) {
+                    return flat.map(|tile| (Source::Tile(tile), None));
+                }
                 let buffer = builder.take();
                 builder.push(Op::Clear { target: buffer });
-                self.composite_list(children, buffer, builder);
+                self.composite_children(layer, buffer, builder);
                 Some((Source::Buffer(buffer), Some(buffer)))
             }
         }
@@ -730,13 +1452,20 @@ impl Pass<'_> {
         let opacity = self.opacity(group);
         let mask = self.mask_factor(group);
         if opacity >= 1.0 && matches!(mask, Coverage::Uniform(v) if v >= 1.0) {
-            self.composite_list(group.children(), target, builder);
+            // Groupe ordinaire de calques normaux : le composer d'abord à part puis le poser par-dessus donne
+            // la même image (la fusion normale est associative), et ce contenu figé se réutilise tel quel
+            // quand le groupe entier se déplace.
+            match self.flat_group(group) {
+                Some(Some(tile)) => builder.push(Op::Blend { target, source: Source::Tile(tile), mode: BlendMode::Normal, opacity: 1.0, mask: Coverage::Uniform(1.0), range: None }),
+                Some(None) => {}
+                None => self.composite_children(group, target, builder),
+            }
             return;
         }
         // Opacité ou masque : le groupe interpole entre l'image d'avant et celle d'après.
         let before = builder.take();
         builder.push(Op::Copy { target: before, source: target });
-        self.composite_list(group.children(), target, builder);
+        self.composite_children(group, target, builder);
         builder.mix(target, before, opacity, mask);
         builder.release(before);
     }
@@ -765,11 +1494,80 @@ impl Pass<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Les tables comptées suivent exactement leurs entrées remplies, quelles que soient les opérations.
+    #[test]
+    fn counted_tables_track_their_filled_entries() {
+        let mut table: Counted<u32, Arc<Tile>> = Counted::default();
+        let tile = || Some(Arc::new(Tile::transparent()));
+        table.insert(1, tile());
+        table.insert(2, None);
+        table.insert(3, tile());
+        table.insert(1, tile()); // remplacement : toujours une seule entrée
+        table.insert(3, None); // vidée
+        assert_eq!(table.filled(), 1);
+        table.remove(&2);
+        table.remove(&9);
+        table.insert(4, tile());
+        table.retain(|key, _| *key != 1);
+        assert_eq!(table.filled(), 1);
+        assert_eq!(table.len(), 2);
+        table.clear();
+        assert_eq!(table.filled(), 0);
+
+        let mut groups = CountedGroups::default();
+        let key = (1, 1, 0, TileCoord::new(0, 0));
+        let probe = |n: usize| vec![PrintRef { id: n as LayerId, at: (0, 0), visible: true, blend: BlendMode::Normal, opacity: 255, fill: 255, clipped: false, range: None, pixels: None, mask: None, effects: &[], children: 0 }];
+        let print = |n: usize| Arc::new(probe(n).iter().map(PrintRef::to_owned).collect::<Vec<Print>>());
+        for n in 0..GROUP_VERSIONS + 2 {
+            groups.push(key, print(n), if n == 1 { None } else { tile() });
+        }
+        let kept: usize = groups.get(&key).expect("versions").iter().filter(|(_, t)| t.is_some()).count();
+        assert_eq!(groups.get(&key).expect("versions").len(), GROUP_VERSIONS);
+        assert_eq!(groups.filled(), kept);
+        assert!(groups.find(&key, &probe(GROUP_VERSIONS + 1)).is_some());
+        assert!(groups.find(&key, &probe(0)).is_none(), "version trop ancienne, partie");
+        groups.retain(|_, _| false);
+        assert_eq!(groups.filled(), 0);
+    }
     use crate::document::Background;
     use crate::plan::TILE_PIXELS;
-    use crate::tiles::TileStore;
+    use crate::tiles::{Sampler, TileStore};
 
     const ORIGIN: TileCoord = TileCoord::new(0, 0);
+
+    #[test]
+    fn a_layer_thumbnail_is_framed_on_its_artboard() {
+        use crate::document::Artboard;
+        let mut d = Document::new("plans", 100, 100, 72.0).expect("document");
+        let board = |x, y, w, h| Artboard { x, y, width: w, height: h, background: Some([255, 255, 255]), clip: true, preset: None, background_layer: None };
+        let a = d.add_artboard("A", board(0, 0, 1200, 600)).expect("plan");
+        let b = d.add_artboard("B", board(1300, 0, 400, 300)).expect("plan");
+        d.fit_to_artboards().expect("ajuster");
+        assert_eq!((d.width(), d.height()), (1700, 600));
+        // Calque rouge à gauche du plan A, masque qui ne laisse voir que sa moitié gauche.
+        let mut rgba = vec![0u8; 300 * 600 * 4];
+        rgba.chunks_exact_mut(4).for_each(|p| p.copy_from_slice(&[255, 0, 0, 255]));
+        let red = d.add_pixel_layer("Rouge", TileStore::from_premultiplied(300, 600, &rgba).expect("tampon"), Some(a), 1).expect("calque");
+        d.add_mask(red, true).expect("masque");
+        let renderer = TileRenderer::new();
+        let level = TileRenderer::max_level(&d);
+        let step = 1u32 << level;
+        // Calque du plan A : cadré sur A (1200 × 600), le rouge occupe son quart gauche.
+        let (w, h, px) = renderer.board_thumbnail(&d, red, false).expect("miniature");
+        assert_eq!((w, h), (1200u32.div_ceil(step), 600u32.div_ceil(step)));
+        assert_eq!(&px[0..4], &[255, 0, 0, 255]);
+        assert_eq!(px[((w - 1) * 4 + 3) as usize], 0, "à droite du calque");
+        let (_, _, mask) = renderer.board_thumbnail(&d, red, true).expect("masque");
+        assert!(mask.chunks_exact(4).all(|p| p[0] == 255), "masque tout blanc");
+        // Fond du plan B : cadré sur B, blanc partout, masque blanc.
+        let bg = d.layer(b).expect("plan").artboard.as_ref().and_then(|x| x.background_layer).expect("fond");
+        let (w, h, px) = renderer.board_thumbnail(&d, bg, false).expect("fond");
+        assert_eq!((w, h), (400u32.div_ceil(step), 300u32.div_ceil(step)));
+        assert!(px.chunks_exact(4).all(|p| p == [255, 255, 255, 255]), "fond blanc");
+        let (_, _, mask) = renderer.board_thumbnail(&d, bg, true).expect("masque du fond");
+        assert!(mask.chunks_exact(4).all(|p| p[0] == 255), "masque du fond blanc");
+    }
 
     fn white_doc() -> Document {
         Document::with_background("x", 256, 256, 72.0, Background::White).expect("document")
@@ -785,6 +1583,193 @@ mod tests {
 
     fn render(doc: &Document) -> [u8; 4] {
         TileRenderer::new().tile(doc, 0, ORIGIN).map_or([0; 4], |t| t.pixel(10, 10))
+    }
+
+    /// Composition de référence, sans contenu figé des groupes (un filtre `include` le désactive).
+    fn reference(doc: &Document, level: u8, coord: TileCoord) -> Option<Arc<Tile>> {
+        let r = TileRenderer::new();
+        let all = |_: LayerId| true;
+        Pass { renderer: &r, doc, level, coord, generation: 0, include: Some(&all), opaque: None, replace: None, shift: (0, 0) }.run()
+    }
+
+    /// Au niveau 0, la composition par groupe figé est exacte (à l'arrondi près). Aux niveaux réduits, chaque
+    /// position est arrondie au pixel de mip le plus proche, relativement au groupe : un calque peut s'y
+    /// trouver décalé d'un pixel de mip, d'où une tolérance sur une petite part des pixels (les bords).
+    fn assert_close(a: Option<Arc<Tile>>, b: Option<Arc<Tile>>, level: u8, what: &str) {
+        let (a, b) = (a.map(|t| t.bytes().to_vec()).unwrap_or_default(), b.map(|t| t.bytes().to_vec()).unwrap_or_default());
+        if a.is_empty() || b.is_empty() {
+            assert!(a.iter().chain(b.iter()).all(|v| *v <= 2), "{what} : une tuile vide, l'autre non");
+            return;
+        }
+        if level == 0 {
+            let worst = a.iter().zip(&b).map(|(x, y)| x.abs_diff(*y)).max().unwrap_or(0);
+            assert!(worst <= 2, "{what} : écart {worst}");
+        } else {
+            let off = a.iter().zip(&b).filter(|(x, y)| x.abs_diff(**y) > 2).count();
+            assert!(off * 100 <= a.len() * 6, "{what} : {off} valeurs sur {} s'écartent", a.len());
+        }
+    }
+
+    #[test]
+    fn a_group_moved_as_a_block_reuses_its_composed_content_and_renders_the_same() {
+        let mut doc = Document::with_background("x", 700, 520, 72.0, Background::White).expect("document");
+        let group = doc.add_group("G", None, 1).expect("groupe");
+        let nested = doc.add_group("N", Some(group), 0).expect("sous-groupe");
+        let mut ids = Vec::new();
+        for (k, parent) in [Some(group), Some(group), Some(nested), Some(nested)].into_iter().enumerate() {
+            let (w, h) = (300u32, 220u32);
+            let mut rgba = vec![0u8; (w * h * 4) as usize];
+            for (i, px) in rgba.chunks_exact_mut(4).enumerate() {
+                let (x, y) = (i as u32 % w, i as u32 / w);
+                let a = if (x / 20 + y / 20 + k as u32) % 2 == 0 { 255 } else { 120 };
+                let c = |v: u32| (v * a / 255) as u8;
+                px.copy_from_slice(&[c(40 + 50 * k as u32), c(x % 200), c(y % 200), a as u8]);
+            }
+            let store = TileStore::from_premultiplied(w, h, &rgba).expect("tampon").translated(37 + 61 * k as i32, 29 + 43 * k as i32);
+            let index = doc.children_of(parent).expect("parent").len();
+            ids.push(doc.add_pixel_layer("c", store, parent, index).expect("calque"));
+        }
+        doc.edit_props(ids[1], |p| p.opacity = 0.6).expect("opacité");
+        let renderer = TileRenderer::new();
+        let coords = |doc: &Document, level: u8| {
+            let size = TILE_SIZE as u32;
+            let (w, h) = ((doc.width() >> level).max(1).div_ceil(size), (doc.height() >> level).max(1).div_ceil(size));
+            (0..h).flat_map(move |y| (0..w).map(move |x| TileCoord::new(x as i32, y as i32))).collect::<Vec<_>>()
+        };
+        let check = |doc: &Document, renderer: &TileRenderer, what: &str| {
+            for level in 0..=TileRenderer::max_level(doc) {
+                for coord in coords(doc, level) {
+                    assert_close(renderer.tile(doc, level, coord), reference(doc, level, coord), level, &format!("{what}, niveau {level}, {coord:?}"));
+                }
+            }
+        };
+        check(&doc, &renderer, "avant");
+        let filled = |r: &TileRenderer| lock(&r.caches.groups).iter().filter_map(|(k, versions)| versions.first().and_then(|(_, t)| t.clone()).map(|t| (*k, t))).collect::<HashMap<_, _>>();
+        let before = filled(&renderer);
+        assert!(!before.is_empty(), "le contenu du groupe est figé");
+        // Déplacement du groupe entier, de biais : les tuiles figées sont reprises telles quelles.
+        doc.translate_layers(&[group], 23, -11).expect("déplacement");
+        renderer.invalidate_composites();
+        check(&doc, &renderer, "après déplacement");
+        let after = filled(&renderer);
+        for (key, tile) in &before {
+            assert!(after.get(key).is_some_and(|t| Arc::ptr_eq(t, tile)), "tuile figée {key:?} recalculée");
+        }
+        // Un calque du groupe déplacé seul : l'empreinte change, le contenu est recomposé et reste juste.
+        doc.translate_layers(&[ids[2]], 40, 5).expect("déplacement d'un calque");
+        renderer.invalidate_composites();
+        check(&doc, &renderer, "après déplacement d'un calque du groupe");
+        // Un mode de fusion dans le groupe : plus de contenu figé, toujours la même image.
+        doc.edit_props(ids[0], |p| p.blend = BlendMode::Multiply).expect("mode");
+        renderer.invalidate_composites();
+        check(&doc, &renderer, "avec un mode Produit dans le groupe");
+    }
+
+    /// Groupe qui ne se fige pas en entier (remplissage en fond, réglage au-dessus, calque en Produit, en Transfert
+    /// ou isolé, avec opacité) : le reste est figé et repris quand le groupe se déplace, puis après Ctrl+Z, et
+    /// l'image reste celle de la composition calque par calque.
+    #[test]
+    fn a_partly_flattenable_group_keeps_the_rest_cached_through_moves_and_undo() {
+        use crate::session::Session;
+        let layer = |doc: &mut Document, parent: LayerId, k: i32| {
+            let (w, h) = (260u32, 200u32);
+            let rgba: Vec<u8> = (0..w * h)
+                .flat_map(|i| {
+                    let (x, y) = (i % w, i / w);
+                    let a = if (x / 16 + y / 16 + k as u32) % 2 == 0 { 255 } else { 140 };
+                    let c = |v: u32| (v * a / 255) as u8;
+                    [c(30 + 40 * k as u32), c(x % 220), c(y % 220), a as u8]
+                })
+                .collect();
+            let store = TileStore::from_premultiplied(w, h, &rgba).expect("tampon").translated(40 + 70 * k, 30 + 50 * k);
+            let index = doc.children_of(Some(parent)).expect("parent").len();
+            doc.add_pixel_layer("c", store, Some(parent), index).expect("calque")
+        };
+        type Setup = fn(&mut Document, LayerId, &dyn Fn(&mut Document, LayerId, i32) -> LayerId);
+        let cases: [(&str, Setup); 4] = [
+            ("remplissage en fond", |doc, g, add| {
+                doc.add_fill_layer(crate::fill::FillContent::SolidColor { color: [210, 200, 40] }, "f", Some(g), 0).expect("remplissage");
+                for k in 0..3 {
+                    add(doc, g, k);
+                }
+            }),
+            ("réglage au-dessus", |doc, g, add| {
+                for k in 0..3 {
+                    add(doc, g, k);
+                }
+                let index = doc.children_of(Some(g)).expect("parent").len();
+                doc.add_adjustment_layer(crate::adjust::Adjustment::Invert, Some(g), index, false).expect("réglage");
+            }),
+            ("Produit au milieu, groupe isolé à 70 %", |doc, g, add| {
+                add(doc, g, 0);
+                let mid = add(doc, g, 1);
+                doc.edit_props(mid, |p| p.blend = BlendMode::Multiply).expect("mode");
+                for k in 2..5 {
+                    add(doc, g, k);
+                }
+                doc.edit_props(g, |p| {
+                    p.blend = BlendMode::Normal;
+                    p.opacity = 0.7;
+                })
+                .expect("groupe");
+            }),
+            ("sous-groupes d'un seul calque", |doc, g, add| {
+                for _ in 0..3 {
+                    let index = doc.children_of(Some(g)).expect("parent").len();
+                    let sub = doc.add_group("s", Some(g), index).expect("sous-groupe");
+                    add(doc, sub, index as i32);
+                }
+            }),
+        ];
+        for (name, setup) in cases {
+            let mut doc = Document::with_background("x", 700, 520, 72.0, Background::White).expect("document");
+            let group = doc.add_group("G", None, 1).expect("groupe");
+            setup(&mut doc, group, &layer);
+            let mut session = Session::new(doc, "Ouvrir");
+            let render_all = |s: &Session, what: &str| {
+                let doc = s.document();
+                for level in 0..=1u8 {
+                    let size = TILE_SIZE as u32;
+                    let (w, h) = ((doc.width() >> level).div_ceil(size), (doc.height() >> level).div_ceil(size));
+                    for y in 0..h {
+                        for x in 0..w {
+                            let coord = TileCoord::new(x as i32, y as i32);
+                            assert_close(s.renderer().tile(doc, level, coord), reference(doc, level, coord), level, &format!("{name}, {what}, niveau {level}, {coord:?}"));
+                        }
+                    }
+                }
+            };
+            let cached = |s: &Session| lock(&s.renderer().caches.groups).iter().flat_map(|(k, v)| v.iter().filter_map(move |(_, t)| t.clone().map(|t| (*k, Arc::as_ptr(&t) as usize)))).collect::<std::collections::HashSet<_>>();
+            render_all(&session, "au départ");
+            let first = cached(&session);
+            assert!(!first.is_empty(), "{name} : une partie du groupe est figée");
+            session.apply_gesture("Déplacer", "g1".into(), |d| d.translate_layers(&[group], 37, 21)).expect("déplacement");
+            session.renderer().invalidate_composites();
+            render_all(&session, "après déplacement");
+            let moved = cached(&session);
+            assert!(first.iter().all(|t| moved.contains(t)), "{name} : contenu figé gardé au déplacement");
+            session.undo();
+            session.renderer().invalidate_composites();
+            render_all(&session, "après Ctrl+Z");
+            session.apply_gesture("Déplacer", "g2".into(), |d| d.translate_layers(&[group], -15, 40)).expect("déplacement");
+            session.renderer().invalidate_composites();
+            render_all(&session, "après un autre déplacement");
+            assert_eq!(cached(&session).len(), first.len(), "{name} : rien n'a été recomposé");
+        }
+    }
+
+    /// Un état d'historique relu du disque de travail (nouveaux stockages, mêmes pixels) retrouve le contenu figé
+    /// de ses groupes : la version du contenu fait foi, pas l'adresse.
+    #[test]
+    fn a_store_keeps_its_version_through_clone_and_changes_it_on_write() {
+        let mut a = TileStore::new();
+        a.fill(300, 300, [10, 20, 30, 255]);
+        let b = a.clone();
+        assert_eq!(a.version(), b.version());
+        let mut c = b.clone();
+        c.get_mut(ORIGIN).set_pixel(0, 0, [1, 2, 3, 255]);
+        assert_ne!(c.version(), b.version());
+        assert_ne!(TileStore::new().version(), TileStore::new().version());
     }
 
     #[test]
@@ -815,6 +1800,27 @@ mod tests {
         assert_eq!(render(&doc), [191, 191, 191, 255], "opacité et fond se multiplient");
         doc.edit_props(black, |p| p.visible = false).expect("visibilité");
         assert_eq!(render(&doc), [255; 4]);
+    }
+
+    /// Comparaison : le calque disparaît là où sa valeur ou celle du dessous sort des plages, et apparaît en fondu
+    /// entre les deux moitiés d'un triangle scindé. Une plage entière n'est pas gardée.
+    #[test]
+    fn blend_if_hides_by_this_layer_and_by_the_layer_below() {
+        use crate::blend::{BlendIf, BlendIfChannel};
+        let mut doc = white_doc();
+        let top = add_fill(&mut doc, None, [100, 100, 100, 255]);
+        let range = |this, under| Some(BlendIf { channel: BlendIfChannel::Gray, this, under });
+        doc.edit_props(top, |p| p.blend_if = range([0, 0, 90, 90], [0, 0, 255, 255])).expect("comparaison");
+        assert_eq!(render(&doc), [255; 4], "gris 100 au-dessus du blanc 90 : caché");
+        doc.edit_props(top, |p| p.blend_if = range([0, 0, 255, 255], [0, 0, 200, 200])).expect("comparaison");
+        assert_eq!(render(&doc), [255; 4], "dessous blanc hors plage : le calque disparaît");
+        doc.edit_props(top, |p| p.blend_if = range([50, 150, 255, 255], [0, 0, 255, 255])).expect("comparaison");
+        assert_eq!(render(&doc), [178, 178, 178, 255], "fondu à moitié (100 entre 50 et 150)");
+        doc.edit_props(top, |p| p.blend_if = range([0, 0, 255, 255], [0, 0, 255, 255])).expect("comparaison");
+        assert_eq!(doc.layer(top).expect("calque").props.blend_if, None, "plages entières : rien de gardé");
+        assert_eq!(render(&doc), [100, 100, 100, 255]);
+        doc.edit_props(top, |p| p.blend_if = Some(BlendIf { channel: BlendIfChannel::Red, this: [120, 120, 255, 255], under: [0, 0, 255, 255] })).expect("rouge");
+        assert_eq!(render(&doc), [255; 4], "rouge 100 sous 120 : caché");
     }
 
     #[test]
@@ -1114,6 +2120,37 @@ mod tests {
         assert_eq!(renderer.tile(&doc, 0, ORIGIN).expect("tuile").pixel(84, 84), [255; 4]);
     }
 
+    /// Pendant un trait, les effets ne sont recalculés qu'autour des tuiles peintes : le rendu est celui d'un
+    /// calcul complet (à l'arrondi du flou près), et la tuile où rien n'a changé garde ses pixels partagés.
+    #[test]
+    fn effects_are_restyled_locally_around_changed_tiles() {
+        let mut doc = Document::with_background("x", 1024, 512, 72.0, crate::document::Background::White).expect("document");
+        let mut pixels = TileStore::new();
+        pixels.get_mut(ORIGIN).set_pixel(40, 40, [0, 0, 255, 255]);
+        pixels.get_mut(TileCoord::new(3, 1)).set_pixel(100, 100, [0, 0, 255, 255]);
+        let layer = doc.add_pixel_layer("calque", pixels, None, 1).expect("calque");
+        let effects = vec![LayerEffect::DropShadow { enabled: true, color: [0, 0, 0], opacity: 1.0, angle: 135.0, distance: 8.0, size: 6.0, blend: BlendMode::Normal }, LayerEffect::OuterGlow { enabled: true, color: [255, 0, 0], opacity: 0.8, size: 10.0, blend: BlendMode::Normal }];
+        doc.set_effects(layer, effects).expect("effets");
+        let renderer = TileRenderer::new();
+        let before = renderer.styled_layer(doc.layer(layer).expect("calque")).expect("stylé");
+        // Un trait sur la première tuile seulement.
+        doc.pixels_mut(layer).expect("pixels").get_mut(ORIGIN).set_pixel(200, 60, [0, 0, 255, 255]);
+        renderer.invalidate_tiles(&doc, layer, false, &[ORIGIN]);
+        let local = renderer.styled_layer(doc.layer(layer).expect("calque")).expect("stylé");
+        let full = TileRenderer::new().styled_layer(doc.layer(layer).expect("calque")).expect("stylé");
+        assert!(!Arc::ptr_eq(&local.main, &before.main));
+        assert!(Arc::ptr_eq(local.main.get(TileCoord::new(3, 1)).expect("tuile"), before.main.get(TileCoord::new(3, 1)).expect("tuile")), "tuile loin du trait : gardée telle quelle");
+        let (mut a, mut b) = (Sampler::new(&local.main), Sampler::new(&full.main));
+        for y in -40..300 {
+            for x in -40..560 {
+                let (p, q) = (a.get(x, y), b.get(x, y));
+                assert!(p.iter().zip(q).all(|(u, v)| (i32::from(*u) - i32::from(v)).abs() <= 2), "({x}, {y}) : local {p:?}, complet {q:?}");
+            }
+        }
+        assert_eq!(a.get(200, 60), [0, 0, 255, 255]);
+        assert!(a.get(206, 66)[3] > 0, "ombre du nouveau pixel");
+    }
+
     #[test]
     fn the_cache_budget_bounds_memory_without_changing_the_picture() {
         let doc = Document::with_background("x", 2048, 2048, 72.0, crate::document::Background::White).expect("document");
@@ -1150,7 +2187,7 @@ mod tests {
         let unlimited = render_all();
         let own = renderer.cache_bytes();
         assert!(own >= 64 * 256 * 1024, "sans plafond, tout reste en cache");
-        let others = crate::tiles::resident_bytes() - own;
+        let others = crate::tiles::resident_bytes().saturating_sub(own);
         let cap = others + 4 * 1024 * 1024;
         let budget = cache_budget_under(cap, 0, others);
         assert_eq!(budget, MIN_CACHE_BUDGET.max(4 * 1024 * 1024), "la marge sous le plafond, au moins le minimum");

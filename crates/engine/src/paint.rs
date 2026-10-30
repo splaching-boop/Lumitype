@@ -16,7 +16,7 @@ use std::collections::BTreeSet;
 use rayon::prelude::*;
 use std::sync::Arc;
 
-use crate::brushes::BrushTip;
+use crate::brushes::{BrushPattern, BrushTip, TipBlend};
 use crate::document::{Document, LayerId};
 use crate::error::EngineError;
 use crate::pixel::{mul_div_255, premultiply};
@@ -95,6 +95,96 @@ pub struct BrushDynamics {
     /// Mélangeur : étirement des couleurs (0 à 1). Plus il est fort, plus les couleurs ramassées
     /// sont traînées loin avant de céder la place à celles que le pinceau rencontre.
     pub stretch: f32,
+    /// Rondeur de la pointe (0 à 1 ; 0 = ronde, c'est-à-dire 1) : écrasée dans sa hauteur avant d'être tournée.
+    pub roundness: f32,
+    /// Variation aléatoire de la rondeur (0 à 1), sans descendre sous `min_roundness`.
+    pub roundness_jitter: f32,
+    pub min_roundness: f32,
+    /// Pointe retournée horizontalement, verticalement.
+    pub flip_x: bool,
+    pub flip_y: bool,
+    /// Diamètre minimal sous faible pression (fraction du diamètre ; pression → taille).
+    pub min_size: f32,
+    /// Dispersion seulement perpendiculaire au trait (sinon dans toutes les directions), et nombre d'empreintes par pas.
+    pub scatter_perpendicular: bool,
+    pub count: u32,
+    /// Variations aléatoires d'opacité et de flux de chaque empreinte (0 à 1).
+    pub opacity_jitter: f32,
+    pub flow_jitter: f32,
+    /// La pression module aussi le flux de chaque empreinte.
+    pub pressure_flow: bool,
+}
+
+/// Pinceau double : seconde pointe tamponnée le long du trait ; la couverture finale combine les deux (`mode`).
+#[derive(Clone, Debug)]
+pub struct DualBrush {
+    pub tip: Arc<BrushTip>,
+    /// Diamètre de la seconde pointe rapporté à celui du pinceau.
+    pub ratio: f32,
+    pub spacing: f32,
+    pub scatter: f32,
+    pub both_axes: bool,
+    pub count: u32,
+    pub mode: TipBlend,
+    pub flip: bool,
+}
+
+/// Texture : motif fixé à la toile qui module la couverture du trait (profondeur, mode, inversion, luminosité, contraste).
+#[derive(Clone, Debug)]
+pub struct BrushTexture {
+    pub pattern: Arc<BrushPattern>,
+    pub scale: f32,
+    pub depth: f32,
+    pub mode: TipBlend,
+    pub invert: bool,
+    pub brightness: f32,
+    pub contrast: f32,
+}
+
+impl BrushTexture {
+    /// Valeur du motif au point `(x, y)` de la toile, réglages appliqués.
+    fn at(&self, x: f32, y: f32) -> f32 {
+        let mut t = self.pattern.at(x, y, self.scale);
+        if self.invert {
+            t = 1.0 - t;
+        }
+        t += self.brightness / 255.0;
+        t = (t - 0.5) * (1.0 + self.contrast / 100.0) + 0.5;
+        t.clamp(0.0, 1.0)
+    }
+}
+
+/// Empreinte d'une pointe, en repère document : position, diamètre (plus grand côté), rotation (radians), rondeur,
+/// retournements et force (0 à 1). L'interface calcule les empreintes d'un trait de pointe (même algorithme que
+/// `Stroke::stamps`, voir ui/src/lib/tip-stamps.ts), les montre aussitôt par la carte graphique, puis le moteur les
+/// rejoue telles quelles (`Stroke::extend_stamps`) : ce qu'on voit pendant le geste est le résultat.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Stamp {
+    pub x: f32,
+    pub y: f32,
+    pub diameter: f32,
+    pub turn: f32,
+    pub roundness: f32,
+    pub flip_x: bool,
+    pub flip_y: bool,
+    pub strength: f32,
+}
+
+/// Empreinte du pinceau double, en repère document (pointe droite, pleine force).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DualStamp {
+    pub x: f32,
+    pub y: f32,
+    pub diameter: f32,
+    pub flip_x: bool,
+    pub flip_y: bool,
+}
+
+/// Pinceau double en cours : sa couverture (repère du calque) et la distance parcourue depuis sa dernière empreinte.
+struct DualState {
+    brush: DualBrush,
+    coverage: MaskStore,
+    travelled: f32,
 }
 
 enum Snapshot {
@@ -134,6 +224,14 @@ pub struct Stroke {
     /// qui voyage avec lui — et les empreintes en attente d'être appliquées au document.
     carried: Option<Patch>,
     mixing: Vec<StrokePoint>,
+    dual: Option<DualState>,
+    texture: Option<BrushTexture>,
+    /// Zone de travail en repère local `(x0, y0, x1, y1)` : comme dans Photoshop, la peinture s'arrête au bord du
+    /// document. Un trait qui frôlait le bord créait des pixels au-delà : le calque grandissait (son cadre débordait du
+    /// document, comme une bande vide en haut de l'image) et l'affichage le rechargeait en entier à chaque trait.
+    canvas: (i32, i32, i32, i32),
+    /// Empreintes de pointe posées par le moteur lui-même, relevées (repère document) : voir `with_recording`.
+    recorded: Option<(Vec<Stamp>, Vec<DualStamp>)>,
 }
 
 impl Stroke {
@@ -145,9 +243,17 @@ impl Stroke {
         if target.text().is_some() && !on_mask {
             return Err(EngineError::InvalidOperation("calque de texte : pixellisez-le pour le peindre".into()));
         }
+        if target.fill_content().is_some() && !on_mask {
+            return Err(EngineError::InvalidOperation("calque de remplissage : pixellisez-le pour le peindre".into()));
+        }
         // Le masque de fusion d'un objet dynamique se peint normalement ; son contenu, non.
         if target.smart().is_some() && !on_mask {
             return Err(EngineError::InvalidOperation(crate::smart::NOT_PAINTABLE.into()));
+        }
+        // Idem pour un calque à filtres dynamiques : refusé dès le début du trait, et non à chaque point (le trait
+        // n'aurait rien peint mais aurait laissé un état « Pinceau » vide dans l'historique).
+        if target.filters.is_some() && !on_mask {
+            return Err(EngineError::InvalidOperation(crate::document::FILTERED_IS_NOT_PAINTABLE.into()));
         }
         if target.props.locks.all || target.props.locks.pixels {
             return Err(EngineError::InvalidOperation("les pixels de ce calque sont verrouillés".into()));
@@ -178,6 +284,10 @@ impl Stroke {
             seed: 0x9E37_79B9,
             carried: None,
             mixing: Vec::new(),
+            dual: None,
+            texture: None,
+            canvas: (-target.offset.0, -target.offset.1, doc.width() as i32 - target.offset.0, doc.height() as i32 - target.offset.1),
+            recorded: None,
         })
     }
 
@@ -192,6 +302,57 @@ impl Stroke {
     pub fn with_dynamics(mut self, dynamics: BrushDynamics) -> Self {
         self.dynamics = dynamics;
         self
+    }
+
+    /// Pinceau double (voir `DualBrush`).
+    pub fn with_dual(mut self, dual: Option<DualBrush>) -> Self {
+        self.dual = dual.map(|brush| DualState { brush, coverage: MaskStore::with_background([0]), travelled: 0.0 });
+        self
+    }
+
+    /// Texture (voir `BrushTexture`).
+    pub fn with_texture(mut self, texture: Option<BrushTexture>) -> Self {
+        self.texture = texture;
+        self
+    }
+
+    /// Relève les empreintes de pointe que le moteur calcule (repère document) : sert à vérifier que l'interface
+    /// calcule les mêmes (voir `recorded`).
+    pub fn with_recording(mut self) -> Self {
+        self.recorded = Some((Vec::new(), Vec::new()));
+        self
+    }
+
+    /// Empreintes relevées depuis `with_recording`.
+    pub fn recorded(&self) -> Option<&(Vec<Stamp>, Vec<DualStamp>)> {
+        self.recorded.as_ref()
+    }
+
+    /// Pose des empreintes calculées par l'interface (repère document), telles quelles : pinceau double d'abord (sa
+    /// couverture découpe celle du trait), puis la pointe. Seulement pour une pointe importée ; les points du trait ne
+    /// servent alors plus (`extend` n'est pas appelé). Retourne les tuiles locales modifiées, comme `extend`.
+    pub fn extend_stamps(&mut self, doc: &mut Document, stamps: &[Stamp], duals: &[DualStamp]) -> Result<Vec<TileCoord>, EngineError> {
+        let BrushKind::Tip(tip) = self.kind.clone() else {
+            return Err(EngineError::InvalidOperation("empreintes fournies : seulement pour une pointe de pinceau".into()));
+        };
+        let (ox, oy) = (self.offset.0 as f32, self.offset.1 as f32);
+        if let Some(dual) = self.dual.as_mut() {
+            for d in duals {
+                let shape = Footprint { diameter: d.diameter, turn: 0.0, roundness: 1.0, flip_x: d.flip_x, flip_y: d.flip_y, strength: 1.0 };
+                stamp_tip(&mut dual.coverage, &dual.brush.tip, (d.x - ox, d.y - oy), shape, 0.999, &mut BTreeSet::new());
+            }
+        }
+        let flow = self.flow();
+        let mut touched = BTreeSet::new();
+        for s in stamps {
+            let shape = Footprint { diameter: s.diameter, turn: s.turn, roundness: s.roundness, flip_x: s.flip_x, flip_y: s.flip_y, strength: s.strength.clamp(0.0, 1.0) };
+            stamp_tip(&mut self.coverage, &tip, (s.x - ox, s.y - oy), shape, flow, &mut touched);
+        }
+        if self.deferred {
+            self.waiting.extend(touched);
+            return Ok(Vec::new());
+        }
+        self.apply(doc, touched)
     }
 
     pub fn with_kind(mut self, kind: BrushKind) -> Self {
@@ -223,6 +384,10 @@ impl Stroke {
             seed: 0x9E37_79B9,
             carried: None,
             mixing: Vec::new(),
+            dual: None,
+            texture: None,
+            canvas: (0, 0, doc.width() as i32, doc.height() as i32),
+            recorded: None,
         }
     }
 
@@ -282,7 +447,16 @@ impl Stroke {
         for at in std::mem::take(&mut self.mixing) {
             self.mix(doc, at, &mut touched)?;
         }
-        let touched: Vec<TileCoord> = touched.into_iter().collect();
+        // Tuiles entièrement hors du document : rien à peindre (voir `canvas`).
+        let (cx0, cy0, cx1, cy1) = self.canvas;
+        let size = TILE_SIZE as i32;
+        let touched: Vec<TileCoord> = touched
+            .into_iter()
+            .filter(|c| {
+                let (ox, oy) = c.origin();
+                ox < cx1 && oy < cy1 && ox + size > cx0 && oy + size > cy0
+            })
+            .collect();
         let resolved: Vec<(TileCoord, Resolved)> = touched.par_iter().filter_map(|coord| self.resolve(*coord).map(|tile| (*coord, tile))).collect();
         for (coord, tile) in resolved {
             match tile {
@@ -321,7 +495,8 @@ impl Stroke {
     }
 
     fn radius(&self, pressure: f32) -> f32 {
-        let scale = if self.brush.pressure_size { pressure.clamp(0.0, 1.0) } else { 1.0 };
+        let floor = self.dynamics.min_size.clamp(0.0, 1.0);
+        let scale = if self.brush.pressure_size { floor + (1.0 - floor) * pressure.clamp(0.0, 1.0) } else { 1.0 };
         (self.brush.size * 0.5 * scale).max(0.5)
     }
 
@@ -339,6 +514,7 @@ impl Stroke {
     }
 
     fn segment(&mut self, from: StrokePoint, to: StrokePoint, touched: &mut BTreeSet<TileCoord>) {
+        self.dual_along(from, to);
         if !matches!(self.kind, BrushKind::Round) || self.soft_round() {
             self.stamps(from, to, touched);
             return;
@@ -372,6 +548,7 @@ impl Stroke {
 
     /// Premier point du trait : une gélule réduite à un cercle, ou une première empreinte.
     fn dab(&mut self, at: StrokePoint, touched: &mut BTreeSet<TileCoord>) {
+        self.dual_stamp(at);
         if matches!(self.kind, BrushKind::Round) && !self.soft_round() {
             self.segment(at, at, touched);
         } else {
@@ -412,21 +589,106 @@ impl Stroke {
         }
     }
 
-    fn stamp(&mut self, mut at: StrokePoint, touched: &mut BTreeSet<TileCoord>) {
+    fn stamp(&mut self, at: StrokePoint, touched: &mut BTreeSet<TileCoord>) {
         let dynamics = self.dynamics;
-        // Dispersion : l'empreinte s'écarte du trait, dans une direction et à une distance tirées au sort.
-        if dynamics.scatter > 0.0 {
-            let (angle, reach) = (self.random() * std::f32::consts::TAU, self.random() * dynamics.scatter.clamp(0.0, 3.0) * self.radius(at.pressure) * 2.0);
-            (at.x, at.y) = (at.x + angle.cos() * reach, at.y + angle.sin() * reach);
+        // Plusieurs empreintes par pas (dispersion de Photoshop : « nombre »), chacune tirée au sort.
+        for _ in 0..dynamics.count.clamp(1, 16) {
+            let mut at = at;
+            // Dispersion : l'empreinte s'écarte du trait, perpendiculairement ou dans toutes les directions.
+            if dynamics.scatter > 0.0 {
+                let reach = dynamics.scatter.clamp(0.0, 10.0) * self.radius(at.pressure) * 2.0;
+                let (dx, dy) = if dynamics.scatter_perpendicular {
+                    let offset = (self.random() * 2.0 - 1.0) * reach;
+                    (-self.heading.sin() * offset, self.heading.cos() * offset)
+                } else {
+                    let (angle, distance) = (self.random() * std::f32::consts::TAU, self.random() * reach);
+                    (angle.cos() * distance, angle.sin() * distance)
+                };
+                (at.x, at.y) = (at.x + dx, at.y + dy);
+            }
+            let scale = 1.0 - self.random() * dynamics.size_jitter.clamp(0.0, 1.0);
+            match self.kind.clone() {
+                BrushKind::Round => self.round_dab(at, touched),
+                BrushKind::Mixer => self.mixing.push(at), // appliqué au document en fin de lot
+                BrushKind::Spray => self.spray(at, touched),
+                BrushKind::Tip(tip) => {
+                    let turn = dynamics.angle.to_radians() + if dynamics.follow_direction { self.heading } else { 0.0 } + (self.random() - 0.5) * dynamics.angle_jitter.clamp(0.0, 1.0) * std::f32::consts::TAU;
+                    let base = if dynamics.roundness > 0.0 { dynamics.roundness.clamp(0.01, 1.0) } else { 1.0 };
+                    let floor = dynamics.min_roundness.clamp(0.0, 1.0);
+                    let roundness = (base * (1.0 - self.random() * dynamics.roundness_jitter.clamp(0.0, 1.0))).max(floor.min(base)).max(0.01);
+                    // Opacité et flux de l'empreinte : pression (si demandée) et variations aléatoires.
+                    let mut strength = if self.brush.pressure_opacity { at.pressure.clamp(0.0, 1.0) } else { 1.0 };
+                    if dynamics.pressure_flow {
+                        strength *= at.pressure.clamp(0.0, 1.0);
+                    }
+                    strength *= 1.0 - self.random() * dynamics.opacity_jitter.clamp(0.0, 1.0);
+                    strength *= 1.0 - self.random() * dynamics.flow_jitter.clamp(0.0, 1.0);
+                    let diameter = self.radius(at.pressure) * 2.0 * scale.max(0.05);
+                    let shape = Footprint { diameter, turn, roundness, flip_x: dynamics.flip_x, flip_y: dynamics.flip_y, strength };
+                    let flow = self.flow();
+                    let (ox, oy) = (self.offset.0 as f32, self.offset.1 as f32);
+                    if let Some((stamps, _)) = self.recorded.as_mut() {
+                        stamps.push(Stamp { x: at.x + ox, y: at.y + oy, diameter, turn, roundness, flip_x: dynamics.flip_x, flip_y: dynamics.flip_y, strength });
+                    }
+                    stamp_tip(&mut self.coverage, &tip, (at.x, at.y), shape, flow, touched);
+                }
+            }
         }
-        let scale = 1.0 - self.random() * dynamics.size_jitter.clamp(0.0, 1.0);
-        match self.kind.clone() {
-            BrushKind::Round => self.round_dab(at, touched),
-            BrushKind::Mixer => self.mixing.push(at), // appliqué au document en fin de lot
-            BrushKind::Spray => self.spray(at, touched),
-            BrushKind::Tip(tip) => {
-                let turn = dynamics.angle.to_radians() + if dynamics.follow_direction { self.heading } else { 0.0 } + (self.random() - 0.5) * dynamics.angle_jitter.clamp(0.0, 1.0) * std::f32::consts::TAU;
-                self.tip(&tip, at, scale.max(0.05), turn, touched);
+    }
+
+    /// Pinceau double : empreintes de la seconde pointe le long du segment, à leur propre espacement.
+    fn dual_along(&mut self, from: StrokePoint, to: StrokePoint) {
+        let Some(dual) = self.dual.as_ref() else { return };
+        let (dx, dy) = (to.x - from.x, to.y - from.y);
+        let length = dx.hypot(dy);
+        if length <= f32::EPSILON {
+            return;
+        }
+        let diameter = (self.brush.size * dual.brush.ratio).max(1.0);
+        let spacing = (diameter * dual.brush.spacing.clamp(0.01, 10.0)).max(1.0);
+        let mut position = 0.0;
+        let mut travelled = dual.travelled;
+        loop {
+            let step = spacing - travelled;
+            if position + step > length {
+                if let Some(dual) = self.dual.as_mut() {
+                    dual.travelled = travelled + length - position;
+                }
+                return;
+            }
+            position += step;
+            travelled = 0.0;
+            let t = position / length;
+            self.heading = dy.atan2(dx);
+            self.dual_stamp(StrokePoint { x: from.x + dx * t, y: from.y + dy * t, pressure: from.pressure + (to.pressure - from.pressure) * t });
+        }
+    }
+
+    fn dual_stamp(&mut self, at: StrokePoint) {
+        let Some(brush) = self.dual.as_ref().map(|d| d.brush.clone()) else { return };
+        let diameter = (self.brush.size * brush.ratio).max(1.0);
+        for _ in 0..brush.count.clamp(1, 16) {
+            let (mut x, mut y) = (at.x, at.y);
+            if brush.scatter > 0.0 {
+                let reach = brush.scatter.clamp(0.0, 10.0) * diameter;
+                if brush.both_axes {
+                    let (angle, distance) = (self.random() * std::f32::consts::TAU, self.random() * reach);
+                    (x, y) = (x + angle.cos() * distance, y + angle.sin() * distance);
+                } else {
+                    let offset = (self.random() * 2.0 - 1.0) * reach;
+                    (x, y) = (x - self.heading.sin() * offset, y + self.heading.cos() * offset);
+                }
+            }
+            let (flip_x, flip_y) = if brush.flip { (self.random() < 0.5, self.random() < 0.5) } else { (false, false) };
+            let shape = Footprint { diameter, turn: 0.0, roundness: 1.0, flip_x, flip_y, strength: 1.0 };
+            let (ox, oy) = (self.offset.0 as f32, self.offset.1 as f32);
+            if let Some((_, duals)) = self.recorded.as_mut() {
+                duals.push(DualStamp { x: x + ox, y: y + oy, diameter, flip_x, flip_y });
+            }
+            if let Some(dual) = self.dual.as_mut() {
+                // Les empreintes du pinceau double S'ACCUMULENT (comme dans Photoshop) : une pointe légère et
+                // dispersée finit par couvrir le trait, au lieu de laisser des trous que le mode de fusion viderait.
+                stamp_tip(&mut dual.coverage, &brush.tip, (x, y), shape, 0.999, &mut BTreeSet::new());
             }
         }
     }
@@ -444,84 +706,51 @@ impl Stroke {
         if self.dynamics.flow > 0.0 { self.dynamics.flow.clamp(0.01, 1.0) } else { 1.0 }
     }
 
-    /// Ajoute une couverture en un pixel (repère local).
-    fn cover(&mut self, x: i32, y: i32, value: u8, touched: &mut BTreeSet<TileCoord>) {
-        let flow = self.flow();
-        let (coord, px, py) = TileCoord::of_pixel(x, y);
-        let tile = self.coverage.get_mut(coord);
-        let merged = merge(tile.pixel(px, py)[0], value, flow);
-        if merged != tile.pixel(px, py)[0] {
-            tile.set_pixel(px, py, [merged]);
-            touched.insert(coord);
-        }
-    }
-
     /// Aérographe : gouttelettes réparties en cloche autour du point (denses au centre, rares au bord).
     fn spray(&mut self, at: StrokePoint, touched: &mut BTreeSet<TileCoord>) {
         let radius = self.radius(at.pressure);
         let density = if self.dynamics.amount > 0.0 { self.dynamics.amount.clamp(0.1, 4.0) } else { 1.0 };
         let drops = ((radius * radius * 0.012 * density) as usize).clamp(2, 1500);
         let softness = 1.0 - self.brush.hardness.clamp(0.0, 1.0) * 0.6;
-        for _ in 0..drops {
-            let angle = self.random() * std::f32::consts::TAU;
-            // Moyenne de deux tirages : répartition triangulaire, proche d'une cloche.
-            let distance = radius * ((self.random() + self.random()) / 2.0).powf(softness * 1.4);
-            let (cx, cy) = (at.x + angle.cos() * distance, at.y + angle.sin() * distance);
-            let size = (0.45 + self.random() * 0.9).max(0.5) * (1.0 + radius / 220.0);
-            let strength = (0.35 + self.random() * 0.65) * if self.brush.pressure_opacity { at.pressure.clamp(0.0, 1.0) } else { 1.0 };
+        let pressure = if self.brush.pressure_opacity { at.pressure.clamp(0.0, 1.0) } else { 1.0 };
+        // Les gouttelettes sont tirées d'abord (centre, taille, force), puis posées : la tuile de couverture n'est
+        // prise en écriture qu'une fois par suite de pixels d'une même tuile, pas à chaque pixel.
+        let droplets: Vec<(f32, f32, f32, f32)> = (0..drops)
+            .map(|_| {
+                let angle = self.random() * std::f32::consts::TAU;
+                // Moyenne de deux tirages : répartition triangulaire, proche d'une cloche.
+                let distance = radius * ((self.random() + self.random()) / 2.0).powf(softness * 1.4);
+                let (cx, cy) = (at.x + angle.cos() * distance, at.y + angle.sin() * distance);
+                let size = (0.45 + self.random() * 0.9).max(0.5) * (1.0 + radius / 220.0);
+                let strength = (0.35 + self.random() * 0.65) * pressure;
+                (cx, cy, size, strength)
+            })
+            .collect();
+        let flow = self.flow();
+        let coverage = &mut self.coverage;
+        let mut current: Option<(TileCoord, &mut MaskTile)> = None;
+        for (cx, cy, size, strength) in droplets {
             let reach = size.ceil() as i32 + 1;
             for y in (cy as i32 - reach)..=(cy as i32 + reach) {
                 for x in (cx as i32 - reach)..=(cx as i32 + reach) {
                     let d = (x as f32 + 0.5 - cx).hypot(y as f32 + 0.5 - cy);
                     let value = ((size - d + 0.5).clamp(0.0, 1.0) * strength * 255.0) as u8;
-                    if value > 0 {
-                        self.cover(x, y, value, touched);
+                    if value == 0 {
+                        continue;
                     }
-                }
-            }
-        }
-    }
-
-    /// Pointe tamponnée : sa carte de couverture, mise à l'échelle du diamètre (le plus grand côté
-    /// de la pointe), éventuellement réduite (`scale`) et tournée de `turn` radians.
-    fn tip(&mut self, tip: &BrushTip, at: StrokePoint, scale: f32, turn: f32, touched: &mut BTreeSet<TileCoord>) {
-        let diameter = self.radius(at.pressure) * 2.0 * scale;
-        let unit = diameter / tip.width.max(tip.height) as f32;
-        let (w, h) = (tip.width as f32 * unit, tip.height as f32 * unit);
-        if w < 0.5 || h < 0.5 {
-            return;
-        }
-        // Boîte englobante de la pointe tournée.
-        let (sin, cos) = turn.sin_cos();
-        let (half_w, half_h) = ((w * cos.abs() + h * sin.abs()) / 2.0, (w * sin.abs() + h * cos.abs()) / 2.0);
-        let flow = self.flow();
-        let strength = if self.brush.pressure_opacity { at.pressure.clamp(0.0, 1.0) } else { 1.0 };
-        let size = TILE_SIZE as i32;
-        let (x0, y0, x1, y1) = ((at.x - half_w).floor() as i32, (at.y - half_h).floor() as i32, (at.x + half_w).ceil() as i32, (at.y + half_h).ceil() as i32);
-        let (first, _, _) = TileCoord::of_pixel(x0, y0);
-        let (last, _, _) = TileCoord::of_pixel(x1, y1);
-        for ty in first.y..=last.y {
-            for tx in first.x..=last.x {
-                let coord = TileCoord::new(tx, ty);
-                let (ox, oy) = coord.origin();
-                let mut changed = false;
-                let tile = self.coverage.get_mut(coord);
-                for y in y0.max(oy)..(y1 + 1).min(oy + size) {
-                    for x in x0.max(ox)..(x1 + 1).min(ox + size) {
-                        // Pixel ramené dans le repère de la pointe (rotation inverse autour du centre).
-                        let (dx, dy) = (x as f32 + 0.5 - at.x, y as f32 + 0.5 - at.y);
-                        let (u, v) = ((dx * cos + dy * sin) / w + 0.5, (dy * cos - dx * sin) / h + 0.5);
-                        let value = (tip.sample(u, v) * strength * 255.0 + 0.5) as u8;
-                        let (px, py) = ((x - ox) as u32, (y - oy) as u32);
-                        let merged = merge(tile.pixel(px, py)[0], value, flow);
-                        if merged != tile.pixel(px, py)[0] {
-                            tile.set_pixel(px, py, [merged]);
-                            changed = true;
-                        }
+                    let (coord, px, py) = TileCoord::of_pixel(x, y);
+                    if current.as_ref().is_none_or(|(c, _)| *c != coord) {
+                        // L'ancien emprunt est relâché (`None`) avant d'en prendre un autre sur la couverture.
+                        current.take();
+                        current = Some((coord, coverage.get_mut(coord)));
                     }
-                }
-                if changed {
-                    touched.insert(coord);
+                    let Some((_, tile)) = current.as_mut() else { continue };
+                    let before = tile.pixel(px, py)[0];
+                    let merged = merge(before, value, flow);
+                    if merged != before {
+                        tile.set_pixel(px, py, [merged]);
+                        touched.insert(coord);
+                    }
                 }
             }
         }
@@ -603,6 +832,7 @@ impl Stroke {
     ///      avec une force donnée par la **densité** ;
     ///   2. il se recharge de ce qu'il y avait sous lui AVANT le dépôt ; l'**étirement** dit quelle part
     ///      de l'ancien contenu il garde, donc jusqu'où les couleurs sont traînées.
+    ///
     /// Tout se fait en alpha prémultiplié : le transparent se traîne comme une couleur, on peut donc
     /// aussi estomper le bord d'une forme. Il écrit directement dans le calque, chaque empreinte
     /// dépendant du résultat de la précédente.
@@ -651,12 +881,15 @@ impl Stroke {
         let (first, _, _) = TileCoord::of_pixel(x0, y0);
         let (last, _, _) = TileCoord::of_pixel(x0 + 2 * reach, y0 + 2 * reach);
         let mut mask = selection.as_deref().map(Sampler::new);
+        let mut pending: Vec<(u32, u32, [u8; 4])> = Vec::new();
         for ty in first.y..=last.y {
             for tx in first.x..=last.x {
                 let coord = TileCoord::new(tx, ty);
                 let (ox, oy) = coord.origin();
-                let tile = pixels.get_mut(coord);
-                let mut changed = false;
+                // Les pixels qui changent sont relevés d'abord ; la tuile n'est prise en écriture (créée ou dupliquée)
+                // que s'il y en a : le cercle du pinceau ne touche pas toutes les tuiles de sa boîte englobante.
+                let existing = pixels.get(coord).cloned();
+                pending.clear();
                 for y in y0.max(oy)..(y0 + 2 * reach + 1).min(oy + size) {
                     for x in x0.max(ox)..(x0 + 2 * reach + 1).min(ox + size) {
                         let distance = (x as f32 + 0.5 - at.x).hypot(y as f32 + 0.5 - at.y);
@@ -676,7 +909,8 @@ impl Stroke {
                         // Ce que le pinceau dépose : ses couleurs ramassées, teintées par sa propre peinture (opaque).
                         let deposit = [0, 1, 2, 3].map(|c| carried[c] * (1.0 - paint) + if c < 3 { ink[c] } else { 1.0 } * paint);
                         let (px, py) = ((x - ox) as u32, (y - oy) as u32);
-                        let old = tile.pixel(px, py).map(|v| f32::from(v) / 255.0);
+                        let current = existing.as_ref().map_or([0; 4], |t| t.pixel(px, py));
+                        let old = current.map(|v| f32::from(v) / 255.0);
                         let mut new = [0, 1, 2, 3].map(|c| old[c] + (deposit[c] - old[c]) * force);
                         if keep_alpha {
                             // Transparence verrouillée : l'alpha d'origine reste, la couleur s'y adapte.
@@ -684,13 +918,16 @@ impl Stroke {
                             new = [new[0] * scale, new[1] * scale, new[2] * scale, old[3]];
                         }
                         let out = [0, 1, 2, 3].map(|c| (new[c].min(if c < 3 { new[3] } else { 1.0 }).clamp(0.0, 1.0) * 255.0 + 0.5) as u8);
-                        if out != tile.pixel(px, py) {
-                            tile.set_pixel(px, py, out);
-                            changed = true;
+                        if out != current {
+                            pending.push((px, py, out));
                         }
                     }
                 }
-                if changed {
+                if !pending.is_empty() {
+                    let tile = pixels.get_mut(coord);
+                    for &(px, py, out) in &pending {
+                        tile.set_pixel(px, py, out);
+                    }
                     touched.insert(coord);
                 }
             }
@@ -722,18 +959,57 @@ impl Stroke {
     }
 
     /// Recalcule une tuile de la cible depuis l'instantané et la couverture.
+    /// Couverture finale d'une tuile : celle du trait, combinée au pinceau double et à la texture s'il y en a.
+    fn effective(&self, coord: TileCoord, coverage: &MaskTile) -> Option<Vec<u8>> {
+        if self.dual.is_none() && self.texture.is_none() {
+            return None;
+        }
+        let dual = self.dual.as_ref().map(|d| (d.brush.mode, d.coverage.get(coord)));
+        let (ox, oy) = coord.origin();
+        let size = TILE_SIZE as i32;
+        Some(
+            coverage
+                .bytes()
+                .iter()
+                .enumerate()
+                .map(|(index, covered)| {
+                    if *covered == 0 {
+                        return 0;
+                    }
+                    let mut c = f32::from(*covered) / 255.0;
+                    if let Some((mode, tile)) = &dual {
+                        let other = tile.as_ref().map_or(0.0, |t| f32::from(t.bytes()[index]) / 255.0);
+                        c = mode.apply(c, other);
+                    }
+                    if let Some(texture) = &self.texture {
+                        // Le motif est fixé à la toile : repère du document.
+                        let (x, y) = ((ox + index as i32 % size + self.offset.0) as f32, (oy + index as i32 / size + self.offset.1) as f32);
+                        let textured = texture.mode.apply(c, texture.at(x, y));
+                        c += (textured - c) * texture.depth.clamp(0.0, 1.0);
+                    }
+                    (c.clamp(0.0, 1.0) * 255.0 + 0.5) as u8
+                })
+                .collect(),
+        )
+    }
+
     fn resolve(&self, coord: TileCoord) -> Option<Resolved> {
         let coverage = self.coverage.get(coord)?;
+        let combined = self.effective(coord, coverage);
+        let covered_bytes: &[u8] = combined.as_deref().unwrap_or_else(|| coverage.bytes());
         let opacity = (self.brush.opacity.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
         // La sélection est en repère document : force du trait pour chaque pixel de la tuile locale.
         let (ox, oy) = coord.origin();
         let size = TILE_SIZE as i32;
         let mut selected = self.selection.as_deref().map(Sampler::new);
-        let strengths: Vec<u8> = coverage
-            .bytes()
+        let strengths: Vec<u8> = covered_bytes
             .iter()
             .enumerate()
             .map(|(index, covered)| {
+                let (lx, ly) = (ox + index as i32 % size, oy + index as i32 / size);
+                if lx < self.canvas.0 || ly < self.canvas.1 || lx >= self.canvas.2 || ly >= self.canvas.3 {
+                    return 0; // hors du document
+                }
                 let base = mul_div_255(*covered, opacity);
                 match (&mut selected, base) {
                     (_, 0) | (None, _) => base,
@@ -823,6 +1099,79 @@ pub(crate) fn soft_falloff(distance: f32, radius: f32, hard: f32) -> f32 {
 pub(crate) const SOFT_FLOW: f32 = 0.33;
 
 /// Réunit une couverture existante et une nouvelle : maximum à plein flux, addition progressive sinon.
+/// Forme d'une empreinte de pointe : diamètre (plus grand côté), rotation, rondeur, retournements et force (0 à 1).
+#[derive(Clone, Copy, Debug)]
+struct Footprint {
+    diameter: f32,
+    turn: f32,
+    roundness: f32,
+    flip_x: bool,
+    flip_y: bool,
+    strength: f32,
+}
+
+/// Tamponne une pointe dans une carte de couverture (repère du calque). La pointe est lue dans sa version réduite la
+/// plus proche de sa taille à l'écran (voir `BrushTip::level_for`). Retourne vrai si une tuile a changé.
+fn stamp_tip(store: &mut MaskStore, tip: &BrushTip, (cx, cy): (f32, f32), shape: Footprint, flow: f32, touched: &mut BTreeSet<TileCoord>) -> bool {
+    let unit = shape.diameter / tip.width.max(tip.height) as f32;
+    let (w, h) = (tip.width as f32 * unit, tip.height as f32 * unit * shape.roundness);
+    if w < 0.5 || h < 0.5 {
+        return false;
+    }
+    let level = tip.level_for(w.max(h));
+    // Boîte englobante de la pointe tournée.
+    let (sin, cos) = shape.turn.sin_cos();
+    let (half_w, half_h) = ((w * cos.abs() + h * sin.abs()) / 2.0, (w * sin.abs() + h * cos.abs()) / 2.0);
+    let size = TILE_SIZE as i32;
+    let (x0, y0, x1, y1) = ((cx - half_w).floor() as i32, (cy - half_h).floor() as i32, (cx + half_w).ceil() as i32, (cy + half_h).ceil() as i32);
+    let (first, _, _) = TileCoord::of_pixel(x0, y0);
+    let (last, _, _) = TileCoord::of_pixel(x1, y1);
+    let mut any = false;
+    let mut pending: Vec<(u32, u32, u8)> = Vec::new();
+    for ty in first.y..=last.y {
+        for tx in first.x..=last.x {
+            let coord = TileCoord::new(tx, ty);
+            let (ox, oy) = coord.origin();
+            // Pixels qui changent relevés d'abord, tuile prise en écriture seulement s'il y en a (voir `Stroke::mix`).
+            let background = store.background();
+            let existing = store.get(coord).cloned();
+            pending.clear();
+            for y in y0.max(oy)..(y1 + 1).min(oy + size) {
+                for x in x0.max(ox)..(x1 + 1).min(ox + size) {
+                    // Pixel ramené dans le repère de la pointe (rotation inverse autour du centre).
+                    let (dx, dy) = (x as f32 + 0.5 - cx, y as f32 + 0.5 - cy);
+                    let (mut u, mut v) = ((dx * cos + dy * sin) / w + 0.5, (dy * cos - dx * sin) / h + 0.5);
+                    if shape.flip_x {
+                        u = 1.0 - u;
+                    }
+                    if shape.flip_y {
+                        v = 1.0 - v;
+                    }
+                    let value = (tip.sample_level(level, u, v) * shape.strength * 255.0 + 0.5) as u8;
+                    if value == 0 {
+                        continue;
+                    }
+                    let (px, py) = ((x - ox) as u32, (y - oy) as u32);
+                    let current = existing.as_ref().map_or(background[0], |t| t.pixel(px, py)[0]);
+                    let merged = merge(current, value, flow);
+                    if merged != current {
+                        pending.push((px, py, merged));
+                    }
+                }
+            }
+            if !pending.is_empty() {
+                let tile = store.get_mut(coord);
+                for &(px, py, merged) in &pending {
+                    tile.set_pixel(px, py, [merged]);
+                }
+                touched.insert(coord);
+                any = true;
+            }
+        }
+    }
+    any
+}
+
 fn merge(existing: u8, value: u8, flow: f32) -> u8 {
     if flow >= 1.0 {
         return existing.max(value);
@@ -1014,7 +1363,12 @@ mod tests {
     }
 
     fn doc_with_layer() -> (Document, LayerId) {
-        let mut doc = Document::with_background("x", 600, 300, 72.0, Background::White).expect("document");
+        doc_sized(600, 300)
+    }
+
+    /// Document assez grand pour les traits qui doivent rester entiers (la peinture s'arrête au bord du document).
+    fn doc_sized(width: u32, height: u32) -> (Document, LayerId) {
+        let mut doc = Document::with_background("x", width, height, 72.0, Background::White).expect("document");
         let id = doc.add_pixel_layer("peinture", TileStore::new(), None, 1).expect("calque");
         (doc, id)
     }
@@ -1107,14 +1461,16 @@ mod tests {
     }
 
     #[test]
-    fn painting_on_a_moved_layer_lands_under_the_cursor_and_may_leave_the_canvas() {
+    fn painting_on_a_moved_layer_lands_under_the_cursor_and_stops_at_the_canvas() {
         let (mut doc, id) = doc_with_layer();
         doc.translate_layers(&[id], 37, -12).expect("déplacement");
         let mut stroke = Stroke::begin(&doc, id, false, brush(1.0)).expect("trait");
         let mut touched = stroke.extend(&mut doc, &[point(100.5, 100.5), point(-20.5, 100.5)]).expect("peinture");
         touched.extend(stroke.finish(&mut doc).expect("fin du trait"));
         assert_eq!(pixel(&doc, id, 100, 100), [255, 0, 0, 255], "sous le curseur, en repère document");
-        assert_eq!(pixel(&doc, id, -20, 100), [255, 0, 0, 255], "hors cadre : conservé");
+        assert_eq!(pixel(&doc, id, -20, 100)[3], 0, "hors du document : rien n'est peint, comme dans Photoshop");
+        assert_eq!(pixel(&doc, id, 2, 100), [255, 0, 0, 255], "jusqu'au bord du document");
+        // Le calque est décalé de 37 px : le bord gauche du document est en x local négatif.
         assert!(touched.iter().any(|c| c.x < 0), "tuiles locales négatives : {touched:?}");
     }
 
@@ -1135,7 +1491,7 @@ mod tests {
     fn the_edge_of_a_large_stroke_is_perfectly_straight() {
         // Pinceau de 300 px tiré à l'horizontale sur 600 px : avec des empreintes espacées, le bord
         // supérieur ondulait de plus d'un pixel. Il doit maintenant être à la même hauteur partout.
-        let (mut doc, id) = doc_with_layer();
+        let (mut doc, id) = doc_sized(1000, 600);
         let big = Brush { size: 300.0, ..brush(1.0) };
         let mut stroke = Stroke::begin(&doc, id, false, big).expect("trait");
         stroke.extend(&mut doc, &[point(200.0, 300.0), point(500.0, 300.0), point(800.0, 300.0)]).expect("peinture");
@@ -1152,7 +1508,7 @@ mod tests {
     fn the_soft_edge_keeps_every_level_of_its_gradient() {
         // Bord d'un grand trait flou : une rampe douce, sans palier. On relève la couverture moyenne par tranche
         // de 4 px en s'éloignant de l'axe : elle doit décroître régulièrement, sans marche ni plateau figé.
-        let (mut doc, id) = doc_with_layer();
+        let (mut doc, id) = doc_sized(1400, 900);
         let soft = Brush { size: 400.0, hardness: 0.0, ..brush(1.0) };
         let mut stroke = Stroke::begin(&doc, id, false, soft).expect("trait");
         stroke.extend(&mut doc, &[point(100.0, 300.0), point(500.0, 300.0), point(900.0, 300.0), point(1300.0, 300.0)]).expect("peinture");
@@ -1219,10 +1575,249 @@ mod tests {
         assert!(count(&doc, 200, 400) > once * 13 / 10, "un second passage densifie le nuage");
     }
 
+    /// Réglages (pour la fixture), pinceau, dynamique, pinceau double et points d'un cas.
+    type StampCase = (serde_json::Value, Brush, BrushDynamics, Option<DualBrush>, Vec<StrokePoint>);
+
+    /// Cas de la fixture partagée avec l'interface (ui/tests/fixtures/tip-stamps.json) : réglages, puis points.
+    fn stamp_cases() -> Vec<StampCase> {
+        let tip = Arc::new(BrushTip::from_mask("ovale".into(), 24, 12, (0..24 * 12).map(|i| if i % 24 == 12 { 255 } else { 180 }).collect(), 0.22).expect("pointe"));
+        let curve = |n: usize, k: f32| -> Vec<StrokePoint> {
+            (0..n)
+                .map(|i| {
+                    let t = i as f32 / (n - 1) as f32;
+                    // Quelques points presque confondus (bruit de capteur) : filtrés des deux côtés.
+                    let jitter = if i % 7 == 3 { 0.2 } else { 0.0 };
+                    StrokePoint { x: 40.0 + t * 300.0 * k + jitter, y: 150.0 + (t * 5.0).sin() * 80.0, pressure: (0.15 + 0.85 * t).min(1.0) }
+                })
+                .collect()
+        };
+        let base = BrushDynamics::default();
+        let busy = BrushDynamics {
+            spacing: 0.3,
+            angle: 30.0,
+            follow_direction: true,
+            scatter: 1.5,
+            size_jitter: 0.5,
+            angle_jitter: 0.3,
+            roundness: 0.6,
+            roundness_jitter: 0.4,
+            min_roundness: 0.2,
+            count: 3,
+            opacity_jitter: 0.3,
+            flow_jitter: 0.2,
+            pressure_flow: true,
+            min_size: 0.3,
+            flip_x: true,
+            ..BrushDynamics::default()
+        };
+        let perpendicular = BrushDynamics { scatter: 0.8, scatter_perpendicular: true, spacing: 0.15, ..BrushDynamics::default() };
+        let dual = DualBrush { tip: Arc::clone(&tip), ratio: 0.6, spacing: 0.3, scatter: 0.5, both_axes: false, count: 2, mode: TipBlend::Multiply, flip: true };
+        let dual_both = DualBrush { both_axes: true, scatter: 1.2, count: 1, flip: false, ..dual.clone() };
+        let brush = |size: f32, pressure_size: bool, pressure_opacity: bool| Brush { size, hardness: 1.0, opacity: 1.0, color: [0, 0, 0], mode: BrushMode::Paint, pressure_size, pressure_opacity };
+        let dynamics_json = |d: &BrushDynamics| serde_json::json!({
+            "spacing": d.spacing, "angle": d.angle, "followDirection": d.follow_direction, "scatter": d.scatter, "sizeJitter": d.size_jitter,
+            "angleJitter": d.angle_jitter, "amount": d.amount, "flow": d.flow, "paint": d.paint, "stretch": d.stretch, "roundness": d.roundness,
+            "roundnessJitter": d.roundness_jitter, "minRoundness": d.min_roundness, "flipX": d.flip_x, "flipY": d.flip_y, "minSize": d.min_size,
+            "scatterPerpendicular": d.scatter_perpendicular, "count": d.count, "opacityJitter": d.opacity_jitter, "flowJitter": d.flow_jitter, "pressureFlow": d.pressure_flow,
+        });
+        let dual_json = |d: &DualBrush| serde_json::json!({ "ratio": d.ratio, "spacing": d.spacing, "scatter": d.scatter, "bothAxes": d.both_axes, "count": d.count, "flip": d.flip });
+        let case = |name: &str, b: Brush, d: BrushDynamics, du: Option<DualBrush>, points: Vec<StrokePoint>| {
+            let settings = serde_json::json!({
+                "name": name, "size": b.size, "pressureSize": b.pressure_size, "pressureOpacity": b.pressure_opacity, "tipSpacing": tip.spacing,
+                "dynamics": dynamics_json(&d), "dual": du.as_ref().map(dual_json),
+            });
+            (settings, b, d, du, points)
+        };
+        vec![
+            case("simple", brush(40.0, true, false), base, None, curve(40, 1.0)),
+            case("dynamiques", brush(36.0, true, true), busy, None, curve(50, 0.8)),
+            case("perpendiculaire + double", brush(28.0, false, true), perpendicular, Some(dual), curve(45, 1.0)),
+            case("double dispersé", brush(50.0, true, false), BrushDynamics { count: 2, ..base }, Some(dual_both), curve(30, 0.6)),
+        ]
+    }
+
+    /// Les empreintes que le moteur pose pour une pointe sont celles que calcule l'interface (même algorithme, voir
+    /// ui/src/lib/tip-stamps.ts) : la fixture est produite ici (`LUMI_WRITE_FIXTURE=1`) et vérifiée des deux côtés.
+    #[test]
+    fn tip_stamps_match_the_interface_fixture() {
+        let tip = Arc::new(BrushTip::from_mask("ovale".into(), 24, 12, (0..24 * 12).map(|i| if i % 24 == 12 { 255 } else { 180 }).collect(), 0.22).expect("pointe"));
+        let mut cases = Vec::new();
+        for (settings, brush, dynamics, dual, points) in stamp_cases() {
+            let (mut doc, id) = doc_sized(400, 300);
+            let mut stroke = Stroke::begin(&doc, id, false, brush).expect("trait").with_kind(BrushKind::Tip(Arc::clone(&tip))).with_dynamics(dynamics).with_dual(dual).with_recording();
+            stroke.extend(&mut doc, &points).expect("trait");
+            stroke.finish(&mut doc).expect("fin");
+            let (stamps, duals) = stroke.recorded().expect("relevé").clone();
+            assert!(stamps.len() > 10, "{} : {} empreintes", settings["name"], stamps.len());
+            cases.push(serde_json::json!({
+                "settings": settings,
+                "points": points.iter().map(|p| [p.x, p.y, p.pressure]).collect::<Vec<_>>(),
+                "stamps": stamps.iter().map(|s| [s.x, s.y, s.diameter, s.turn, s.roundness, f32::from(u8::from(s.flip_x)), f32::from(u8::from(s.flip_y)), s.strength]).collect::<Vec<_>>(),
+                "duals": duals.iter().map(|d| [d.x, d.y, d.diameter, f32::from(u8::from(d.flip_x)), f32::from(u8::from(d.flip_y))]).collect::<Vec<_>>(),
+            }));
+        }
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ui/tests/fixtures/tip-stamps.json");
+        let produced = serde_json::json!({ "cases": cases });
+        if std::env::var_os("LUMI_WRITE_FIXTURE").is_some() {
+            std::fs::write(&path, serde_json::to_string(&produced).expect("json")).expect("fixture");
+            return;
+        }
+        let expected: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).expect("fixture (LUMI_WRITE_FIXTURE=1 pour la produire)")).expect("json");
+        // Mêmes valeurs aux arrondis de la lecture du JSON près (les nombres y sont écrits en décimal).
+        fn same(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+            match (a, b) {
+                (serde_json::Value::Number(x), serde_json::Value::Number(y)) => {
+                    let (x, y) = (x.as_f64().unwrap_or(f64::NAN), y.as_f64().unwrap_or(f64::NAN));
+                    (x - y).abs() <= 1e-6 * x.abs().max(1.0)
+                }
+                (serde_json::Value::Array(x), serde_json::Value::Array(y)) => x.len() == y.len() && x.iter().zip(y).all(|(x, y)| same(x, y)),
+                (serde_json::Value::Object(x), serde_json::Value::Object(y)) => x.len() == y.len() && x.iter().all(|(k, v)| y.get(k).is_some_and(|w| same(v, w))),
+                _ => a == b,
+            }
+        }
+        assert!(same(&produced, &expected), "le moteur pose d'autres empreintes que la fixture : l'interface doit suivre (ui/src/lib/tip-stamps.ts)");
+    }
+
+    /// Documents de référence du pinceau peint sur carte graphique (ui/tests/live-paint-parity.mjs) : pour chaque cas,
+    /// le calque avant et après le trait (zone un peu plus grande que le document, repère du calque), les points (rond)
+    /// ou les empreintes (pointe) et les réglages. Écrit seulement avec `LUMI_LIVE_FIXTURE=<dossier>` :
+    /// `LUMI_LIVE_FIXTURE=/tmp/x cargo test -p engine --lib live_paint_fixture -- --ignored`.
+    #[test]
+    #[ignore]
+    fn live_paint_fixture() {
+        let Some(dir) = std::env::var_os("LUMI_LIVE_FIXTURE").map(std::path::PathBuf::from) else { return };
+        std::fs::create_dir_all(&dir).expect("dossier");
+        let (width, height) = (220u32, 160u32);
+        let offset = (13, -9);
+        // Zone lue : le document dans le repère du calque, élargie (la peinture ne doit pas déborder du document).
+        let area = (-offset.0 - 6, -offset.1 - 5, width + 12, height + 10);
+        let oval = Arc::new(BrushTip::from_mask("ovale".into(), 24, 12, (0..24 * 12).map(|i| if i % 24 == 12 { 255 } else { 40 + (i * 37 % 200) as u8 }).collect(), 0.22).expect("pointe"));
+        let grain = Arc::new(BrushTip::from_mask("grain".into(), 9, 9, (0..81).map(|i| ((i * 97 + 13) % 256) as u8).collect(), 0.5).expect("pointe"));
+        let pattern = Arc::new(BrushPattern { name: "motif".into(), uid: "m".into(), width: 7, height: 5, gray: (0..35).map(|i| ((i * 53 + 20) % 256) as u8).collect() });
+        let curve: Vec<StrokePoint> = (0..40)
+            .map(|i| {
+                let t = i as f32 / 39.0;
+                StrokePoint { x: -10.0 + t * 245.0, y: 80.0 + (t * 6.0).sin() * 55.0, pressure: (0.3 + 0.7 * t).min(1.0) }
+            })
+            .collect();
+        struct Case {
+            name: &'static str,
+            brush: Brush,
+            kind: BrushKind,
+            dynamics: BrushDynamics,
+            dual: Option<DualBrush>,
+            texture: Option<BrushTexture>,
+        }
+        let paint = |size: f32, hardness: f32, opacity: f32, erase: bool, pressure: bool| Brush { size, hardness, opacity, color: [200, 40, 90], mode: if erase { BrushMode::Erase } else { BrushMode::Paint }, pressure_size: pressure, pressure_opacity: false };
+        let tip = |t: &Arc<BrushTip>| BrushKind::Tip(Arc::clone(t));
+        let cases = vec![
+            Case { name: "rond-net", brush: paint(18.0, 1.0, 0.8, false, false), kind: BrushKind::Round, dynamics: BrushDynamics::default(), dual: None, texture: None },
+            Case { name: "rond-net-pression", brush: paint(26.0, 1.0, 1.0, false, true), kind: BrushKind::Round, dynamics: BrushDynamics::default(), dual: None, texture: None },
+            Case { name: "rond-flou", brush: paint(30.0, 0.3, 1.0, false, false), kind: BrushKind::Round, dynamics: BrushDynamics::default(), dual: None, texture: None },
+            Case { name: "rond-flou-espace", brush: paint(30.0, 0.0, 0.7, false, false), kind: BrushKind::Round, dynamics: BrushDynamics { spacing: 0.25, ..BrushDynamics::default() }, dual: None, texture: None },
+            Case { name: "gomme-ronde", brush: paint(22.0, 1.0, 0.9, true, false), kind: BrushKind::Round, dynamics: BrushDynamics::default(), dual: None, texture: None },
+            Case { name: "pointe", brush: paint(28.0, 1.0, 0.85, false, true), kind: tip(&oval), dynamics: BrushDynamics { angle: 25.0, follow_direction: true, ..BrushDynamics::default() }, dual: None, texture: None },
+            Case { name: "pointe-flux", brush: paint(20.0, 1.0, 1.0, false, false), kind: tip(&grain), dynamics: BrushDynamics { flow: 0.4, spacing: 0.15, ..BrushDynamics::default() }, dual: None, texture: None },
+            Case {
+                name: "pointe-double-texture",
+                brush: paint(34.0, 1.0, 1.0, false, false),
+                kind: tip(&oval),
+                dynamics: BrushDynamics::default(),
+                dual: Some(DualBrush { tip: Arc::clone(&grain), ratio: 0.6, spacing: 0.3, scatter: 0.0, both_axes: false, count: 1, mode: TipBlend::Multiply, flip: false }),
+                texture: Some(BrushTexture { pattern: Arc::clone(&pattern), scale: 2.0, depth: 0.8, mode: TipBlend::Multiply, invert: false, brightness: 10.0, contrast: 20.0 }),
+            },
+            Case { name: "gomme-pointe", brush: paint(30.0, 1.0, 1.0, true, false), kind: tip(&grain), dynamics: BrushDynamics::default(), dual: None, texture: None },
+        ];
+        let mut index = Vec::new();
+        for case in cases {
+            // Calque déjà peint (dégradé à demi transparent), décalé dans le document.
+            let content: Vec<u8> = (0..width * height)
+                .flat_map(|i| {
+                    let (x, y) = (i % width, i / width);
+                    let a = if (30..190).contains(&x) && (20..140).contains(&y) { (60 + (x + y) % 160) as u8 } else { 0 };
+                    let m = |c: u32| ((c * u32::from(a) + 127) / 255) as u8;
+                    [m(20 + x % 200), m(120), m(250 - y), a]
+                })
+                .collect();
+            let mut doc = Document::with_background("x", width, height, 72.0, Background::White).expect("document");
+            let id = doc.add_pixel_layer("peinture", TileStore::from_premultiplied(width, height, &content).expect("pixels"), None, 1).expect("calque");
+            doc.translate_layers(&[id], offset.0, offset.1).expect("décalage");
+            let before = doc.layer(id).expect("calque").pixels().expect("pixels").read_rect(area.0, area.1, area.2, area.3);
+            let mut stroke = Stroke::begin(&doc, id, false, case.brush).expect("trait").with_kind(case.kind.clone()).with_dynamics(case.dynamics).with_dual(case.dual.clone()).with_texture(case.texture.clone()).with_recording().with_deferred(true);
+            for chunk in curve.chunks(7) {
+                stroke.extend(&mut doc, chunk).expect("trait");
+            }
+            stroke.finish(&mut doc).expect("fin");
+            let (stamps, duals) = stroke.recorded().cloned().unwrap_or_default();
+            let after = doc.layer(id).expect("calque").pixels().expect("pixels").read_rect(area.0, area.1, area.2, area.3);
+            let tip_json = |t: &BrushTip| serde_json::json!({ "width": t.width, "height": t.height, "mask": t.mask.clone() });
+            let blend = |m: TipBlend| match m {
+                TipBlend::Multiply => "multiply",
+                TipBlend::Darken => "darken",
+                TipBlend::Lighten => "lighten",
+                TipBlend::Overlay => "overlay",
+                TipBlend::ColorDodge => "colorDodge",
+                TipBlend::ColorBurn => "colorBurn",
+                TipBlend::LinearBurn => "linearBurn",
+                TipBlend::HardMix => "hardMix",
+                TipBlend::Subtract => "subtract",
+                TipBlend::Height => "height",
+                TipBlend::LinearHeight => "linearHeight",
+                TipBlend::Screen => "screen",
+            };
+            let spec = serde_json::json!({
+                "name": case.name,
+                "doc": [width, height],
+                "offset": [offset.0, offset.1],
+                "area": [area.0, area.1, area.2, area.3],
+                "size": case.brush.size,
+                "hardness": case.brush.hardness,
+                "opacity": case.brush.opacity,
+                "color": case.brush.color,
+                "erase": matches!(case.brush.mode, BrushMode::Erase),
+                "pressureSize": case.brush.pressure_size,
+                "spacing": case.dynamics.spacing,
+                "flow": case.dynamics.flow,
+                "points": curve.iter().map(|p| [p.x, p.y, p.pressure]).collect::<Vec<_>>(),
+                "tip": match &case.kind { BrushKind::Tip(t) => tip_json(t), _ => serde_json::Value::Null },
+                "stamps": stamps.iter().map(|s| serde_json::json!({ "x": s.x, "y": s.y, "diameter": s.diameter, "turn": s.turn, "roundness": s.roundness, "flipX": s.flip_x, "flipY": s.flip_y, "strength": s.strength })).collect::<Vec<_>>(),
+                "duals": duals.iter().map(|d| serde_json::json!({ "x": d.x, "y": d.y, "diameter": d.diameter, "flipX": d.flip_x, "flipY": d.flip_y })).collect::<Vec<_>>(),
+                "dual": case.dual.as_ref().map(|d| serde_json::json!({ "tip": tip_json(&d.tip), "mode": blend(d.mode) })),
+                "texture": case.texture.as_ref().map(|t| serde_json::json!({ "pattern": { "width": t.pattern.width, "height": t.pattern.height, "gray": t.pattern.gray.clone() }, "scale": t.scale, "depth": t.depth, "mode": blend(t.mode), "invert": t.invert, "brightness": t.brightness, "contrast": t.contrast })),
+            });
+            std::fs::write(dir.join(format!("{}.json", case.name)), serde_json::to_string(&spec).expect("json")).expect("cas");
+            std::fs::write(dir.join(format!("{}.before", case.name)), &before).expect("avant");
+            std::fs::write(dir.join(format!("{}.after", case.name)), &after).expect("après");
+            index.push(case.name);
+        }
+        std::fs::write(dir.join("index.json"), serde_json::to_string(&index).expect("json")).expect("index");
+    }
+
+    /// Empreintes fournies par l'interface : posées telles quelles, elles donnent exactement le trait du moteur.
+    #[test]
+    fn replayed_stamps_paint_the_same_stroke_as_the_engine() {
+        let tip = Arc::new(BrushTip::from_mask("ovale".into(), 24, 12, (0..24 * 12).map(|i| if i % 24 == 12 { 255 } else { 180 }).collect(), 0.22).expect("pointe"));
+        for (settings, brush, dynamics, dual, points) in stamp_cases() {
+            let (mut own, id) = doc_sized(400, 300);
+            let mut stroke = Stroke::begin(&own, id, false, brush).expect("trait").with_kind(BrushKind::Tip(Arc::clone(&tip))).with_dynamics(dynamics).with_dual(dual.clone()).with_recording().with_deferred(true);
+            stroke.extend(&mut own, &points).expect("trait");
+            stroke.finish(&mut own).expect("fin");
+            let (stamps, duals) = stroke.recorded().expect("relevé").clone();
+            let (mut replayed, id2) = doc_sized(400, 300);
+            let mut stroke = Stroke::begin(&replayed, id2, false, brush).expect("trait").with_kind(BrushKind::Tip(Arc::clone(&tip))).with_dynamics(dynamics).with_dual(dual).with_deferred(true);
+            stroke.extend_stamps(&mut replayed, &stamps[..stamps.len() / 2], &duals).expect("empreintes");
+            stroke.extend_stamps(&mut replayed, &stamps[stamps.len() / 2..], &[]).expect("empreintes");
+            stroke.finish(&mut replayed).expect("fin");
+            for (x, y) in [(60, 150), (120, 190), (200, 120), (300, 160), (330, 100)] {
+                assert_eq!(pixel(&own, id, x, y), pixel(&replayed, id2, x, y), "{} : pixel ({x}, {y})", settings["name"]);
+            }
+        }
+    }
+
     #[test]
     fn imported_tips_are_stamped_at_the_brush_size() {
         // Pointe en croix 3 x 3 : on doit retrouver une croix de 90 px, pas un disque.
-        let tip = Arc::new(BrushTip { name: "croix".into(), width: 3, height: 3, mask: vec![0, 255, 0, 255, 255, 255, 0, 255, 0], spacing: 5.0 });
+        let tip = Arc::new(BrushTip::from_mask("croix".into(), 3, 3, vec![0, 255, 0, 255, 255, 255, 0, 255, 0], 5.0).expect("pointe"));
         let (mut doc, id) = doc_with_layer();
         let mut stroke = Stroke::begin(&doc, id, false, Brush { size: 90.0, ..brush(1.0) }).expect("trait").with_kind(BrushKind::Tip(tip));
         stroke.extend(&mut doc, &[point(200.0, 200.0)]).expect("tampon");
@@ -1235,7 +1830,7 @@ mod tests {
     #[test]
     fn dynamics_rotate_scatter_and_space_the_stamps() {
         // Pointe en barre horizontale 8 x 1 : tournée de 90°, elle doit devenir verticale.
-        let bar = Arc::new(BrushTip { name: "barre".into(), width: 8, height: 1, mask: vec![255; 8], spacing: 0.25 });
+        let bar = Arc::new(BrushTip::from_mask("barre".into(), 8, 1, vec![255; 8], 0.25).expect("pointe"));
         let stamp = |dynamics: BrushDynamics, points: &[StrokePoint]| {
             let (mut doc, id) = doc_with_layer();
             let mut stroke = Stroke::begin(&doc, id, false, Brush { size: 80.0, ..brush(1.0) }).expect("trait").with_kind(BrushKind::Tip(Arc::clone(&bar))).with_dynamics(dynamics);
@@ -1328,7 +1923,7 @@ mod tests {
     fn flow_lets_overlapping_stamps_build_up() {
         // Pointe pleine à 40 % de couverture, empreintes très serrées : à plein flux elles se confondent
         // (40 % partout) ; à flux réduit elles s'additionnent et dépassent ce que donnerait une seule.
-        let tip = Arc::new(BrushTip { name: "voile".into(), width: 2, height: 2, mask: vec![102; 4], spacing: 0.05 });
+        let tip = Arc::new(BrushTip::from_mask("voile".into(), 2, 2, vec![102; 4], 0.05).expect("pointe"));
         let paint = |flow: f32| {
             let (mut doc, id) = doc_with_layer();
             let mut stroke = Stroke::begin(&doc, id, false, Brush { size: 60.0, ..brush(1.0) }).expect("trait").with_kind(BrushKind::Tip(Arc::clone(&tip))).with_dynamics(BrushDynamics { flow, ..Default::default() });
@@ -1422,4 +2017,57 @@ mod tests {
         assert_eq!(pixel(&doc, id, 100, 100)[3], 255);
         assert_eq!(pixel(&doc, id, 106, 100)[3], 0, "rayon réduit à 2,5 px");
     }
+    #[test]
+    fn dual_brush_and_texture_cut_into_the_stroke() {
+        let ink = Arc::new(BrushTip::from_mask("plein".into(), 4, 4, vec![255; 16], 0.1).expect("pointe"));
+        let paint = |dual: Option<DualBrush>, texture: Option<BrushTexture>| {
+            let (mut doc, id) = doc_with_layer();
+            let mut stroke = Stroke::begin(&doc, id, false, brush(1.0)).expect("trait").with_kind(BrushKind::Tip(Arc::clone(&ink))).with_dual(dual).with_texture(texture);
+            stroke.extend(&mut doc, &[point(100.0, 100.0), point(220.0, 100.0)]).expect("peinture");
+            stroke.finish(&mut doc).expect("fin");
+            (100..220).flat_map(|x| (88..112).map(move |y| (x, y))).map(|(x, y)| u32::from(pixel(&doc, id, x, y)[3])).sum::<u32>()
+        };
+        let plain = paint(None, None);
+        assert!(plain > 0);
+        // Seconde pointe minuscule et très espacée : la couverture finale ne reste qu'aux rares endroits communs.
+        let dot = Arc::new(BrushTip::from_mask("point".into(), 1, 1, vec![255], 1.0).expect("pointe"));
+        let dual = DualBrush { tip: dot, ratio: 0.1, spacing: 4.0, scatter: 0.0, both_axes: false, count: 1, mode: TipBlend::Multiply, flip: false };
+        assert!(paint(Some(dual), None) < plain / 4);
+        // Texture noire, profondeur totale, en multiplication : plus rien ne passe.
+        let black = Arc::new(BrushPattern { name: "noir".into(), uid: "n".into(), width: 2, height: 2, gray: vec![0; 4] });
+        let texture = BrushTexture { pattern: black, scale: 1.0, depth: 1.0, mode: TipBlend::Multiply, invert: false, brightness: 0.0, contrast: 0.0 };
+        assert_eq!(paint(None, Some(texture)), 0);
+    }
+
+    #[test]
+    fn roundness_squashes_the_tip_and_pressure_keeps_a_minimum_size() {
+        let ink = Arc::new(BrushTip::from_mask("plein".into(), 8, 8, vec![255; 64], 0.1).expect("pointe"));
+        let height = |dynamics: BrushDynamics, pressure: f32| {
+            let (mut doc, id) = doc_with_layer();
+            let mut b = brush(1.0);
+            b.pressure_size = true;
+            let mut stroke = Stroke::begin(&doc, id, false, b).expect("trait").with_kind(BrushKind::Tip(Arc::clone(&ink))).with_dynamics(dynamics);
+            stroke.extend(&mut doc, &[StrokePoint { x: 150.0, y: 150.0, pressure }]).expect("peinture");
+            stroke.finish(&mut doc).expect("fin");
+            (100..200).filter(|y| pixel(&doc, id, 150, *y)[3] > 0).count()
+        };
+        let full = height(BrushDynamics::default(), 1.0);
+        assert!((18..=22).contains(&full), "{full}");
+        assert!(height(BrushDynamics { roundness: 0.5, ..BrushDynamics::default() }, 1.0) <= full / 2 + 1);
+        assert!(height(BrushDynamics { min_size: 0.5, ..BrushDynamics::default() }, 0.0) >= full / 2 - 1);
+    }
+
+    #[test]
+    fn painting_stops_at_the_document_edge() {
+        let (mut doc, id) = doc_with_layer();
+        let mut stroke = Stroke::begin(&doc, id, false, brush(1.0)).expect("trait");
+        // Un trait qui sort du document par le haut et par la gauche.
+        stroke.extend(&mut doc, &[point(-30.0, -15.0), point(120.0, 5.0)]).expect("peinture");
+        stroke.finish(&mut doc).expect("fin");
+        let pixels = doc.layer(id).expect("calque").pixels().expect("pixels").clone();
+        let (x0, y0, _, _) = pixels.pixel_bounds(|px| px[3] > 0).expect("encre");
+        assert!(x0 >= 0 && y0 >= 0, "rien n'est peint hors du document : {x0}, {y0}");
+        assert!(pixel(&doc, id, 60, 2)[3] > 0, "le bord du document, lui, est peint");
+    }
+
 }

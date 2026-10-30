@@ -172,10 +172,23 @@ pub const fn tiles_for(pixels: u32) -> u32 {
 }
 
 /// Image en tuiles, creuse et sans limites : une tuile absente vaut uniformément `background`.
+///
+/// `version` identifie le CONTENU : un numéro jamais réattribué, renouvelé à chaque écriture (toutes passent par
+/// les méthodes de ce module) et conservé par une copie (`clone`), qui a le même contenu. Deux stockages de même
+/// version ont donc les mêmes pixels, même s'ils ne sont pas au même endroit en mémoire — un état d'historique
+/// relu du disque de travail, par exemple. Les caches de rendu s'y fient (voir `render::Print`).
 #[derive(Clone, Debug)]
 pub struct Store<const C: usize> {
     background: [u8; C],
     tiles: HashMap<TileCoord, Arc<TileBuf<C>>>,
+    version: u64,
+}
+
+/// Prochain numéro de version de contenu (voir [`Store`]) ; 0 n'est jamais attribué.
+static NEXT_VERSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn fresh_version() -> u64 {
+    NEXT_VERSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Pixels d'un calque. Tuile absente = transparente.
@@ -185,7 +198,18 @@ pub type MaskStore = Store<1>;
 
 impl<const C: usize> Store<C> {
     pub fn with_background(background: [u8; C]) -> Self {
-        Self { background, tiles: HashMap::new() }
+        Self { background, tiles: HashMap::new(), version: fresh_version() }
+    }
+
+    /// Version du contenu (voir [`Store`]).
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
+    /// Redonne à ce stockage la version d'un contenu identique : réservé au disque de travail, qui retire des tuiles
+    /// d'un état puis les remet telles quelles (le contenu redevient celui de cette version).
+    pub(crate) fn set_version(&mut self, version: u64) {
+        self.version = version;
     }
 
     pub fn background(&self) -> [u8; C] {
@@ -194,6 +218,9 @@ impl<const C: usize> Store<C> {
 
     /// Change la valeur de tout ce qui n'a pas de tuile (pour un masque : tout le plan hors des zones peintes).
     pub fn set_background(&mut self, value: [u8; C]) {
+        if self.background != value {
+            self.version = fresh_version();
+        }
         self.background = value;
     }
 
@@ -208,6 +235,7 @@ impl<const C: usize> Store<C> {
     /// Accès en écriture. La tuile est créée (remplie du fond) si elle n'existe
     /// pas et dupliquée si elle est partagée (copie à l'écriture).
     pub fn get_mut(&mut self, coord: TileCoord) -> &mut TileBuf<C> {
+        self.version = fresh_version();
         let background = self.background;
         let entry = self.tiles.entry(coord).or_insert_with(|| Arc::new(TileBuf::filled(background)));
         Arc::make_mut(entry)
@@ -215,6 +243,7 @@ impl<const C: usize> Store<C> {
 
     /// Insère une tuile ; une tuile uniformément égale au fond supprime l'entrée.
     pub fn insert(&mut self, coord: TileCoord, tile: TileBuf<C>) {
+        self.version = fresh_version();
         if tile.is_uniform(self.background) {
             self.tiles.remove(&coord);
         } else {
@@ -224,6 +253,7 @@ impl<const C: usize> Store<C> {
 
     /// Remet une tuile à l'état partagé fourni (`None` = fond). Sert à restaurer un instantané.
     pub fn restore(&mut self, coord: TileCoord, tile: Option<Arc<TileBuf<C>>>) {
+        self.version = fresh_version();
         match tile {
             Some(tile) => self.tiles.insert(coord, tile),
             None => self.tiles.remove(&coord),
@@ -275,24 +305,31 @@ impl<const C: usize> Store<C> {
 
     /// Rectangle englobant exact des pixels retenus par `counts` (par exemple « alpha non nul »),
     /// en pixels : `(x0, y0, x1, y1)`, bornes hautes exclues. Sert au cadre de transformation.
-    pub fn pixel_bounds(&self, counts: impl Fn([u8; C]) -> bool) -> Option<(i32, i32, i32, i32)> {
-        let mut bounds: Option<(i32, i32, i32, i32)> = None;
-        for (coord, tile) in &self.tiles {
-            let (ox, oy) = coord.origin();
-            for y in 0..TILE_SIZE {
-                for x in 0..TILE_SIZE {
-                    if !counts(tile.pixel(x, y)) {
-                        continue;
-                    }
-                    let (px, py) = (ox + x as i32, oy + y as i32);
+    /// Les tuiles sont parcourues en parallèle ; dans chaque ligne, seuls le premier et le dernier pixel retenus
+    /// comptent, le reste de la ligne n'est pas examiné.
+    pub fn pixel_bounds(&self, counts: impl Fn([u8; C]) -> bool + Sync) -> Option<(i32, i32, i32, i32)> {
+        let merge = |a: Option<(i32, i32, i32, i32)>, b: Option<(i32, i32, i32, i32)>| match (a, b) {
+            (Some((ax0, ay0, ax1, ay1)), Some((bx0, by0, bx1, by1))) => Some((ax0.min(bx0), ay0.min(by0), ax1.max(bx1), ay1.max(by1))),
+            (a, None) => a,
+            (None, b) => b,
+        };
+        self.tiles
+            .par_iter()
+            .map(|(coord, tile)| {
+                let (ox, oy) = coord.origin();
+                let mut bounds: Option<(i32, i32, i32, i32)> = None;
+                for y in 0..TILE_SIZE {
+                    let Some(first) = (0..TILE_SIZE).find(|&x| counts(tile.pixel(x, y))) else { continue };
+                    let last = (first..TILE_SIZE).rev().find(|&x| counts(tile.pixel(x, y))).unwrap_or(first);
+                    let (py, px0, px1) = (oy + y as i32, ox + first as i32, ox + last as i32 + 1);
                     bounds = Some(match bounds {
-                        None => (px, py, px + 1, py + 1),
-                        Some((x0, y0, x1, y1)) => (x0.min(px), y0.min(py), x1.max(px + 1), y1.max(py + 1)),
+                        None => (px0, py, px1, py + 1),
+                        Some((x0, y0, x1, _)) => (x0.min(px0), y0, x1.max(px1), py + 1),
                     });
                 }
-            }
-        }
-        bounds
+                bounds
+            })
+            .reduce(|| None, merge)
     }
 
     /// Copie décalée de `(dx, dy)` pixels. Chaque tuile source se répartit sur quatre tuiles au plus.
@@ -487,6 +524,7 @@ impl TileStore {
 
     /// Remplace tout le contenu par un rectangle `width x height` (origine en 0, 0) d'une couleur prémultipliée.
     pub fn fill(&mut self, width: u32, height: u32, px: [u8; 4]) {
+        self.version = fresh_version();
         self.tiles.clear();
         if px[3] == 0 {
             return;
@@ -537,19 +575,38 @@ impl TileStore {
                 (!tile.is_transparent()).then(|| (coord, Arc::new(tile)))
             })
             .collect();
-        Some(Self { background: [0; 4], tiles })
+        Some(Self { background: [0; 4], tiles, version: fresh_version() })
     }
 
     /// Recopie dans ce stockage le rectangle `(x0, y0, x1, y1)` de `other` (mêmes coordonnées). Le
     /// reste n'est pas touché : les tuiles hors du rectangle restent partagées avec l'original.
     pub fn paste(&mut self, other: &Self, (x0, y0, x1, y1): (i32, i32, i32, i32)) {
-        let mut source = Sampler::new(other);
-        for y in y0..y1 {
-            for x in x0..x1 {
-                let (coord, px, py) = TileCoord::of_pixel(x, y);
-                let value = source.get(x, y);
-                if self.get(coord).is_some() || value != [0; 4] {
-                    self.get_mut(coord).set_pixel(px, py, value);
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        let size = TILE_SIZE as i32;
+        let (first, _, _) = TileCoord::of_pixel(x0, y0);
+        let (last, _, _) = TileCoord::of_pixel(x1 - 1, y1 - 1);
+        for ty in first.y..=last.y {
+            for tx in first.x..=last.x {
+                let coord = TileCoord::new(tx, ty);
+                let (ox, oy) = coord.origin();
+                let (cx0, cy0, cx1, cy1) = (x0.max(ox), y0.max(oy), x1.min(ox + size), y1.min(oy + size));
+                let src = other.get(coord);
+                // Rien à écrire : la source est transparente ici et la cible n'a pas de tuile.
+                if src.is_none() && self.get(coord).is_none() {
+                    continue;
+                }
+                // Tuile prise en écriture une fois, puis lignes copiées d'un bloc.
+                let tile = self.get_mut(coord);
+                let row = |y: i32| ((y - oy) as usize * TILE_SIZE as usize + (cx0 - ox) as usize) * 4;
+                let width = (cx1 - cx0) as usize * 4;
+                for y in cy0..cy1 {
+                    let at = row(y);
+                    match src {
+                        Some(src) => tile.bytes_mut()[at..at + width].copy_from_slice(&src.bytes()[at..at + width]),
+                        None => tile.bytes_mut()[at..at + width].fill(0),
+                    }
                 }
             }
         }
@@ -618,6 +675,39 @@ mod read_rect_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `paste` par tuile et `pixel_bounds` parallèle : mêmes résultats que pixel par pixel.
+    #[test]
+    fn paste_and_pixel_bounds_match_the_pixel_by_pixel_definitions() {
+        let mut source = TileStore::new();
+        for (x, y) in [(3, 5), (300, 7), (511, 511), (260, 258)] {
+            source.get_mut(TileCoord::of_pixel(x, y).0).set_pixel((x % 256) as u32, (y % 256) as u32, [10, 20, 30, 255]);
+        }
+        assert_eq!(source.pixel_bounds(|px| px[3] > 0), Some((3, 5, 512, 512)));
+        assert_eq!(TileStore::new().pixel_bounds(|px| px[3] > 0), None);
+        let mut target = TileStore::new();
+        target.get_mut(TileCoord::new(1, 0)).set_pixel(74, 10, [1, 1, 1, 255]);
+        target.get_mut(TileCoord::new(2, 2)).set_pixel(88, 88, [1, 1, 1, 255]);
+        let rect = (2, 4, 320, 300);
+        target.paste(&source, rect);
+        let mut sampler = Sampler::new(&source);
+        let mut result = Sampler::new(&target);
+        for y in 0..700 {
+            for x in 0..700 {
+                let inside = x >= rect.0 && x < rect.2 && y >= rect.1 && y < rect.3;
+                let expected = if inside {
+                    sampler.get(x, y)
+                } else if (x, y) == (330, 10) || (x, y) == (600, 600) {
+                    [1, 1, 1, 255]
+                } else {
+                    [0; 4]
+                };
+                assert_eq!(result.get(x, y), expected, "pixel ({x}, {y})");
+            }
+        }
+        // Tuile vide des deux côtés : pas créée.
+        assert!(target.get(TileCoord::new(0, 1)).is_none());
+    }
 
     #[test]
     fn resident_bytes_follow_allocations_clones_and_drops() {

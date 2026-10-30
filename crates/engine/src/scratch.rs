@@ -36,6 +36,8 @@ use crate::tiles::{MaskTile, Tile, TileBuf, TileCoord};
 pub const MAGIC: &[u8; 8] = b"LUMISWP1";
 /// Extension des fichiers d'échange : c'est elle que le nettoyage au démarrage reconnaît.
 pub const EXTENSION: &str = "lumiswap";
+/// Suffixe du fichier temporaire d'un compactage (`.lumiswap.tmp`), lui aussi effacé au démarrage.
+const TEMP_SUFFIX: &str = "tmp";
 /// Quota par défaut : 20 Gio.
 pub const DEFAULT_QUOTA: u64 = 20 * 1024 * 1024 * 1024;
 /// En dessous, on ne compacte pas : récupérer quelques mégaoctets ne vaut pas une réécriture.
@@ -86,9 +88,15 @@ pub fn clean_leftovers(dir: &Path) -> usize {
     entries
         .flatten()
         .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|e| e == EXTENSION))
+        .filter(|path| is_scratch_file(path))
         .filter(|path| std::fs::remove_file(path).is_ok())
         .count()
+}
+
+/// Fichier d'échange (`.lumiswap`) ou temporaire d'un compactage interrompu (`.lumiswap.tmp`).
+fn is_scratch_file(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else { return false };
+    name.ends_with(&format!(".{EXTENSION}")) || name.ends_with(&format!(".{EXTENSION}.{TEMP_SUFFIX}"))
 }
 
 /// Réglages en vigueur pour une session (les tests en fixent d'autres, propres à leur session).
@@ -325,10 +333,19 @@ impl ScratchFile {
         Ok(())
     }
 
-    /// Réécrit le fichier sans les emplacements inutilisés. Les numéros d'emplacement ne changent pas.
+    /// Réécrit le fichier sans les emplacements inutilisés. Les numéros d'emplacement ne changent pas. En cas
+    /// d'échec, le fichier d'origine reste tel quel (emplacements et descripteur), et le temporaire est supprimé.
     fn compact(&mut self) -> io::Result<()> {
-        let temporary = self.path.with_extension(format!("{EXTENSION}.tmp"));
-        let mut out = io::BufWriter::new(OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&temporary)?);
+        let temporary = self.path.with_extension(format!("{EXTENSION}.{TEMP_SUFFIX}"));
+        let result = self.compact_into(&temporary);
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+        }
+        result
+    }
+
+    fn compact_into(&mut self, temporary: &Path) -> io::Result<()> {
+        let mut out = io::BufWriter::new(OpenOptions::new().read(true).write(true).create(true).truncate(true).open(temporary)?);
         out.write_all(MAGIC)?;
         let mut end = MAGIC.len() as u64;
         let mut moved = self.slots.clone();
@@ -347,8 +364,14 @@ impl ScratchFile {
         }
         let file = out.into_inner().map_err(io::IntoInnerError::into_error)?;
         file.sync_data()?;
-        drop(std::mem::replace(&mut self.file, file));
-        std::fs::rename(&temporary, &self.path)?;
+        // Sous Windows, un fichier ouvert ne peut pas être remplacé par un renommage : l'ancien descripteur est
+        // fermé d'abord. Si le renommage échoue, l'ancien fichier, intact, est rouvert et rien d'autre ne change.
+        let previous = std::mem::replace(&mut self.file, file);
+        drop(previous);
+        if let Err(error) = std::fs::rename(temporary, &self.path) {
+            self.file = OpenOptions::new().read(true).write(true).open(&self.path)?;
+            return Err(error);
+        }
         DISK_BYTES.fetch_sub(self.end - end, Ordering::Relaxed);
         self.end = end;
         self.slots = moved;
@@ -389,9 +412,9 @@ impl SpilledState {
             let tile = file.load(slot)?;
             let missing = || io::Error::other("stockage disparu du squelette d'un état d'historique");
             match (store, tile) {
-                (StoreId::Pixels(id), AnyTile::Rgba(tile)) => Arc::make_mut(doc.pixels_slot(id).ok_or_else(missing)?).restore(coord, Some(tile)),
-                (StoreId::Mask(id), AnyTile::Gray(tile)) => Arc::make_mut(doc.mask_slot(id).ok_or_else(missing)?).restore(coord, Some(tile)),
-                (StoreId::Selection, AnyTile::Gray(tile)) => Arc::make_mut(doc.selection_slot().ok_or_else(missing)?).restore(coord, Some(tile)),
+                (StoreId::Pixels(id), AnyTile::Rgba(tile)) => put_back(doc.pixels_slot(id).ok_or_else(missing)?, coord, Some(tile)),
+                (StoreId::Mask(id), AnyTile::Gray(tile)) => put_back(doc.mask_slot(id).ok_or_else(missing)?, coord, Some(tile)),
+                (StoreId::Selection, AnyTile::Gray(tile)) => put_back(doc.selection_slot().ok_or_else(missing)?, coord, Some(tile)),
                 _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "tuile du mauvais type dans le fichier d'échange")),
             }
         }
@@ -467,17 +490,17 @@ pub(crate) fn spill(file: &SharedScratch, doc: &Document, keep: &std::collection
         match store {
             StoreId::Pixels(id) => {
                 if let Some(slot) = skeleton.pixels_slot(*id) {
-                    Arc::make_mut(slot).restore(*coord, None);
+                    put_back(slot, *coord, None);
                 }
             }
             StoreId::Mask(id) => {
                 if let Some(slot) = skeleton.mask_slot(*id) {
-                    Arc::make_mut(slot).restore(*coord, None);
+                    put_back(slot, *coord, None);
                 }
             }
             StoreId::Selection => {
                 if let Some(slot) = skeleton.selection_slot() {
-                    Arc::make_mut(slot).restore(*coord, None);
+                    put_back(slot, *coord, None);
                 }
             }
         }
@@ -485,7 +508,62 @@ pub(crate) fn spill(file: &SharedScratch, doc: &Document, keep: &std::collection
     Ok(Some(SpilledState { skeleton, tiles, file: Arc::clone(file) }))
 }
 
+/// Retire (`None`) ou remet une tuile d'un stockage SANS changer la version de son contenu : le squelette d'un état
+/// et l'état relu représentent toujours le même contenu que l'état d'origine. Les caches de rendu, qui reconnaissent
+/// un contenu à sa version (voir `tiles::Store`), resservent donc ce qu'ils avaient après un Ctrl+Z relu du disque.
+fn put_back<const C: usize>(slot: &mut Arc<crate::tiles::Store<C>>, coord: TileCoord, tile: Option<Arc<TileBuf<C>>>) {
+    let version = slot.version();
+    let store = Arc::make_mut(slot);
+    store.restore(coord, tile);
+    store.set_version(version);
+}
+
 /// Ménage du fichier avant une série d'écritures (voir [`ScratchFile::tidy`]).
 pub(crate) fn tidy(file: &SharedScratch) -> io::Result<()> {
     file.lock().unwrap_or_else(PoisonError::into_inner).tidy()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tile(seed: u8) -> AnyTile {
+        let mut buf = TileBuf::<4>::filled([seed, 0, 0, 255]);
+        buf.set_pixel(u32::from(seed) % crate::tiles::TILE_SIZE, 3, [1, 2, 3, 255]);
+        AnyTile::Rgba(Arc::new(buf))
+    }
+
+    /// Le compactage garde les emplacements utilisés (relisibles ensuite), écarte les autres, ne laisse aucun
+    /// temporaire ; le nettoyage au démarrage efface aussi un temporaire de compactage abandonné.
+    #[test]
+    fn compaction_keeps_live_slots_and_cleans_temporaries() {
+        let dir = tempfile::tempdir().expect("dossier temporaire");
+        let mut file = ScratchFile::create(dir.path()).expect("fichier d'échange");
+        let kept = tile(7);
+        let dropped = tile(9);
+        let slot_kept = file.slot_for(&kept, u64::MAX).expect("écriture");
+        let slot_dropped = file.slot_for(&dropped, u64::MAX).expect("écriture");
+        file.retain(slot_kept);
+        file.file.flush().expect("flush");
+        drop(kept);
+        drop(dropped);
+        file.by_address.clear();
+        file.by_slot.clear();
+        file.compact().expect("compactage");
+        assert!(file.slots[slot_kept as usize].valid);
+        assert!(!file.slots[slot_dropped as usize].valid);
+        assert!(file.load(slot_dropped).is_err());
+        let back = file.load(slot_kept).expect("relecture");
+        assert_eq!(back.bytes(), tile(7).bytes());
+        assert_eq!(file.end, std::fs::metadata(file.path()).expect("taille").len());
+        let temporary = file.path().with_extension(format!("{EXTENSION}.{TEMP_SUFFIX}"));
+        assert!(!temporary.exists(), "le temporaire est renommé");
+        // Nettoyage au démarrage : fichiers d'échange et temporaires de compactage, rien d'autre.
+        std::fs::write(&temporary, b"x").expect("temporaire");
+        std::fs::write(dir.path().join("note.txt"), b"x").expect("fichier");
+        drop(file);
+        assert_eq!(clean_leftovers(dir.path()), 1);
+        assert!(!temporary.exists());
+        assert!(dir.path().join("note.txt").exists());
+    }
 }

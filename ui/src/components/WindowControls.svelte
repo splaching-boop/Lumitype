@@ -50,7 +50,7 @@
     transition: background 120ms var(--ease), color 120ms var(--ease);
   }
   button:hover {
-    background: rgba(255, 255, 255, 0.08);
+    background: rgb(var(--ink) / 0.08);
     color: var(--text);
   }
   button.close:hover {

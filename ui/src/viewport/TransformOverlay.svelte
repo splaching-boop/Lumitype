@@ -7,9 +7,9 @@
   import { SNAP_PIXELS, edgesAndCenter, setSnapObjects, snapAxis, snapTargets } from "../lib/snapping.svelte";
   import ContextMenu, { type MenuEntry } from "../components/ContextMenu.svelte";
   import { onDestroy } from "svelte";
-  import { cancelTransform, commitTransform, sendTransform, setTransformDragging } from "../lib/transform-session";
+  import { cancelTransform, commitTransform, sendTransform, setTransformDragging, settleTransform } from "../lib/transform-session";
   import { app, type Point, type TransformSession } from "../state/app.svelte";
-  import type { Camera } from "./camera";
+  import { type Camera, clientToDoc } from "./camera";
 
   // Cadre de transformation libre. Toute manipulation se réduit à déplacer les quatre
   // coins du cadre ; la matrice envoyée au moteur est l'homographie « cadre d'origine ->
@@ -46,14 +46,22 @@
 
   let root = $state<SVGSVGElement>();
 
-  function docPoint(event: PointerEvent): Point {
+  function docPoint(event: MouseEvent): Point {
+    // Par la zone de travail : juste aussi quand l'affichage est tourné (outil R).
+    const mapped = clientToDoc(event.clientX, event.clientY);
+    if (mapped) return mapped;
     const rect = (root ?? (event.currentTarget as Element)).getBoundingClientRect();
     return { x: (event.clientX - rect.left - camera.x) / camera.zoom, y: (event.clientY - rect.top - camera.y) / camera.zoom };
   }
 
+  /** Position du pointeur dans le repère du cadre dessiné (celui de `screenQuad`), même vue tournée. */
+  function framePoint(event: MouseEvent): Point {
+    const doc = docPoint(event);
+    return { x: camera.x + doc.x * camera.zoom, y: camera.y + doc.y * camera.zoom };
+  }
+
   function gripAt(event: PointerEvent): Grip | null {
-    const rect = (root ?? (event.currentTarget as Element)).getBoundingClientRect();
-    const at = { x: event.clientX - rect.left, y: event.clientY - rect.top };
+    const at = framePoint(event);
     const near = (p: Point, reach: number) => Math.hypot(p.x - at.x, p.y - at.y) <= reach;
     const corner = screenQuad.findIndex((p) => near(p, HANDLE));
     if (corner >= 0) return { kind: "corner", index: corner };
@@ -165,6 +173,9 @@
   }
 
   function endDrag(): void {
+    // Poignée relâchée : le moteur reçoit, en arrière-plan, une étape en qualité d'aperçu (l'aperçu de la carte
+    // graphique reste affiché jusqu'à l'arrivée de ses textures). La validation enverra le rendu final.
+    if (drag && session.quad.some((p, i) => p.x !== drag?.quad[i]?.x || p.y !== drag?.quad[i]?.y)) settleTransform();
     drag = null;
     setTransformDragging(false);
     app.smartGuides = { x: null, y: null };
@@ -190,7 +201,10 @@
   /** Curseur de rotation tourné vers l'extérieur du cadre, à l'angle `index`. */
   function cornerCursor(index: number): string {
     const corner = screenQuad[index] ?? center;
-    return rotateCursorFor(corner.x - center.x, corner.y - center.y);
+    // Vue tournée (outil R) : le cadre est dessiné droit puis tourné avec l'affichage ; le curseur tourne avec lui.
+    const [dx, dy] = [corner.x - center.x, corner.y - center.y];
+    const [c, s] = [Math.cos(camera.rotation ?? 0), Math.sin(camera.rotation ?? 0)];
+    return rotateCursorFor(dx * c - dy * s, dx * s + dy * c);
   }
 
   /** Cadre modal : le clic vise une poignée, l'intérieur, la zone de rotation… ou rien : on valide alors. */
@@ -222,6 +236,7 @@
     }
     session.quad = previous;
     sendTransform(false);
+    settleTransform();
   }
 
   // ---- Clic droit dans le cadre : rotations droites et miroirs, comme Photoshop.
@@ -239,6 +254,7 @@
     session.steps.push(session.quad);
     session.quad = next;
     sendTransform(false);
+    settleTransform();
   }
 
   const menuEntries = (): MenuEntry[] => [
@@ -258,11 +274,11 @@
    * droit sur l'écran d'accueil, un panneau ou une fenêtre ne concerne jamais la transformation.
    */
   function onContextMenu(event: MouseEvent): void {
-    const box = root?.getBoundingClientRect();
-    if (!box || app.homeVisible) return;
-    const inside = event.target instanceof Node && root?.parentElement?.contains(event.target);
+    // Pinceau ou gomme en main : le clic droit ouvre le menu des pinceaux, jamais celui du cadre.
+    if (!root || app.homeVisible || app.paintTool) return;
+    const inside = event.target instanceof Node && root.parentElement?.contains(event.target);
     if (!inside) return;
-    const local = { x: event.clientX - box.left, y: event.clientY - box.top };
+    const local = framePoint(event);
     if (!pointInQuad(local, screenQuad)) return;
     event.preventDefault();
     event.stopPropagation();
@@ -334,6 +350,14 @@
 {/if}
 
 <style>
+  /* Couleur du cadre : celle de l'outil Déplacement (cadre passif) ; bleu en transformation manuelle (Ctrl+T), comme
+     Photoshop, pour la distinguer nettement du cadre en pointillés gris de l'édition d'un texte de paragraphe. */
+  .overlay {
+    --frame: var(--accent);
+  }
+  .overlay:not(.passive) {
+    --frame: #3d8bff;
+  }
   .overlay {
     position: absolute;
     inset: 0;
@@ -358,7 +382,7 @@
   /* Petit arc visible à chaque angle : on voit où saisir pour faire tourner. */
   .rotate-hint {
     fill: none;
-    stroke: var(--accent);
+    stroke: var(--frame);
     stroke-width: 1.5;
     stroke-linecap: round;
     opacity: 0.85;
@@ -373,11 +397,11 @@
     stroke-width: 3;
   }
   .over {
-    stroke: var(--accent);
+    stroke: var(--frame);
   }
   .handle {
     fill: #fff;
-    stroke: var(--accent);
+    stroke: var(--frame);
     stroke-width: 1;
   }
 </style>

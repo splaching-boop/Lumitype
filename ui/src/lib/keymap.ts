@@ -22,8 +22,8 @@ export interface Chord {
   /** Maj ignorée : « + » s'obtient avec ou sans Maj selon la disposition. */
   shiftOptional?: boolean;
   /**
-   * Accepté aussi avec AltGr. Windows rapporte AltGr comme Ctrl+Alt : à réserver
-   * aux raccourcis Ctrl+Alt dont la touche ne produit aucun caractère avec AltGr.
+   * Raccourci par position de touche accepté aussi avec AltGr (Windows rapporte AltGr comme Ctrl+Alt). Sans effet
+   * sur un raccourci par lettre : il est toujours accepté avec AltGr, voir `resolve`.
    */
   allowAltGr?: boolean;
 }
@@ -46,7 +46,8 @@ function modifiersOf(event: KeyboardEvent): number {
   return (event.ctrlKey ? CTRL : 0) | (event.shiftKey ? SHIFT : 0) | (event.altKey ? ALT : 0);
 }
 
-function isTyping(event: KeyboardEvent): boolean {
+/** La frappe va dans un champ de texte (champ, zone de texte, élément éditable) : les raccourcis se taisent. */
+export function isTyping(event: KeyboardEvent): boolean {
   const target = event.target;
   if (!(target instanceof HTMLElement)) return false;
   if (target instanceof HTMLInputElement) {
@@ -60,27 +61,41 @@ export function resolve<Action extends string>(
   event: KeyboardEvent,
   bindings: readonly Binding<Action>[],
 ): Action | null {
-  // Sous Windows, AltGr est rapporté comme Ctrl+Alt : sans ce garde-fou, taper
-  // « @ » ou « [ » en AZERTY déclencherait des raccourcis Ctrl+Alt.
   if (isTyping(event)) return null;
+  // Sous Windows, Ctrl+Alt et AltGr sont une seule et même chose pour la webview : tout Ctrl+Alt+touche arrive avec
+  // AltGr levé. Deux conséquences, traitées ici :
+  //   - un raccourci par POSITION de touche (chiffres, crochets) ne doit pas se déclencher quand on tape « @ » ou « [ »
+  //     en AZERTY : il n'est accepté avec AltGr que s'il le dit (`allowAltGr`) ;
+  //   - un raccourci par LETTRE (Ctrl+Alt+M, Ctrl+Alt+Z) est sans danger : si AltGr produisait un caractère (« € »),
+  //     c'est lui que la webview rapporte et la lettre ne correspondrait pas. Mais quand AltGr ne produit rien, la
+  //     webview peut ne pas rapporter la lettre non plus : la touche est alors reconnue par sa position, d'après la
+  //     disposition du clavier (ou, sans elle, d'après son nom : « KeyM » → « m »).
   const altGr = event.getModifierState("AltGraph");
-
-  const mods = modifiersOf(event);
+  // Avec AltGr levé, la webview rapporte Ctrl et Alt RELÂCHÉS (`ctrlKey`, `altKey` à faux) : sans cette ligne,
+  // Ctrl+Alt+M était lu comme un simple M (outil Rectangle de sélection). Même règle que `chordFromEvent`.
+  const mods = modifiersOf(event) | (altGr ? CTRL | ALT : 0);
   const pressedKey = event.key.toLowerCase();
+  const positional = altGr ? (layout?.get(event.code) ?? (/^Key[A-Z]$/.test(event.code) ? event.code.slice(3) : "")).toLowerCase() : "";
+  const hits = (chord: Chord) => (chord.match === "key" ? pressedKey === chord.value || (positional !== "" && positional === chord.value) : event.code === chord.value);
+  // Un raccourci aux modificateurs exacts l'emporte sur un raccourci « Maj facultatif » (Ctrl+Maj+; passe avant Ctrl+;).
+  let loose: Action | null = null;
   for (const { action, chord } of bindings) {
-    if (altGr && !chord.allowAltGr) continue;
-    const ignore = chord.shiftOptional ? SHIFT : 0;
-    if ((mods & ~ignore) !== (chord.mods & ~ignore)) continue;
-    if (chord.match === "key" ? pressedKey === chord.value : event.code === chord.value) return action;
+    if (altGr && chord.match === "code" && !chord.allowAltGr) continue;
+    if (!hits(chord)) continue;
+    if (mods === chord.mods) return action;
+    if (loose === null && chord.shiftOptional && (mods & ~SHIFT) === (chord.mods & ~SHIFT)) loose = action;
   }
-  return null;
+  return loose;
 }
 
-/** Deux raccourcis qui se déclencheraient sur la même frappe. */
+/**
+ * Deux raccourcis qui se disputeraient la même frappe. Mêmes modificateurs, ou tous deux « Maj facultatif » à Maj
+ * près ; un raccourci exact ne gêne pas un raccourci « Maj facultatif » (l'exact l'emporte, voir `resolve`).
+ */
 export function chordsConflict(a: Chord, b: Chord): boolean {
   if (a.match !== b.match || a.value !== b.value) return false;
-  const ignore = a.shiftOptional || b.shiftOptional ? SHIFT : 0;
-  return (a.mods & ~ignore) === (b.mods & ~ignore);
+  if (a.mods === b.mods) return true;
+  return Boolean(a.shiftOptional && b.shiftOptional) && (a.mods & ~SHIFT) === (b.mods & ~SHIFT);
 }
 
 const MODIFIER_KEYS = new Set(["Control", "Shift", "Alt", "AltGraph", "Meta"]);
@@ -112,7 +127,7 @@ void (navigator as Navigator & { keyboard?: KeyboardApi }).keyboard?.getLayoutMa
 );
 
 const CODE_LABELS: Record<string, string> = {
-  Backspace: "Retour arr.",
+  Backspace: "⌫",
   Delete: "Suppr",
   // Le pavé numérique est nommé : « Ctrl++ » et « Ctrl+Pavé + » sont deux raccourcis distincts.
   NumpadAdd: "Pavé +",

@@ -1,0 +1,28 @@
+# Image de construction de ./packaging/linux.sh --compat : Ubuntu 22.04, donc glibc 2.35.
+# Les paquets compilés ici démarrent sur toute distribution dont la glibc est 2.35 ou plus récente
+# (Linux Mint 21+, Ubuntu 22.04+, Debian 12+, Fedora 36+, Arch…).
+# Préparée une seule fois par linux.sh (podman ou docker build), puis réutilisée. Changer ce fichier : augmenter le
+# numéro de l'image dans linux.sh (IMAGE="lumitype-build:ubuntu22.04-N") pour qu'elle soit refaite.
+FROM docker.io/library/ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8 LC_ALL=C.UTF-8
+
+# Outils de construction et bibliothèques de développement (les mêmes que linux.sh demande sous Debian/Ubuntu),
+# CMake et Ninja pour l'enveloppe C++ de Chromium (CEF), nasm pour l'encodeur AVIF.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl gnupg build-essential pkg-config file binutils git xz-utils zstd \
+      libwebkit2gtk-4.1-dev libgtk-3-dev libssl-dev librsvg2-dev libxdo-dev libayatana-appindicator3-dev \
+      cmake ninja-build nasm \
+    && rm -rf /var/lib/apt/lists/*
+
+# Node.js 20 (celui d'Ubuntu 22.04 est trop ancien), depuis le dépôt officiel NodeSource.
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# Rust stable par rustup (celui d'Ubuntu 22.04 est trop ancien), pour tous les utilisateurs du conteneur.
+ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo PATH=/usr/local/cargo/bin:$PATH
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable --no-modify-path \
+    && chmod -R a+w "$RUSTUP_HOME" "$CARGO_HOME"
+
+WORKDIR /src

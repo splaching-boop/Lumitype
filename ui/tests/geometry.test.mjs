@@ -55,3 +55,6 @@ assert.deepEqual(g.decompose({ x: 3, y: 8 }, { x: 1, y: 0 }, { x: 0, y: 2 }), [3
 assert.equal(g.snapOffset([98, 148, 198], [0, 150, 300], 8), 2);
 assert.equal(g.snapOffset([40], [0, 150, 300], 8), 0);
 console.log("OK — géométrie : homographie, cadre, échelle proportionnelle, magnétisme.");
+
+// Rotation de l'affichage (camera.ts) : même famille de calculs, même commande.
+await import("./view-rotation.test.mjs");

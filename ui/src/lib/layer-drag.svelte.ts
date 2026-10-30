@@ -64,7 +64,12 @@ interface Gesture {
   ghost: HTMLElement | null;
   frame: number;
   tabTimer: ReturnType<typeof setTimeout> | undefined;
+  /** Stylet signalé levé (sans `pointerup`) depuis cet instant ; `null` : pointe posée. */
+  liftedAt?: number | null;
 }
+
+/** Durée d'un lever du stylet sans `pointerup` au-delà de laquelle le geste s'arrête (ms). */
+const PEN_LIFT_MS = 250;
 
 let gesture: Gesture | null = null;
 
@@ -113,10 +118,16 @@ function onMove(event: PointerEvent): void {
   const g = gesture;
   if (!g || event.pointerId !== g.pointerId) return;
   // Bouton relâché sans que `pointerup` nous soit parvenu (relâché hors de la fenêtre avant la capture, événement
-  // perdu par le gestionnaire de fenêtres) : le geste s'arrête là, sans dépôt.
+  // perdu par le gestionnaire de fenêtres) : le geste s'arrête là, sans dépôt. Stylet : à faible pression, Windows
+  // signale par instants la pointe comme levée au milieu du geste ; seul un lever qui dure (ou `pointerup`) compte,
+  // sinon il fallait appuyer à fond pour réordonner les calques.
   if ((event.buttons & 1) === 0) {
-    finish();
-    return;
+    if (event.pointerType !== "pen" || event.timeStamp - (g.liftedAt ??= event.timeStamp) > PEN_LIFT_MS) {
+      finish();
+      return;
+    }
+  } else {
+    g.liftedAt = null;
   }
   g.x = event.clientX;
   g.y = event.clientY;

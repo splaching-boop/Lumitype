@@ -14,7 +14,7 @@ const source = fs
   .replace(/^import .*$/gm, "");
 const out = path.join(here, "../../node_modules/.cache-performance.mjs");
 fs.writeFileSync(out, ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 } }).outputText);
-const { ASSUMED_VRAM_MB, DEFAULT_PERFORMANCE, gpuMemoryBudgetMb, gpuPercentOf, isIntegratedGpu, memoryPercentOf, mergeStoredPerformance, scratchQuotaOf } = await import(pathToFileURL(out).href);
+const { ASSUMED_VRAM_MB, DEFAULT_PERFORMANCE, engineMemoryPercent, gpuMemoryBudgetMb, gpuPercentOf, isIntegratedGpu, laptopModeActive, memoryPercentOf, mergeStoredPerformance, scratchQuotaOf } = await import(pathToFileURL(out).href);
 
 // ---- Défauts et bornes des curseurs.
 assert.equal(DEFAULT_PERFORMANCE.memoryPercent, 50);
@@ -29,18 +29,33 @@ assert.equal(gpuPercentOf({ gpuMemoryPercent: 3 }), 10);
 const perf = { ...DEFAULT_PERFORMANCE };
 assert.equal(gpuMemoryBudgetMb(perf, { vramMb: 24576, vramShared: false, ramMb: 65536 }), 12288, "50 % de 24 Gio");
 assert.equal(isIntegratedGpu({ vramMb: 24576, vramShared: false }), false);
-// Carte intégrée (mémoire dédiée petite, ou signalée comme partagée) : min(part × VRAM, un quart de la mémoire vive).
+// Carte intégrée, mode portable désactivé à la main (budgets séparés) : min(part × VRAM, un quart de la mémoire vive).
+const desk = { ...perf, laptopAuto: false, laptopMode: false };
 assert.equal(isIntegratedGpu({ vramMb: 512 }), true, "moins d'un gibioctet dédié");
 assert.equal(isIntegratedGpu({ vramMb: 16384, vramShared: true }), true, "partagée, même grande");
-assert.equal(gpuMemoryBudgetMb(perf, { vramMb: 16384, vramShared: true, ramMb: 32768 }), 8192, "50 % de 16 Gio partagés = 8 Gio, dans le quart de 32 Gio");
-assert.equal(gpuMemoryBudgetMb({ ...perf, gpuMemoryPercent: 80 }, { vramMb: 16384, vramShared: true, ramMb: 32768 }), 8192, "80 % dépasserait le quart de la mémoire vive : borné");
-assert.equal(gpuMemoryBudgetMb(perf, { vramMb: 512, ramMb: 8192 }), 256, "petite carte : la part de sa mémoire dédiée");
+assert.equal(gpuMemoryBudgetMb(desk, { vramMb: 16384, vramShared: true, ramMb: 32768 }), 8192, "50 % de 16 Gio partagés = 8 Gio, dans le quart de 32 Gio");
+assert.equal(gpuMemoryBudgetMb({ ...desk, gpuMemoryPercent: 80 }, { vramMb: 16384, vramShared: true, ramMb: 32768 }), 8192, "80 % dépasserait le quart de la mémoire vive : borné");
+assert.equal(gpuMemoryBudgetMb(desk, { vramMb: 512, ramMb: 8192 }), 256, "petite carte : la part de sa mémoire dédiée");
 // Mémoire non détectée : 2 Gio supposés.
 assert.equal(ASSUMED_VRAM_MB, 2048);
 assert.equal(isIntegratedGpu({ vramMb: null }), true);
-assert.equal(gpuMemoryBudgetMb(perf, { vramMb: null, ramMb: 16384 }), 1024, "50 % de 2 Gio supposés");
-assert.equal(gpuMemoryBudgetMb(perf, { vramMb: null, ramMb: 2048 }), 512, "… mais jamais plus d'un quart de la mémoire vive");
-assert.equal(gpuMemoryBudgetMb(perf, { vramMb: null }), 1024, "mémoire vive inconnue aussi : pas de borne");
+assert.equal(gpuMemoryBudgetMb(desk, { vramMb: null, ramMb: 16384 }), 1024, "50 % de 2 Gio supposés");
+assert.equal(gpuMemoryBudgetMb(desk, { vramMb: null, ramMb: 2048 }), 512, "… mais jamais plus d'un quart de la mémoire vive");
+assert.equal(gpuMemoryBudgetMb(desk, { vramMb: null }), 1024, "mémoire vive inconnue aussi : pas de borne");
+
+// ---- Mode portable : automatique par défaut (carte intégrée), ou choisi à la main.
+assert.equal(DEFAULT_PERFORMANCE.laptopAuto, true);
+assert.equal(laptopModeActive(perf, { vramMb: 128, ramMb: 8192 }), true, "128 Mio réservés : carte intégrée, mode portable");
+assert.equal(laptopModeActive(perf, { vramMb: 8192, vramShared: false, ramMb: 16384 }), false, "carte dédiée : pas de mode portable");
+assert.equal(laptopModeActive(perf, { vramMb: null, gpuName: "NVIDIA GeForce RTX 3060" }), false, "nom d'une carte dédiée : il l'emporte sur une mémoire inconnue");
+assert.equal(laptopModeActive(perf, { vramMb: 4096, vramShared: false, gpuName: "Intel(R) UHD Graphics 620" }), true, "nom d'une carte intégrée");
+assert.equal(laptopModeActive({ ...perf, laptopAuto: false, laptopMode: true }, { vramMb: 8192, vramShared: false }), true, "forcé à la main");
+assert.equal(laptopModeActive({ ...perf, laptopAuto: false, laptopMode: false }, { vramMb: 128 }), false, "désactivé à la main");
+// Un seul budget : la carte reçoit 1/8 de la mémoire vive (et non les 128 Mio réservés), pris sur la part du moteur.
+assert.equal(gpuMemoryBudgetMb(perf, { vramMb: 128, ramMb: 8192 }), 1024, "1/8 de 8 Gio");
+assert.equal(engineMemoryPercent(perf, { vramMb: 128, ramMb: 8192 }), 38, "50 % − 12,5 % pour la carte graphique");
+assert.equal(engineMemoryPercent({ ...perf, memoryPercent: 15 }, { vramMb: 128, ramMb: 8192 }), 10, "jamais sous 10 %");
+assert.equal(engineMemoryPercent(perf, { vramMb: 8192, vramShared: false, ramMb: 16384 }), 50, "carte dédiée : rien de retiré");
 
 // ---- Lecture d'un fichier de réglages : les anciennes clés sont ignorées, les absentes gardent leur défaut.
 const legacy = mergeStoredPerformance({ cacheMb: 4096, gpuMemoryMb: 2048, cores: 4, historyStates: 80, unknown: true });

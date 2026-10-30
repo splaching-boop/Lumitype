@@ -15,10 +15,10 @@ fn rendered(doc: &Document) -> [u8; 4] {
 fn an_adjustment_layer_changes_the_picture() {
     let mut doc = Document::with_background("x", 256, 256, 72.0, Background::White).expect("document");
     assert_eq!(rendered(&doc), [255; 4], "fond blanc");
-    // Inverser laisse le papier (blanc pur) blanc : c'est Négatif qui le rend noir.
-    let paper = doc.add_adjustment_layer(Adjustment::Invert, None, 1, false).expect("réglage");
-    assert_eq!(rendered(&doc), [255; 4], "Inverser épargne le blanc pur");
-    doc.remove_layers(&[paper]).expect("retrait");
+    // Inverser, comme Photoshop, retourne aussi le blanc pur ; Négatif fait le même calcul.
+    let inverted = doc.add_adjustment_layer(Adjustment::Invert, None, 1, false).expect("réglage");
+    assert_eq!(rendered(&doc), [0, 0, 0, 255], "Inverser rend le blanc noir");
+    doc.remove_layers(&[inverted]).expect("retrait");
     let layer = doc.add_adjustment_layer(Adjustment::Negative, None, 1, false).expect("réglage");
     assert_eq!(rendered(&doc), [0, 0, 0, 255], "négatif du blanc");
 

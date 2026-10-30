@@ -5,7 +5,7 @@
   import { edit } from "../lib/engine";
   import type { DocumentInfo } from "../lib/ipc";
   import { app } from "../state/app.svelte";
-  import type { Camera } from "./camera";
+  import { type Camera, clientToDoc } from "./camera";
 
   // Recadrage : un cadre à huit poignées sur l'image, tout ce qui est dehors est assombri. Le cadre
   // peut dépasser du document pour agrandir la zone de travail. Entrée ou double-clic valide,
@@ -47,6 +47,9 @@
   const CURSORS = ["nwse-resize", "ns-resize", "nesw-resize", "ew-resize", "", "ew-resize", "nesw-resize", "ns-resize", "nwse-resize"];
 
   function docPoint(event: PointerEvent): { x: number; y: number } {
+    // Par la zone de travail : juste aussi quand l'affichage est tourné (outil R).
+    const mapped = clientToDoc(event.clientX, event.clientY);
+    if (mapped) return mapped;
     const rect = root?.getBoundingClientRect();
     return { x: (event.clientX - (rect?.left ?? 0) - camera.x) / camera.zoom, y: (event.clientY - (rect?.top ?? 0) - camera.y) / camera.zoom };
   }

@@ -7,7 +7,9 @@
 //!   insérés après le segment JFIF ;
 //! - WebP : conteneur étendu (`VP8X` avec les drapeaux EXIF et XMP), morceaux `EXIF` et `XMP ` après l'image ;
 //! - TIFF : les mêmes entrées EXIF ajoutées à l'IFD principal (réécrit en fin de fichier), plus le XMP (tag 700) ;
-//!   la réécriture d'IFD sert aussi, hors métadonnées, à déclarer l'alpha du TIFF (`tiff_with_unassociated_alpha`).
+//!   la réécriture d'IFD sert aussi, hors métadonnées, à déclarer l'alpha du TIFF (`tiff_with_unassociated_alpha`) ;
+//! - AVIF : le même bloc EXIF, en élément `Exif` du conteneur, écrit à l'encodage (`crate::io`) ; pas de XMP
+//!   (`avif-serialize` ne sait pas en joindre) : ni mots-clés ni contact.
 //!
 //! Le XMP porte aussi ce que l'EXIF n'a pas : les mots-clés (`dc:subject`), le site ou contact
 //! (`xmpRights:WebStatement`) et la date au format ISO.
@@ -41,6 +43,11 @@ pub struct ImageMetadata {
 impl ImageMetadata {
     pub fn is_empty(&self) -> bool {
         self.author.is_empty() && self.copyright.is_empty() && self.description.is_empty() && self.keywords.is_empty() && self.contact.is_empty() && self.software.is_empty() && self.created.is_empty()
+    }
+
+    /// Vrai si au moins un champ s'écrit en EXIF (les mots-clés et le contact ne vont que dans le XMP).
+    pub(crate) fn has_exif(&self) -> bool {
+        !self.exif_entries().is_empty()
     }
 
     /// Entrées EXIF de l'IFD principal : (tag, texte), triées par tag comme l'exige le TIFF.
@@ -169,6 +176,10 @@ pub fn embed(format: ExportFormat, bytes: Vec<u8>, metadata: &ImageMetadata) -> 
         ExportFormat::Jpeg => embed_jpeg(bytes, metadata),
         ExportFormat::Webp => embed_webp(bytes, metadata),
         ExportFormat::Tiff => embed_tiff(bytes, metadata),
+        // Le PDF inscrit les siennes lui-même (dictionnaire Info et flux XMP, voir `crate::pdf`).
+        ExportFormat::Pdf => Ok(bytes),
+        // L'AVIF aussi, à l'encodage : son conteneur est refait autour des flux AV1 (voir `crate::io`).
+        ExportFormat::Avif => Ok(bytes),
     }
 }
 
@@ -358,6 +369,8 @@ pub(crate) enum TiffValue {
     Bytes(Vec<u8>),
     /// Type SHORT (3) : un entier 16 bits.
     Short(u16),
+    /// Type UNDEFINED (7) : octets opaques (profil ICC, tag 34675).
+    Undefined(Vec<u8>),
 }
 
 /// Réécrit l'IFD principal d'un TIFF avec des entrées en plus (une entrée existante de même tag est remplacée) et
@@ -410,6 +423,7 @@ pub(crate) fn tiff_with_entries(mut bytes: Vec<u8>, extra: Vec<(u16, TiffValue)>
                 (2, data.len() as u32, data)
             }
             TiffValue::Bytes(data) => (1, data.len() as u32, data),
+            TiffValue::Undefined(data) => (7, data.len() as u32, data),
             TiffValue::Short(v) => (3, 1, put_u16(v).to_vec()),
         };
         let mut entry = [0u8; 12];

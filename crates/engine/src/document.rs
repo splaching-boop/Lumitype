@@ -12,17 +12,20 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::blend::BlendMode;
+use crate::blend::{BlendIf, BlendMode};
+use crate::color_mode::ColorMode;
 use crate::error::EngineError;
 use crate::adjust::Adjustment;
 use crate::effects::LayerEffect;
-use crate::filters::{self, Filter};
+use crate::fill::{self, FillContent};
+use crate::filters::Filter;
 use crate::paint::{Brush, Stroke, StrokePoint};
 use crate::path::SubPath;
 use crate::pixel::{mul_div_255, premultiply, unpremultiply};
 use crate::selection::{combine, magic_wand, CombineMode, Shape};
 use crate::shape::{self, ShapeData};
 use crate::smart::{self, ContentId, SmartContent, SmartGeometry, SmartSource};
+use crate::smart_filters::{self, LayerFilters, SmartFilter};
 use crate::text::{self, TextData};
 use crate::tiles::{MaskStore, Sampler, Tile, TileCoord, TileStore, MAX_DIMENSION, TILE_SIZE};
 use crate::transform::{transform_store, Matrix, Quality};
@@ -56,6 +59,8 @@ pub struct LayerProps {
     /// Masque d'écrêtage : ce calque n'est visible qu'à travers l'alpha du
     /// premier calque non écrêté situé sous lui.
     pub clipped: bool,
+    /// Comparaison (options de fusion) : `None`, ou des plages qui ne sont pas entières (voir `LayerProps::range`).
+    pub blend_if: Option<BlendIf>,
 }
 
 impl LayerProps {
@@ -68,7 +73,14 @@ impl LayerProps {
             blend,
             locks: Locks::default(),
             clipped: false,
+            blend_if: None,
         }
+    }
+
+    /// Comparaison qui agit vraiment : ni plages entières, ni groupe en Transfert (qui n'a pas de contenu propre à
+    /// comparer).
+    pub fn range(&self) -> Option<BlendIf> {
+        self.blend_if.filter(|r| !r.is_identity() && self.blend != BlendMode::PassThrough)
     }
 }
 
@@ -77,6 +89,9 @@ impl LayerProps {
 pub struct Mask {
     pub pixels: Arc<MaskStore>,
     pub enabled: bool,
+    /// Lié au calque (la chaîne entre les vignettes, comme dans Photoshop) : déplacer le calque déplace son masque,
+    /// même si c'est la vignette des pixels qui est ciblée. Délié, chaque partie se déplace seule.
+    pub linked: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -96,7 +111,10 @@ pub enum LayerKind {
     /// que Ctrl+T modifie, sans jamais pixelliser. `raster` n'est qu'un cache : l'aplat du contenu transformé, égal à
     /// l'aplat lui-même (partagé) quand la transformation est l'identité.
     Smart { content: Arc<SmartContent>, transform: Matrix, raster: Arc<TileStore> },
-    // Forme vectorielle : à venir.
+    /// Calque de remplissage (couleur unie, dégradé, motif ; module `fill`). `raster` n'est qu'un cache du
+    /// rendu, qui couvre exactement le document : recalculé quand le remplissage, la position du calque
+    /// ou la taille du document change.
+    Fill { fill: FillContent, raster: Arc<TileStore> },
 }
 
 /// Couleur d'étiquette d'un calque ou d'un dossier dans le panneau (repère visuel, sans effet sur l'image).
@@ -126,7 +144,39 @@ pub struct Layer {
     pub mask: Option<Mask>,
     /// Effets de calque (ombre portée, lueurs, contour…), non destructifs.
     pub effects: Vec<LayerEffect>,
+    /// Filtres dynamiques (calque de pixels) : les pixels du calque en sont le résultat, l'origine est gardée.
+    pub filters: Option<LayerFilters>,
+    /// Plan de travail : ce groupe est un format (cadre, fond, découpe). Voir `Document::add_artboard`.
+    pub artboard: Option<Artboard>,
     pub kind: LayerKind,
+}
+
+/// Plan de travail : un groupe qui porte un format. Son cadre est en pixels du document ; la découpe passe par le
+/// masque du groupe (un rectangle tenu à jour par le moteur) et le fond par un calque de remplissage placé tout en bas
+/// du groupe : composition, carte graphique, vignettes et export n'ont donc rien de particulier à savoir.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Artboard {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+    /// Couleur du fond ; `None` : transparent.
+    #[serde(default)]
+    pub background: Option<[u8; 3]>,
+    /// Le contenu qui déborde du cadre est caché.
+    #[serde(default = "artboard_clip")]
+    pub clip: bool,
+    /// Nom du format d'origine (« Twitch · Bannière »…), pour l'affichage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset: Option<String>,
+    /// Calque de fond géré par le plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background_layer: Option<LayerId>,
+}
+
+fn artboard_clip() -> bool {
+    true
 }
 
 impl Layer {
@@ -137,7 +187,7 @@ impl Layer {
     pub fn children(&self) -> &[LayerId] {
         match &self.kind {
             LayerKind::Group { children, .. } => children,
-            LayerKind::Pixel { .. } | LayerKind::Text { .. } | LayerKind::Shape { .. } | LayerKind::Adjustment { .. } | LayerKind::Smart { .. } => &[],
+            LayerKind::Pixel { .. } | LayerKind::Text { .. } | LayerKind::Shape { .. } | LayerKind::Adjustment { .. } | LayerKind::Smart { .. } | LayerKind::Fill { .. } => &[],
         }
     }
 
@@ -152,8 +202,16 @@ impl Layer {
     pub fn pixels(&self) -> Option<&Arc<TileStore>> {
         match &self.kind {
             LayerKind::Pixel { pixels } => Some(pixels),
-            LayerKind::Text { raster, .. } | LayerKind::Shape { raster, .. } | LayerKind::Smart { raster, .. } => Some(raster),
+            LayerKind::Text { raster, .. } | LayerKind::Shape { raster, .. } | LayerKind::Smart { raster, .. } | LayerKind::Fill { raster, .. } => Some(raster),
             LayerKind::Group { .. } | LayerKind::Adjustment { .. } => None,
+        }
+    }
+
+    /// Remplissage d'un calque de remplissage.
+    pub fn fill_content(&self) -> Option<&FillContent> {
+        match &self.kind {
+            LayerKind::Fill { fill, .. } => Some(fill),
+            _ => None,
         }
     }
 
@@ -188,11 +246,15 @@ impl Layer {
     }
 }
 
-/// Repère de mise en page. `position` est en pixels du document, le long de l'axe perpendiculaire.
+/// Repère de mise en page. `position` est en pixels du document, le long de l'axe perpendiculaire. Dans un document
+/// à plans de travail, un repère appartient à un plan (`board`) : il n'est dessiné et n'aimante que dans son cadre,
+/// suit le plan quand il bouge et disparaît avec lui. Sans plan, `board` est vide et le repère traverse le document.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Guide {
     pub orientation: Orientation,
     pub position: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub board: Option<LayerId>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -258,6 +320,16 @@ pub struct Document {
     pub guides_locked: bool,
     /// Tracé de travail de la plume.
     pub paths: Vec<SubPath>,
+    /// Mode colorimétrique (Image › Mode) : RVB, niveaux de gris, bitmap ou travail en CMJN. Les pixels restent en
+    /// RGBA8 prémultiplié quel que soit le mode ; voir le module `color_mode` (conversions, rendu final, export).
+    pub(crate) color_mode: ColorMode,
+    /// Styles de caractère du document (voir le module `text_styles`), enregistrés avec lui.
+    pub text_styles: Vec<crate::text_styles::CharStyle>,
+    /// Format d'impression (fonds perdus, zone de sécurité, limite d'encrage), voir le module `print`.
+    /// `None` : document sans format d'impression.
+    pub(crate) print: Option<crate::print::PrintSetup>,
+    /// Temps de travail actif passé sur le projet, en secondes (compté par l'interface, enregistré avec le projet).
+    pub work_seconds: u64,
 }
 
 impl Document {
@@ -265,7 +337,12 @@ impl Document {
         if width == 0 || height == 0 || width > MAX_DIMENSION || height > MAX_DIMENSION {
             return Err(EngineError::InvalidDimensions { width, height, max: MAX_DIMENSION });
         }
-        Ok(Self { name: name.into(), width, height, dpi, nodes: HashMap::new(), root: Vec::new(), next_id: 1, selection: None, guides: Vec::new(), guides_locked: false, paths: Vec::new() })
+        Ok(Self { name: name.into(), width, height, dpi, nodes: HashMap::new(), root: Vec::new(), next_id: 1, selection: None, guides: Vec::new(), guides_locked: false, paths: Vec::new(), color_mode: ColorMode::Rgb, text_styles: Vec::new(), print: None, work_seconds: 0 })
+    }
+
+    /// Mode colorimétrique du document (Image › Mode). Il ne change que par [`Document::convert_color_mode`].
+    pub fn color_mode(&self) -> ColorMode {
+        self.color_mode
     }
 
     pub fn with_background(
@@ -337,6 +414,40 @@ impl Document {
         Ok((parent, index))
     }
 
+    /// Où poser un calque nouveau (import, collage, objet dynamique) « au-dessus de `above` ». Un plan de travail
+    /// est un contexte clos : au-dessus d'un calque d'un plan, le calque reste dans ce plan ; « au-dessus » du plan
+    /// lui-même (le plan est sélectionné), le calque entre dans le plan, en haut de sa pile, et non au-dessus de tous
+    /// les plans. Sans `above` : au sommet de la racine.
+    pub fn placement_slot(&self, above: Option<LayerId>) -> Result<(Option<LayerId>, usize), EngineError> {
+        match above {
+            Some(id) if self.layer(id)?.artboard.is_some() => Ok((Some(id), self.children_of(Some(id))?.len())),
+            Some(id) => self.slot_above(id),
+            None => Ok((None, self.root.len())),
+        }
+    }
+
+    /// Plan de travail qui contient le calque `id` (lui-même compris), ou `None`.
+    pub fn artboard_of(&self, id: LayerId) -> Option<LayerId> {
+        let mut at = Some(id);
+        while let Some(current) = at {
+            let layer = self.layer(current).ok()?;
+            if layer.artboard.is_some() {
+                return Some(current);
+            }
+            at = layer.parent;
+        }
+        None
+    }
+
+    /// Cadre dans lequel un calque nouveau est ajusté et centré, `(x, y, largeur, hauteur)` en pixels du document :
+    /// le plan de travail qui contient `parent`, sinon le document entier.
+    pub fn placement_frame(&self, parent: Option<LayerId>) -> (i32, i32, u32, u32) {
+        parent
+            .and_then(|p| self.artboard_of(p))
+            .and_then(|b| self.layer(b).ok()?.artboard.as_ref().map(|a| (a.x, a.y, a.width.max(1), a.height.max(1))))
+            .unwrap_or((0, 0, self.width, self.height))
+    }
+
     // ---------------------------------------------------------------- création
 
     pub fn add_pixel_layer(
@@ -371,7 +482,7 @@ impl Document {
         self.children_of(parent)?; // valide le parent avant toute modification
         let id = self.next_id;
         self.next_id += 1;
-        self.nodes.insert(id, Arc::new(Layer { id, parent, label: None, offset: (0, 0), props, mask: None, effects: Vec::new(), kind }));
+        self.nodes.insert(id, Arc::new(Layer { id, parent, label: None, offset: (0, 0), props, mask: None, effects: Vec::new(), filters: None, artboard: None, kind }));
         let siblings = self.children_mut(parent)?;
         let index = index.min(siblings.len());
         siblings.insert(index, id);
@@ -437,6 +548,7 @@ impl Document {
         }
         props.opacity = props.opacity.clamp(0.0, 1.0);
         props.fill = props.fill.clamp(0.0, 1.0);
+        props.blend_if = props.blend_if.map(BlendIf::normalized).filter(|r| !r.is_identity());
         layer.props = props;
         Ok(())
     }
@@ -460,6 +572,9 @@ impl Document {
 
     /// Pixels modifiables d'un calque (copie à l'écriture à tous les niveaux).
     pub fn pixels_mut(&mut self, id: LayerId) -> Result<&mut TileStore, EngineError> {
+        if self.layer(id)?.filters.is_some() {
+            return Err(EngineError::InvalidOperation(FILTERED_IS_NOT_PAINTABLE.into()));
+        }
         match &mut self.layer_mut(id)?.kind {
             LayerKind::Pixel { pixels } => Ok(Arc::make_mut(pixels)),
             LayerKind::Group { .. } => Err(EngineError::InvalidOperation("un groupe n'a pas de pixels".into())),
@@ -467,6 +582,7 @@ impl Document {
             LayerKind::Text { .. } => Err(EngineError::InvalidOperation(TEXT_IS_NOT_PAINTABLE.into())),
             LayerKind::Shape { .. } => Err(EngineError::InvalidOperation(SHAPE_IS_NOT_PAINTABLE.into())),
             LayerKind::Smart { .. } => Err(EngineError::InvalidOperation(smart::NOT_PAINTABLE.into())),
+            LayerKind::Fill { .. } => Err(EngineError::InvalidOperation(FILL_IS_NOT_PAINTABLE.into())),
         }
     }
 
@@ -491,7 +607,7 @@ impl Document {
             Some(selection) => selection.translated(-ox, -oy), // le masque vit en repère du calque
             None => MaskStore::with_background(if reveal_all { [255] } else { [0] }),
         };
-        layer.mask = Some(Mask { pixels: Arc::new(pixels), enabled: true });
+        layer.mask = Some(Mask { pixels: Arc::new(pixels), enabled: true, linked: true });
         Ok(())
     }
 
@@ -507,6 +623,17 @@ impl Document {
         match &mut self.layer_mut(id)?.mask {
             Some(mask) => {
                 mask.enabled = enabled;
+                Ok(())
+            }
+            None => Err(EngineError::InvalidOperation("ce calque n'a pas de masque de fusion".into())),
+        }
+    }
+
+    /// Lie ou délie le masque de son calque (voir `Mask::linked`).
+    pub fn set_mask_linked(&mut self, id: LayerId, linked: bool) -> Result<(), EngineError> {
+        match &mut self.layer_mut(id)?.mask {
+            Some(mask) => {
+                mask.linked = linked;
                 Ok(())
             }
             None => Err(EngineError::InvalidOperation("ce calque n'a pas de masque de fusion".into())),
@@ -537,6 +664,10 @@ impl Document {
         }
         for layer in self.nodes.values_mut().map(Arc::make_mut) {
             layer.offset = (layer.offset.0 - x, layer.offset.1 - y);
+            if let Some(board) = &mut layer.artboard {
+                board.x -= x;
+                board.y -= y;
+            }
         }
         if let Some(selection) = self.selection.take() {
             // La sélection est recalée puis limitée au nouveau cadre.
@@ -555,10 +686,22 @@ impl Document {
             }
         }
         (self.width, self.height) = (width, height);
+        // Calques de remplissage : recalés sur le nouveau cadre (position remise à zéro, masque compris),
+        // comme Photoshop aligne le remplissage sur la zone de travail.
+        let fills: Vec<LayerId> = self.nodes.values().filter(|l| l.fill_content().is_some()).map(|l| l.id).collect();
+        for id in fills {
+            let layer = self.layer_mut(id)?;
+            let (ox, oy) = layer.offset;
+            layer.offset = (0, 0);
+            if let Some(mask) = layer.mask.as_mut().filter(|_| (ox, oy) != (0, 0)) {
+                mask.pixels = Arc::new(mask.pixels.translated(ox, oy));
+            }
+            self.refresh_fill(id)?;
+        }
         Ok(())
     }
 
-    fn ensure_paintable(&self, id: LayerId) -> Result<Locks, EngineError> {
+    pub(crate) fn ensure_paintable(&self, id: LayerId) -> Result<Locks, EngineError> {
         if self.layer(id)?.text().is_some() {
             return Err(EngineError::InvalidOperation(TEXT_IS_NOT_PAINTABLE.into()));
         }
@@ -567,6 +710,12 @@ impl Document {
         }
         if self.layer(id)?.smart().is_some() {
             return Err(EngineError::InvalidOperation(smart::NOT_PAINTABLE.into()));
+        }
+        if self.layer(id)?.fill_content().is_some() {
+            return Err(EngineError::InvalidOperation(FILL_IS_NOT_PAINTABLE.into()));
+        }
+        if self.layer(id)?.filters.is_some() {
+            return Err(EngineError::InvalidOperation(FILTERED_IS_NOT_PAINTABLE.into()));
         }
         let locks = self.layer(id)?.props.locks;
         if locks.all || locks.pixels {
@@ -578,7 +727,7 @@ impl Document {
     /// Applique `edit(pixel, force)` aux pixels du calque situés dans le document et
     /// dans la sélection. `force` vaut `1..=255` (valeur de la sélection, 255 sans sélection).
     /// `only_existing` : les tuiles absentes (transparentes) ne sont pas créées.
-    fn edit_selected_pixels(
+    pub(crate) fn edit_selected_pixels(
         &mut self,
         id: LayerId,
         only_existing: bool,
@@ -642,24 +791,17 @@ impl Document {
         })
     }
 
-    /// Ctrl+I : inverse les couleurs des pixels du calque (dans la sélection s'il y en a une), avec
-    /// la courbe `adjust::invert` — la même que le calque de réglage Inverser, destructive ici, le
-    /// papier (blanc pur) restant blanc ; l'alpha n'est pas touché.
+    /// Ctrl+I : inverse les couleurs des pixels du calque (dans la sélection s'il y en a une) : `255 - v`
+    /// sur la couleur droite, comme Photoshop et le calque de réglage Inverser ; l'alpha n'est pas touché.
     pub fn invert_layer(&mut self, id: LayerId) -> Result<(), EngineError> {
         self.ensure_paintable(id)?;
-        let table = crate::adjust::invert_table();
         self.edit_selected_pixels(id, true, move |px, force, _| {
             if px[3] == 0 {
                 return;
             }
-            // La courbe s'applique à la couleur droite : on sort du prémultiplié, puis on y revient.
+            // L'inversion porte sur la couleur droite : on sort du prémultiplié, puis on y revient.
             let straight = unpremultiply([px[0], px[1], px[2], px[3]]);
-            let paper = crate::adjust::paper_weight([f32::from(straight[0]) / 255.0, f32::from(straight[1]) / 255.0, f32::from(straight[2]) / 255.0]);
-            let mix = |c: usize| {
-                let inverted = f32::from(table[usize::from(straight[c])]);
-                (inverted + (f32::from(straight[c]) - inverted) * paper + 0.5) as u8
-            };
-            let inverted = premultiply([mix(0), mix(1), mix(2), px[3]]);
+            let inverted = premultiply([255 - straight[0], 255 - straight[1], 255 - straight[2], px[3]]);
             for (channel, target) in px.iter_mut().zip(inverted).take(3) {
                 *channel = mul_div_255(target, force).saturating_add(mul_div_255(*channel, 255 - force));
             }
@@ -692,17 +834,32 @@ impl Document {
             return Ok(());
         };
         let Some((x0, y0, x1, y1)) = selection.pixel_bounds(|v| v[0] > 0) else { return Ok(()) };
+        // Tuile du masque prise en écriture une fois par tuile (et seulement si la sélection y touche), pas à
+        // chaque pixel.
+        let size = TILE_SIZE as i32;
+        let (first, _, _) = TileCoord::of_pixel(x0 - ox, y0 - oy);
+        let (last, _, _) = TileCoord::of_pixel(x1 - 1 - ox, y1 - 1 - oy);
         let mut chosen = Sampler::new(&selection);
-        for y in y0..y1 {
-            for x in x0..x1 {
-                let force = u32::from(chosen.get(x, y)[0]);
-                if force == 0 {
+        for ty in first.y..=last.y {
+            for tx in first.x..=last.x {
+                let coord = TileCoord::new(tx, ty);
+                let (lx, ly) = coord.origin();
+                let (cx0, cy0, cx1, cy1) = ((x0 - ox).max(lx), (y0 - oy).max(ly), (x1 - ox).min(lx + size), (y1 - oy).min(ly + size));
+                if !selection.any_nonzero_in((cx0 + ox, cy0 + oy, cx1 + ox, cy1 + oy)) {
                     continue;
                 }
-                let (coord, px, py) = TileCoord::of_pixel(x - ox, y - oy);
                 let tile = store.get_mut(coord);
-                let old = u32::from(tile.pixel(px, py)[0]);
-                tile.set_pixel(px, py, [((old * (255 - force) + 127) / 255) as u8]);
+                for y in cy0..cy1 {
+                    for x in cx0..cx1 {
+                        let force = u32::from(chosen.get(x + ox, y + oy)[0]);
+                        if force == 0 {
+                            continue;
+                        }
+                        let (px, py) = ((x - lx) as u32, (y - ly) as u32);
+                        let old = u32::from(tile.pixel(px, py)[0]);
+                        tile.set_pixel(px, py, [((old * (255 - force) + 127) / 255) as u8]);
+                    }
+                }
             }
         }
         Ok(())
@@ -729,20 +886,35 @@ impl Document {
         let mut mask = MaskStore::with_background([0]);
         let mut any = false;
         if let Some(pixels) = layer.pixels() {
+            // Le calque est décalé : une tuile de pixels couvre jusqu'à quatre tuiles du masque. Chaque tuile du
+            // masque est prise en écriture une fois (au premier pixel opaque), pas à chaque pixel.
+            let size = TILE_SIZE as i32;
             for (coord, tile) in pixels.iter() {
                 let (tx, ty) = coord.origin();
-                for py in 0..TILE_SIZE as i32 {
-                    let y = ty + py + oy;
-                    if y < 0 || y >= height {
-                        continue;
-                    }
-                    for px in 0..TILE_SIZE as i32 {
-                        let x = tx + px + ox;
-                        let alpha = tile.pixel(px as u32, py as u32)[3];
-                        if alpha > 0 && x >= 0 && x < width {
-                            let (target, mx, my) = TileCoord::of_pixel(x, y);
-                            mask.get_mut(target).set_pixel(mx, my, [alpha]);
-                            any = true;
+                let (x0, y0, x1, y1) = ((tx + ox).max(0), (ty + oy).max(0), (tx + ox + size).min(width), (ty + oy + size).min(height));
+                if x0 >= x1 || y0 >= y1 {
+                    continue;
+                }
+                let (first, _, _) = TileCoord::of_pixel(x0, y0);
+                let (last, _, _) = TileCoord::of_pixel(x1 - 1, y1 - 1);
+                for my in first.y..=last.y {
+                    for mx in first.x..=last.x {
+                        let target = TileCoord::new(mx, my);
+                        let (lx, ly) = target.origin();
+                        let (cx0, cy0, cx1, cy1) = (x0.max(lx), y0.max(ly), x1.min(lx + size), y1.min(ly + size));
+                        let opaque = (cy0..cy1).any(|y| (cx0..cx1).any(|x| tile.pixel((x - tx - ox) as u32, (y - ty - oy) as u32)[3] > 0));
+                        if !opaque {
+                            continue;
+                        }
+                        let out = mask.get_mut(target);
+                        for y in cy0..cy1 {
+                            for x in cx0..cx1 {
+                                let alpha = tile.pixel((x - tx - ox) as u32, (y - ty - oy) as u32)[3];
+                                if alpha > 0 {
+                                    out.set_pixel((x - lx) as u32, (y - ly) as u32, [alpha]);
+                                    any = true;
+                                }
+                            }
                         }
                     }
                 }
@@ -881,6 +1053,7 @@ impl Document {
     ///  - réglage libre, sans calque écrêté sur lui ;
     ///  - réglage écrêté sur un calque de base en mode Normal, sans autre calque écrêté AU-DESSUS de lui (la cible
     ///    est alors la base et ce qui est écrêté sous le réglage).
+    ///
     /// Sinon `None` : le moteur rend comme avant.
     pub fn adjustment_preview_plan(&self, id: LayerId) -> Option<(Vec<LayerId>, Vec<LayerId>, Vec<LayerId>)> {
         let layer = self.layer(id).ok()?;
@@ -1102,73 +1275,144 @@ impl Document {
     /// Filtre destructif sur les pixels du calque. Avec une sélection, seule la zone sélectionnée
     /// reçoit le résultat (fondu selon la force de la sélection) ; le verrou de transparence conserve l'alpha.
     pub fn apply_filter(&mut self, id: LayerId, filter: &Filter) -> Result<(), EngineError> {
-        // Un filtre agit sur des pixels : une forme ou un texte sont d'abord pixellisés, dans le même état
-        // d'historique (Ctrl+Z rend la forme ou le texte, réglables comme avant). Leurs effets sont conservés.
+        self.filter_layer(id, filter, false)
+    }
+
+    /// Comme [`Document::apply_filter`], mais un objet dynamique est d'abord pixellisé, dans le même état
+    /// d'historique : un seul Ctrl+Z rend l'objet, et si le filtre échoue rien n'est changé (l'opération est
+    /// abandonnée en bloc par la séance). Sert au filtre Camera Raw, que l'utilisateur a confirmé sur cet objet.
+    pub fn rasterize_and_filter(&mut self, id: LayerId, filter: &Filter) -> Result<(), EngineError> {
+        self.filter_layer(id, filter, true)
+    }
+
+    /// Applique un filtre en **filtre dynamique** : le calque garde ses pixels d'origine, le filtre s'ajoute en haut de
+    /// sa liste (voir `smart_filters`) et ses pixels deviennent le résultat. Une forme, un texte ou un remplissage
+    /// sont d'abord pixellisés, dans le même état d'historique ; un objet dynamique seulement sur demande expresse
+    /// (`rasterize_smart`, filtre Camera Raw). Sélection active au premier filtre : elle devient le masque de filtre.
+    fn filter_layer(&mut self, id: LayerId, filter: &Filter, rasterize_smart: bool) -> Result<(), EngineError> {
         let vector = self.layer(id)?;
-        // Objet dynamique : les filtres dynamiques viendront ; d'ici là, refus explicite plutôt qu'une pixellisation.
-        if vector.smart().is_some() {
+        if vector.smart().is_some() && !rasterize_smart {
             return Err(EngineError::InvalidOperation(smart::NOT_PAINTABLE.into()));
         }
-        if vector.shape().is_some() || vector.text().is_some() {
+        if vector.shape().is_some() || vector.text().is_some() || vector.fill_content().is_some() || vector.smart().is_some() {
             self.rasterize_layer(id)?;
         }
-        let locks = self.ensure_paintable(id)?;
         let layer = self.layer(id)?;
+        if layer.props.locks.all || layer.props.locks.pixels {
+            return Err(EngineError::InvalidOperation("les pixels de ce calque sont verrouillés".into()));
+        }
+        let pixels = Arc::clone(layer.pixels().ok_or_else(|| EngineError::InvalidOperation("un groupe ne se filtre pas".into()))?);
+        if !matches!(layer.kind, LayerKind::Pixel { .. }) {
+            return Err(EngineError::InvalidOperation("seul un calque de pixels se filtre".into()));
+        }
         let offset = layer.offset;
-        let original = Arc::clone(layer.pixels().ok_or_else(|| EngineError::InvalidOperation("un groupe ne se filtre pas".into()))?);
-        let filtered = filters::apply(&original, filter)?;
-        let result = match (&self.selection, locks.transparency) {
-            (None, false) => filtered,
-            (selection, keep_alpha) => {
-                let selection = selection.as_deref();
-                let mut out = TileStore::clone(&original);
-                let mut coords = filtered.sorted_coords();
-                coords.extend(original.sorted_coords());
-                coords.sort_unstable();
-                coords.dedup();
-                let (mut before, mut after) = (Sampler::new(&original), Sampler::new(&filtered));
-                let mut mask = selection.map(Sampler::new);
-                for coord in coords {
-                    let (ox, oy) = coord.origin();
-                    let tile = out.get_mut(coord);
-                    for py in 0..TILE_SIZE {
-                        for px in 0..TILE_SIZE {
-                            let (x, y) = (ox + px as i32, oy + py as i32);
-                            let force = mask.as_mut().map_or(255, |m| m.get(x + offset.0, y + offset.1)[0]);
-                            if force == 0 {
-                                continue;
-                            }
-                            let (old, new) = (before.get(x, y), after.get(x, y));
-                            let mut mixed = [0, 1, 2, 3].map(|c| mul_div_255(new[c], force).saturating_add(mul_div_255(old[c], 255 - force)));
-                            if keep_alpha {
-                                mixed[3] = old[3];
-                                for channel in mixed.iter_mut().take(3) {
-                                    *channel = (*channel).min(old[3]);
-                                }
-                            }
-                            tile.set_pixel(px, py, mixed);
-                        }
-                    }
-                }
-                out
-            }
-        };
+        let mut filters = layer.filters.clone().unwrap_or_else(|| {
+            // Premier filtre : la sélection (repère document) devient le masque de filtre (repère du calque).
+            let mask = self.selection.as_ref().map(|sel| Mask { pixels: Arc::new(sel.translated(-offset.0, -offset.1)), enabled: true, linked: true });
+            LayerFilters { list: Vec::new(), enabled: true, source: pixels, mask }
+        });
+        filters.list.push(SmartFilter::new(filter.clone()));
+        self.layer_mut(id)?.filters = Some(filters);
+        self.refilter(id)
+    }
+
+    /// Recalcule les pixels d'un calque à filtres dynamiques depuis son origine.
+    fn refilter(&mut self, id: LayerId) -> Result<(), EngineError> {
+        let Some(filters) = self.layer(id)?.filters.clone() else { return Ok(()) };
+        let rendered = Arc::new(smart_filters::render(&filters)?);
         match &mut self.layer_mut(id)?.kind {
-            LayerKind::Pixel { pixels } => *pixels = Arc::new(result),
-            _ => return Err(EngineError::InvalidOperation("seul un calque de pixels se filtre".into())),
+            LayerKind::Pixel { pixels } => *pixels = rendered,
+            _ => return Err(EngineError::InvalidOperation("seul un calque de pixels a des filtres dynamiques".into())),
         }
         Ok(())
+    }
+
+    /// Liste des filtres dynamiques d'un calque remplacée (réglage, œil, ordre, options de fusion, suppression) ;
+    /// `enabled` : œil de l'ensemble ; `mask_enabled` : masque de filtre activé ou non. Liste vide : le calque
+    /// redevient un calque de pixels ordinaire, avec ses pixels d'origine.
+    pub fn set_smart_filters(&mut self, id: LayerId, list: Vec<SmartFilter>, enabled: bool, mask_enabled: Option<bool>) -> Result<(), EngineError> {
+        let layer = self.layer_mut(id)?;
+        let Some(filters) = layer.filters.as_mut() else {
+            return Err(EngineError::InvalidOperation("ce calque n'a pas de filtres dynamiques".into()));
+        };
+        if list.is_empty() {
+            let source = Arc::clone(&filters.source);
+            layer.filters = None;
+            if let LayerKind::Pixel { pixels } = &mut layer.kind {
+                *pixels = source;
+            }
+            return Ok(());
+        }
+        filters.list = list;
+        filters.enabled = enabled;
+        if let (Some(mask), Some(on)) = (filters.mask.as_mut(), mask_enabled) {
+            mask.enabled = on;
+        }
+        self.refilter(id)
+    }
+
+    /// Pixellise les filtres dynamiques : le résultat actuel devient les pixels du calque, les filtres disparaissent.
+    pub fn bake_filters(&mut self, id: LayerId) -> Result<(), EngineError> {
+        self.layer_mut(id)?.filters = None;
+        Ok(())
+    }
+
+    /// Retire le masque de filtre : les filtres agissent sur tout le calque.
+    pub fn delete_filter_mask(&mut self, id: LayerId) -> Result<(), EngineError> {
+        if let Some(filters) = self.layer_mut(id)?.filters.as_mut() {
+            filters.mask = None;
+        }
+        self.refilter(id)
+    }
+
+    /// Modifie l'origine d'un calque à filtres dynamiques (conversion de mode colorimétrique…) puis refait les filtres.
+    pub(crate) fn edit_filter_source(&mut self, id: LayerId, edit: impl FnOnce(&TileStore) -> TileStore) -> Result<(), EngineError> {
+        let Some(filters) = self.layer_mut(id)?.filters.as_mut() else { return Ok(()) };
+        filters.source = Arc::new(edit(&filters.source));
+        self.refilter(id)
+    }
+
+    /// Ce que montre l'aperçu d'un filtre : l'origine et la liste à rejouer, le filtre réglé à sa place (`edit` : un
+    /// filtre existant, rouvert ; sinon un nouveau, en haut de la liste). Le masque de filtre n'y est pas.
+    pub fn preview_list(&self, id: LayerId, filter: &Filter, edit: Option<usize>) -> Result<(Arc<TileStore>, Vec<SmartFilter>), EngineError> {
+        let layer = self.layer(id)?;
+        Ok(match &layer.filters {
+            Some(filters) => {
+                let mut list: Vec<SmartFilter> = if filters.enabled { filters.list.clone() } else { Vec::new() };
+                match edit.filter(|i| *i < list.len()) {
+                    Some(i) => list[i] = SmartFilter { filter: filter.clone(), enabled: true, ..list[i].clone() },
+                    None => list.push(SmartFilter::new(filter.clone())),
+                }
+                (Arc::clone(&filters.source), list)
+            }
+            None => (Arc::clone(layer.pixels().ok_or_else(|| EngineError::InvalidOperation("un groupe ne se filtre pas".into()))?), vec![SmartFilter::new(filter.clone())]),
+        })
+    }
+
+    /// Ce que reçoit un filtre de la liste : l'origine passée par les filtres actifs qui le précèdent (`upto` exclu ;
+    /// `None` : toute la liste). Sans filtres dynamiques, les pixels du calque. Sert à rouvrir un filtre (Camera Raw,
+    /// Fluidité) sur ce qu'il voyait.
+    pub fn filter_input(&self, id: LayerId, upto: Option<usize>) -> Result<Arc<TileStore>, EngineError> {
+        let layer = self.layer(id)?;
+        let pixels = layer.pixels().ok_or_else(|| EngineError::InvalidOperation("un groupe ne se filtre pas".into()))?;
+        let Some(filters) = &layer.filters else { return Ok(Arc::clone(pixels)) };
+        let end = upto.unwrap_or(filters.list.len()).min(filters.list.len());
+        if !filters.enabled || end == 0 {
+            return Ok(Arc::clone(&filters.source));
+        }
+        Ok(Arc::new(smart_filters::apply_list(&filters.source, &filters.list[..end], 1.0)?))
     }
 
     /// Aperçu d'un filtre pour sa boîte de dialogue : le contenu du calque réduit pour tenir dans
     /// `max_side` pixels, filtré avec des réglages mis à la même échelle. Retourne largeur, hauteur
     /// et pixels RGBA à alpha droit. Rapide quelle que soit la taille du calque, et sans toucher au document.
-    pub fn filter_preview(&self, id: LayerId, filter: &Filter, max_side: u32) -> Result<(u32, u32, Vec<u8>), EngineError> {
+    pub fn filter_preview(&self, id: LayerId, filter: &Filter, max_side: u32, edit: Option<usize>) -> Result<(u32, u32, Vec<u8>), EngineError> {
         let layer = self.layer(id)?;
         if layer.smart().is_some() {
             return Err(EngineError::InvalidOperation(smart::NOT_PAINTABLE.into()));
         }
-        let pixels = layer.pixels().ok_or_else(|| EngineError::InvalidOperation("un groupe ne se filtre pas".into()))?;
+        let (pixels, list) = self.preview_list(id, filter, edit)?;
+        let pixels = &pixels;
         let Some((x0, y0, x1, y1)) = pixels.pixel_bounds(|px| px[3] > 0) else {
             return Err(EngineError::InvalidOperation("ce calque est vide".into()));
         };
@@ -1176,7 +1420,20 @@ impl Document {
         let (w, h) = ((f64::from(x1 - x0) * k).round().max(1.0) as u32, (f64::from(y1 - y0) * k).round().max(1.0) as u32);
         let origin = pixels.translated(-x0, -y0);
         let small = if k < 1.0 { transform_store(&origin, &Matrix::scaling(k), Quality::Final)? } else { origin };
-        let filtered = filters::apply(&small, &filter.scaled(k as f32))?;
+        let filtered = smart_filters::apply_list(&small, &list, k as f32)?;
+        // Un filtre qui étend l'image (flou, lames, contour, traînée…) déborde du cadre d'origine : l'aperçu s'agrandit
+        // pour le montrer (jusqu'à deux fois la taille de chaque côté), au lieu de le couper au bord du calque.
+        let blades = list.iter().any(|f| f.enabled && matches!(f.filter, Filter::Blades { .. }));
+        let (filtered, w, h) = match filtered.pixel_bounds(|px| px[3] > 0) {
+            Some((bx0, by0, bx1, by1)) if blades => (filtered.translated(-bx0, -by0), (bx1 - bx0) as u32, (by1 - by0) as u32),
+            Some((bx0, by0, bx1, by1)) if bx0 < 0 || by0 < 0 || bx1 > w as i32 || by1 > h as i32 => {
+                let (wi, hi) = (w as i32, h as i32);
+                let (ux0, uy0) = (bx0.max(-2 * wi).min(0), by0.max(-2 * hi).min(0));
+                let (ux1, uy1) = (bx1.min(3 * wi).max(wi), by1.min(3 * hi).max(hi));
+                (filtered.translated(-ux0, -uy0), (ux1 - ux0) as u32, (uy1 - uy0) as u32)
+            }
+            _ => (filtered, w, h),
+        };
         let mut rgba = filtered.to_premultiplied(w, h);
         for px in rgba.chunks_exact_mut(4) {
             let straight = crate::pixel::unpremultiply([px[0], px[1], px[2], px[3]]);
@@ -1247,7 +1504,21 @@ impl Document {
 
     /// Pot de peinture : remplit la zone de couleur voisine du point cliqué sur le calque.
     pub fn bucket_fill(&mut self, id: LayerId, (x, y): (u32, u32), color: [u8; 3], tolerance: u8, contiguous: bool) -> Result<(), EngineError> {
-        self.ensure_paintable(id)?;
+        let locks = self.ensure_paintable(id)?;
+        // Sélection active : le pot remplit TOUTE la sélection et remplace la couleur, bord adouci compris. Avec la
+        // baguette, le bord d'un premier remplissage (pixels mi-transparents) n'était pas repris : il gardait
+        // l'ancienne couleur en liseré. Ici, la couleur devient la nouvelle partout ; seule la couverture s'ajoute.
+        if self.selection.is_some() {
+            return self.edit_selected_pixels(id, locks.transparency, move |px, force, _| {
+                let f = f32::from(force) / 255.0;
+                let existing = px[3];
+                let alpha = if locks.transparency { f32::from(existing) / 255.0 } else { f + f32::from(existing) / 255.0 * (1.0 - f) };
+                for c in 0..3 {
+                    px[c] = (f32::from(color[c]) * alpha + 0.5) as u8;
+                }
+                px[3] = (alpha * 255.0 + 0.5) as u8;
+            });
+        }
         let layer = self.layer(id)?;
         let pixels = Arc::clone(layer.pixels().ok_or_else(|| EngineError::InvalidOperation("un groupe n'a pas de pixels".into()))?);
         let Some(mask) = magic_wand(&pixels, layer.offset, (self.width, self.height), (x, y), tolerance, contiguous) else { return Ok(()) };
@@ -1286,8 +1557,8 @@ impl Document {
             let alpha = mix(3) * f32::from(force) / 255.0;
             let keep = 1.0 - alpha;
             let existing = px[3];
-            for c in 0..3 {
-                px[c] = ((mix(c) * alpha + f32::from(px[c]) / 255.0 * keep) * 255.0 + 0.5) as u8;
+            for (c, value) in px.iter_mut().take(3).enumerate() {
+                *value = ((mix(c) * alpha + f32::from(*value) / 255.0 * keep) * 255.0 + 0.5) as u8;
             }
             px[3] = ((alpha + f32::from(existing) / 255.0 * keep) * 255.0 + 0.5) as u8;
             if locks.transparency {
@@ -1398,6 +1669,53 @@ impl Document {
         Ok(())
     }
 
+    // ----------------------------------------------------- calques de remplissage
+
+    /// Nouveau calque de remplissage (couleur unie, dégradé, motif) couvrant tout le document, avec un
+    /// masque de fusion blanc (tout visible), comme Photoshop.
+    pub fn add_fill_layer(&mut self, fill: FillContent, name: impl Into<String>, parent: Option<LayerId>, index: usize) -> Result<LayerId, EngineError> {
+        let raster = Arc::new(fill::render(&fill, (self.width, self.height), (0, 0, self.width, self.height))?);
+        let id = self.attach(LayerProps::named(name, BlendMode::Normal), LayerKind::Fill { fill, raster }, parent, index)?;
+        self.add_mask(id, true)?;
+        Ok(id)
+    }
+
+    /// Modifie le remplissage d'un calque de remplissage (le type peut changer) et le redessine.
+    pub fn set_fill(&mut self, id: LayerId, new: FillContent) -> Result<(), EngineError> {
+        new.validate()?;
+        let layer = self.layer_mut(id)?;
+        if layer.props.locks.all {
+            return Err(EngineError::InvalidOperation("ce calque est verrouillé".into()));
+        }
+        let LayerKind::Fill { fill, .. } = &mut layer.kind else {
+            return Err(EngineError::InvalidOperation("ce calque n'est pas un calque de remplissage".into()));
+        };
+        *fill = new;
+        self.refresh_fill(id)
+    }
+
+    /// Recalcule le rendu d'un calque de remplissage : il couvre le document, dans le repère du calque.
+    fn refresh_fill(&mut self, id: LayerId) -> Result<(), EngineError> {
+        self.refresh_fill_from(id, None)
+    }
+
+    /// Comme `refresh_fill`, après un simple déplacement depuis la position `before` : le remplissage est défini dans
+    /// le repère du calque, ses tuiles couvertes avant et après sont donc les mêmes et sont reprises telles quelles.
+    /// Un déplacement ne recalcule (et ne fait recomposer) que les bords ; si le calque n'a pas bougé, rien du tout.
+    fn refresh_fill_from(&mut self, id: LayerId, before: Option<(i32, i32)>) -> Result<(), EngineError> {
+        let (width, height) = (self.width, self.height);
+        let layer = self.layer_mut(id)?;
+        let (ox, oy) = layer.offset;
+        if before == Some((ox, oy)) {
+            return Ok(());
+        }
+        if let LayerKind::Fill { fill, raster } = &mut layer.kind {
+            let previous = before.map(|(bx, by)| (raster.as_ref(), (-bx, -by, width, height)));
+            *raster = Arc::new(fill::render_reusing(fill, (width, height), (-ox, -oy, width, height), previous)?);
+        }
+        Ok(())
+    }
+
     // ------------------------------------------------------------------- texte
 
     /// Outil Texte : nouveau calque de texte ancré en `(x, y)` dans le document.
@@ -1417,8 +1735,14 @@ impl Document {
 
     /// Modifie un calque de texte et recalcule son rendu. Le nom suit le contenu tant
     /// qu'il n'a pas été choisi par l'utilisateur, comme dans Photoshop.
-    pub fn set_text(&mut self, id: LayerId, new: TextData) -> Result<(), EngineError> {
+    ///
+    /// Le cadre (`frame`) reçu est ignoré : il reste celui du calque. Il ne change que par
+    /// [`Document::set_text_frame`] ou une conversion point/paragraphe, qui décalent aussi l'origine ;
+    /// une frappe partie avec une description antérieure au dernier redimensionnement remettrait
+    /// sinon l'ancien cadre sur l'origine déjà décalée.
+    pub fn set_text(&mut self, id: LayerId, mut new: TextData) -> Result<(), EngineError> {
         let matrix = self.text_transform(id)?;
+        new.frame = self.layer(id)?.text().ok_or_else(|| EngineError::InvalidOperation(NOT_A_TEXT_LAYER.into()))?.frame;
         let rendered = Arc::new(text::render_transformed(&new, &matrix, Quality::Final)?);
         let layer = self.layer_mut(id)?;
         if layer.props.locks.all {
@@ -1435,6 +1759,303 @@ impl Document {
         Ok(())
     }
 
+    // ------------------------------------------------------------ plans de travail
+
+    /// Plans de travail du document, du bas vers le haut de la pile.
+    pub fn artboards(&self) -> Vec<LayerId> {
+        self.walk_top_down().into_iter().rev().filter(|(_, l)| l.artboard.is_some()).map(|(_, l)| l.id).collect()
+    }
+
+    /// Nouveau plan de travail (groupe en haut de la pile) ; le document s'agrandit pour le contenir. Le premier plan
+    /// d'un document qui a déjà des calques les reçoit : ils deviennent son contenu.
+    pub fn add_artboard(&mut self, name: impl Into<String>, board: Artboard) -> Result<LayerId, EngineError> {
+        let first = self.artboards().is_empty();
+        let existing: Vec<LayerId> = self.root.clone();
+        let id = self.add_group(name, None, usize::MAX)?;
+        // Groupe isolé (Normal) : sa découpe et son fond ne débordent pas sur les autres plans.
+        self.edit_props(id, |p| p.blend = BlendMode::Normal)?;
+        if first && !existing.is_empty() {
+            self.move_layers(&existing, Some(id), 0)?;
+        }
+        self.layer_mut(id)?.artboard = Some(Artboard { background_layer: None, ..board });
+        self.refresh_artboard(id)?;
+        // Premier plan d'un document qui avait déjà des repères : ils deviennent les siens (il reçoit aussi ses calques).
+        if first {
+            for guide in self.guides.iter_mut().filter(|g| g.board.is_none()) {
+                guide.board = Some(id);
+            }
+        }
+        Ok(id)
+    }
+
+    /// Change le cadre, le fond ou la découpe d'un plan ; `fit` : le document est ensuite ajusté aux plans (fin d'un
+    /// geste : pendant le geste, le repère du document ne doit pas bouger).
+    pub fn set_artboard(&mut self, id: LayerId, board: Artboard, fit: bool) -> Result<(), EngineError> {
+        let current = self.layer(id)?.artboard.clone().ok_or_else(|| EngineError::InvalidOperation("ce groupe n'est pas un plan de travail".into()))?;
+        if board.width == 0 || board.height == 0 || board.width > MAX_DIMENSION || board.height > MAX_DIMENSION {
+            return Err(EngineError::InvalidDimensions { width: board.width, height: board.height, max: MAX_DIMENSION });
+        }
+        self.layer_mut(id)?.artboard = Some(Artboard { background_layer: current.background_layer, ..board });
+        self.refresh_artboard(id)?;
+        if fit {
+            self.fit_to_artboards()?;
+        }
+        Ok(())
+    }
+
+    /// Déplace un plan avec son contenu.
+    pub fn move_artboard(&mut self, id: LayerId, dx: i32, dy: i32, fit: bool) -> Result<(), EngineError> {
+        if self.layer(id)?.artboard.is_none() {
+            return Err(EngineError::InvalidOperation("ce groupe n'est pas un plan de travail".into()));
+        }
+        // `translate_layers` déplace aussi le cadre du plan.
+        self.translate_layers(&[id], dx, dy)?;
+        self.refresh_artboard(id)?;
+        if fit {
+            self.fit_to_artboards()?;
+        }
+        Ok(())
+    }
+
+    /// Un groupe redevient un groupe ordinaire (son fond géré est retiré, sa découpe aussi, ses repères rattachés
+    /// au plan qui les contient ou retirés, voir `adopt_orphan_guides`).
+    pub fn remove_artboard(&mut self, id: LayerId) -> Result<(), EngineError> {
+        let board = self.layer_mut(id)?.artboard.take().ok_or_else(|| EngineError::InvalidOperation("ce groupe n'est pas un plan de travail".into()))?;
+        self.adopt_orphan_guides();
+        if let Some(bg) = board.background_layer.filter(|bg| self.nodes.contains_key(bg)) {
+            self.remove_layers(&[bg])?;
+        }
+        self.layer_mut(id)?.mask = None;
+        Ok(())
+    }
+
+    /// Le document prend exactement l'étendue de ses plans de travail (rien à faire sans plan).
+    pub fn fit_to_artboards(&mut self) -> Result<(), EngineError> {
+        let boards: Vec<Artboard> = self.artboards().into_iter().filter_map(|id| self.layer(id).ok()?.artboard.clone()).collect();
+        let Some(first) = boards.first() else { return Ok(()) };
+        let mut u = (first.x, first.y, first.x + first.width as i32, first.y + first.height as i32);
+        for b in &boards {
+            u = (u.0.min(b.x), u.1.min(b.y), u.2.max(b.x + b.width as i32), u.3.max(b.y + b.height as i32));
+        }
+        let (w, h) = ((u.2 - u.0) as u32, (u.3 - u.1) as u32);
+        if (u.0, u.1, w, h) != (0, 0, self.width, self.height) {
+            self.crop(u.0, u.1, w, h)?;
+            // Le recadrage recale les fonds ; les découpes, dans le repère de chaque groupe, suivent d'elles-mêmes.
+        }
+        Ok(())
+    }
+
+    /// Fenêtre Plans de travail : la planche entière d'un coup (un seul état d'historique). `boards` : chaque plan,
+    /// existant (`id`) ou nouveau, avec son cadre voulu ; `removed` : plans supprimés (avec leur contenu). Un plan
+    /// existant qui change de place emporte son contenu. Le premier plan d'un document qui n'en avait pas reçoit les
+    /// calques existants. Le document prend ensuite l'étendue des plans. Retourne les identifiants, dans l'ordre.
+    pub fn apply_artboards(&mut self, boards: Vec<(Option<LayerId>, String, Artboard)>, removed: &[LayerId]) -> Result<Vec<LayerId>, EngineError> {
+        let gone: Vec<LayerId> = removed.iter().copied().filter(|id| self.layer(*id).is_ok_and(|l| l.artboard.is_some())).collect();
+        if !gone.is_empty() {
+            self.remove_layers(&gone)?;
+        }
+        let mut ids = Vec::with_capacity(boards.len());
+        for (id, name, board) in boards {
+            match id.filter(|id| self.layer(*id).is_ok_and(|l| l.artboard.is_some())) {
+                Some(id) => {
+                    let current = self.layer(id)?.artboard.clone().unwrap_or(board.clone());
+                    let (dx, dy) = (board.x - current.x, board.y - current.y);
+                    if dx != 0 || dy != 0 {
+                        // Le cadre bouge avec le contenu ; les verrous de position ne bloquent pas la planche.
+                        let mut stack = vec![id];
+                        while let Some(n) = stack.pop() {
+                            stack.extend_from_slice(self.layer(n)?.children());
+                            let layer = self.layer_mut(n)?;
+                            layer.offset = (layer.offset.0 + dx, layer.offset.1 + dy);
+                            if layer.fill_content().is_some() {
+                                self.refresh_fill_from(n, None)?;
+                            }
+                        }
+                    }
+                    self.set_artboard(id, board, false)?;
+                    if self.layer(id)?.props.name != name {
+                        self.edit_props(id, |p| p.name = name)?;
+                    }
+                    ids.push(id);
+                }
+                None => ids.push(self.add_artboard(name, board)?),
+            }
+        }
+        self.fit_to_artboards()?;
+        Ok(ids)
+    }
+
+    /// Le fond d'un plan de travail (calque de remplissage verrouillé, créé avec le plan) devient un calque de
+    /// pixels ordinaire dès qu'on retire son cadenas : on peut alors y peindre comme sur n'importe quel calque. Le
+    /// plan ne le pilote plus (son fond passe à « transparent » : choisir une couleur dans la fenêtre des plans
+    /// recréerait un fond dessous). Vrai si la conversion a eu lieu.
+    pub fn release_artboard_background(&mut self, id: LayerId) -> Result<bool, EngineError> {
+        let layer = self.layer(id)?;
+        if layer.fill_content().is_none() || layer.props.locks.pixels || layer.props.locks.all {
+            return Ok(false);
+        }
+        let Some(board) = layer.parent.filter(|p| self.layer(*p).is_ok_and(|b| b.artboard.as_ref().is_some_and(|a| a.background_layer == Some(id)))) else {
+            return Ok(false);
+        };
+        self.rasterize_layer(id)?;
+        // Le masque « tout visible » posé avec le remplissage n'a plus de raison d'être sur un calque de pixels.
+        if self.layer(id)?.mask.is_some() {
+            self.remove_mask(id)?;
+        }
+        if let Some(a) = self.layer_mut(board)?.artboard.as_mut() {
+            a.background_layer = None;
+            a.background = None;
+        }
+        Ok(true)
+    }
+
+    // ------------------------------------------------------------------ repères
+
+    /// Plan de travail que doit porter un repère nouveau : dans un document à plans, un plan est obligatoire et doit
+    /// en être un ; sans plan, aucun (`None`).
+    fn guide_board(&self, board: Option<LayerId>) -> Result<Option<LayerId>, EngineError> {
+        let boards = self.artboards();
+        match board {
+            Some(id) if boards.contains(&id) => Ok(Some(id)),
+            Some(_) => Err(EngineError::InvalidOperation("ce calque n'est pas un plan de travail".into())),
+            None if boards.is_empty() => Ok(None),
+            None => Err(EngineError::InvalidOperation("choisissez un plan de travail pour y poser des repères".into())),
+        }
+    }
+
+    pub fn add_guide(&mut self, orientation: Orientation, position: f32, board: Option<LayerId>) -> Result<(), EngineError> {
+        let board = self.guide_board(board)?;
+        self.guides.push(Guide { orientation, position, board });
+        Ok(())
+    }
+
+    /// Disposition de repères : `clear` retire d'abord ceux du plan visé (ou tous, sans plan), puis pose `guides`
+    /// (positions en pixels du document) sur ce plan.
+    pub fn set_guides(&mut self, guides: Vec<Guide>, board: Option<LayerId>, clear: bool) -> Result<(), EngineError> {
+        let board = self.guide_board(board)?;
+        if clear {
+            self.guides.retain(|g| g.board != board);
+        }
+        self.guides.extend(guides.into_iter().filter(|g| g.position.is_finite()).map(|g| Guide { board, ..g }));
+        Ok(())
+    }
+
+    /// Efface les repères du plan visé (ou tous, sans plan).
+    pub fn clear_guides(&mut self, board: Option<LayerId>) -> Result<(), EngineError> {
+        let board = self.guide_board(board)?;
+        self.guides.retain(|g| g.board != board);
+        Ok(())
+    }
+
+    /// Projet d'avant les repères par plan (ou plan devenu groupe) : chaque repère sans plan valide est rattaché au
+    /// plan dans lequel il tombe, sinon retiré ; sans plan dans le document, tout repère perd son rattachement.
+    pub fn adopt_orphan_guides(&mut self) {
+        let boards: Vec<(LayerId, Artboard)> = self.artboards().into_iter().filter_map(|id| Some((id, self.layer(id).ok()?.artboard.clone()?))).collect();
+        if boards.is_empty() {
+            for guide in &mut self.guides {
+                guide.board = None;
+            }
+            return;
+        }
+        let known: Vec<LayerId> = boards.iter().map(|(id, _)| *id).collect();
+        let mut kept = Vec::with_capacity(self.guides.len());
+        for guide in self.guides.drain(..) {
+            if guide.board.is_some_and(|b| known.contains(&b)) {
+                kept.push(guide);
+                continue;
+            }
+            let home = boards.iter().find(|(_, b)| match guide.orientation {
+                Orientation::Vertical => guide.position >= b.x as f32 && guide.position <= (b.x + b.width as i32) as f32,
+                Orientation::Horizontal => guide.position >= b.y as f32 && guide.position <= (b.y + b.height as i32) as f32,
+            });
+            if let Some((id, _)) = home {
+                kept.push(Guide { board: Some(*id), ..guide });
+            }
+        }
+        self.guides = kept;
+    }
+
+    /// Recrée la découpe (masque du groupe) et le fond d'un plan d'après son cadre.
+    fn refresh_artboard(&mut self, id: LayerId) -> Result<(), EngineError> {
+        let layer = self.layer(id)?;
+        let board = layer.artboard.clone().ok_or_else(|| EngineError::InvalidOperation("ce groupe n'est pas un plan de travail".into()))?;
+        let (ox, oy) = layer.offset;
+        let mask = rect_mask(board.x - ox, board.y - oy, board.width, board.height);
+        self.layer_mut(id)?.mask = Some(Mask { pixels: Arc::new(mask), enabled: board.clip, linked: true });
+        let alive = board.background_layer.filter(|bg| self.nodes.contains_key(bg) && self.layer(*bg).is_ok_and(|l| l.parent == Some(id)));
+        match (board.background, alive) {
+            (Some(color), Some(bg)) => {
+                // Fond devenu un calque de pixels (cadenas retiré, voir `release_artboard_background`) : il appartient
+                // à l'utilisateur, le plan n'y touche plus.
+                if self.layer(bg)?.fill_content().is_some_and(|f| f != &FillContent::SolidColor { color }) {
+                    self.set_fill(bg, FillContent::SolidColor { color })?;
+                }
+            }
+            (Some(color), None) => {
+                let bg = self.add_fill_layer(FillContent::SolidColor { color }, "Fond du plan", Some(id), 0)?;
+                // Fond protégé de la peinture ; il reste déplaçable avec son plan.
+                self.edit_props(bg, |p| p.locks.pixels = true)?;
+                if let Some(b) = self.layer_mut(id)?.artboard.as_mut() {
+                    b.background_layer = Some(bg);
+                }
+            }
+            (None, Some(bg)) => {
+                self.remove_layers(&[bg])?;
+                if let Some(b) = self.layer_mut(id)?.artboard.as_mut() {
+                    b.background_layer = None;
+                }
+            }
+            (None, None) => {
+                if let Some(b) = self.layer_mut(id)?.artboard.as_mut() {
+                    b.background_layer = None;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Remplace la liste des styles de caractère. `update` : styles modifiés dont les textes qui les utilisent (ou
+    /// un style qui en hérite) doivent suivre ; les autres textes gardent leur aspect. Les calques verrouillés ne
+    /// changent pas. Retourne le nombre de textes mis à jour.
+    pub fn set_text_styles(&mut self, list: Vec<crate::text_styles::CharStyle>, update: &[u32]) -> Result<usize, EngineError> {
+        let mut ids: Vec<u32> = Vec::new();
+        for id in update {
+            for dependent in crate::text_styles::dependents(&list, *id) {
+                if !ids.contains(&dependent) {
+                    ids.push(dependent);
+                }
+            }
+        }
+        // Un style retiré de la liste : les textes gardent leur aspect, sans lien.
+        let alive: Vec<u32> = list.iter().map(|s| s.id).collect();
+        self.text_styles = list;
+        let targets: Vec<LayerId> = self.nodes.values().filter(|l| l.text().is_some()).map(|l| l.id).collect();
+        let mut count = 0;
+        for id in targets {
+            let Some(mut data) = self.layer(id)?.text().cloned() else { continue };
+            let mut changed = crate::text_styles::reapply(&mut data, &self.text_styles, &ids);
+            if data.style.is_some_and(|s| !alive.contains(&s)) {
+                data.style = None;
+                changed = true;
+            }
+            for run in &mut data.runs {
+                if run.style.is_some_and(|s| !alive.contains(&s)) {
+                    run.style = None;
+                    changed = true;
+                }
+            }
+            if !changed {
+                continue;
+            }
+            if self.layer(id)?.props.locks.all {
+                continue;
+            }
+            self.set_text(id, data)?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
     fn text_transform(&self, id: LayerId) -> Result<Matrix, EngineError> {
         match &self.layer(id)?.kind {
             LayerKind::Text { transform, .. } => Ok(*transform),
@@ -1449,16 +2070,63 @@ impl Document {
     }
 
     /// Curseur et sélection d'un calque de texte en cours d'édition, en repère document :
-    /// les deux extrémités du trait du curseur, et un quadrilatère par ligne sélectionnée.
+    /// les deux extrémités du trait du curseur, et un quadrilatère par ligne sélectionnée ;
+    /// pour un texte de paragraphe, son cadre et s'il déborde.
     /// `start`, `end` : positions en unités UTF-16, comme dans un champ de saisie.
-    #[allow(clippy::type_complexity)]
-    pub fn text_caret(&self, id: LayerId, start: usize, end: usize) -> Result<([(f64, f64); 2], Vec<[(f64, f64); 4]>), EngineError> {
+    pub fn text_caret(&self, id: LayerId, start: usize, end: usize) -> Result<TextCaret, EngineError> {
         let data = self.layer(id)?.text().ok_or_else(|| EngineError::InvalidOperation(NOT_A_TEXT_LAYER.into()))?;
         let placed = self.text_to_document(id)?;
         let geometry = text::caret_geometry(data, start, end)?;
         let map = |(x, y): (f32, f32)| placed.apply(f64::from(x), f64::from(y)).unwrap_or((f64::from(x), f64::from(y)));
         let quads = geometry.highlights.iter().map(|(x, y, w, h)| [map((*x, *y)), map((x + w, *y)), map((x + w, y + h)), map((*x, y + h))]);
-        Ok(([map(geometry.caret.0), map(geometry.caret.1)], quads.collect()))
+        // Le cadre est dans le repère du texte : la transformation du calque (Ctrl+T) s'applique par-dessus.
+        let frame = data.frame.map(|f| [map((0.0, 0.0)), map((f.width, 0.0)), map((f.width, f.height)), map((0.0, f.height))]);
+        Ok(TextCaret { caret: [map(geometry.caret.0), map(geometry.caret.1)], highlights: quads.collect(), frame, overflow: geometry.overflow })
+    }
+
+    /// Change le cadre d'un texte (`None` : texte de point) et déplace son origine de `shift` (repère texte actuel) :
+    /// tirer la poignée gauche d'un cadre l'agrandit vers la gauche, l'origine (coin haut gauche) recule d'autant.
+    /// Le texte est recomposé, pas étiré. Sans transformation, le décalage est arrondi au pixel pour que le texte
+    /// reste dessiné sans rééchantillonnage (net) ; sinon il est composé avec la transformation, exactement.
+    pub fn set_text_frame(&mut self, id: LayerId, frame: Option<text::TextFrame>, shift: (f64, f64)) -> Result<(), EngineError> {
+        let data = self.layer(id)?.text().cloned().ok_or_else(|| EngineError::InvalidOperation(NOT_A_TEXT_LAYER.into()))?;
+        self.replace_text_placed(id, TextData { frame, ..data }, shift)
+    }
+
+    /// « Convertir en texte de paragraphe » (`true`) ou « en texte de point » : même aspect, autre comportement.
+    pub fn convert_text(&mut self, id: LayerId, paragraph: bool) -> Result<(), EngineError> {
+        let data = self.layer(id)?.text().ok_or_else(|| EngineError::InvalidOperation(NOT_A_TEXT_LAYER.into()))?;
+        let (next, (dx, dy)) = if paragraph { text::to_paragraph(data)? } else { text::to_point(data)? };
+        self.replace_text_placed(id, next, (f64::from(dx), f64::from(dy)))
+    }
+
+    /// Remplace le texte et déplace son origine de `(dx, dy)` dans son repère (voir [`Document::set_text_frame`]).
+    fn replace_text_placed(&mut self, id: LayerId, new: TextData, (dx, dy): (f64, f64)) -> Result<(), EngineError> {
+        if !(dx.is_finite() && dy.is_finite()) {
+            return Err(EngineError::InvalidOperation("décalage de texte invalide".into()));
+        }
+        let matrix = self.text_transform(id)?;
+        let (offset_shift, matrix) = if matrix == Matrix::IDENTITY {
+            ((dx.round() as i32, dy.round() as i32), matrix)
+        } else {
+            ((0, 0), matrix.then_after(&Matrix::translation(dx, dy)))
+        };
+        let rendered = Arc::new(text::render_transformed(&new, &matrix, Quality::Final)?);
+        let layer = self.layer_mut(id)?;
+        if layer.props.locks.all {
+            return Err(EngineError::InvalidOperation("ce calque est verrouillé".into()));
+        }
+        let LayerKind::Text { text, transform, raster } = &mut layer.kind else {
+            return Err(EngineError::InvalidOperation(NOT_A_TEXT_LAYER.into()));
+        };
+        if layer.props.name == text_layer_name(text) {
+            layer.props.name = text_layer_name(&new);
+        }
+        *text = new;
+        *transform = matrix;
+        *raster = rendered;
+        layer.offset = (layer.offset.0 + offset_shift.0, layer.offset.1 + offset_shift.1);
+        Ok(())
     }
 
     /// Position du curseur (UTF-16) la plus proche du point `(x, y)` du document.
@@ -1472,9 +2140,13 @@ impl Document {
     /// Pixellise un calque de texte, de forme ou un objet dynamique : il devient un calque de pixels ordinaire
     /// (peinture, transformation…) avec son rendu actuel, et n'est plus éditable comme avant.
     pub fn rasterize_layer(&mut self, id: LayerId) -> Result<(), EngineError> {
+        // Calque à filtres dynamiques : ses filtres sont figés dans ses pixels.
+        if self.layer(id)?.filters.is_some() {
+            return self.bake_filters(id);
+        }
         let layer = self.layer_mut(id)?;
-        let (LayerKind::Text { raster, .. } | LayerKind::Shape { raster, .. } | LayerKind::Smart { raster, .. }) = &layer.kind else {
-            return Err(EngineError::InvalidOperation("seul un calque de texte, de forme ou un objet dynamique peut être pixellisé".into()));
+        let (LayerKind::Text { raster, .. } | LayerKind::Shape { raster, .. } | LayerKind::Smart { raster, .. } | LayerKind::Fill { raster, .. }) = &layer.kind else {
+            return Err(EngineError::InvalidOperation("seul un calque de texte, de forme, de remplissage ou un objet dynamique peut être pixellisé".into()));
         };
         layer.kind = LayerKind::Pixel { pixels: Arc::clone(raster) };
         Ok(())
@@ -1512,9 +2184,11 @@ impl Document {
     /// intact). À sa taille d'origine, il est placé sur des pixels entiers : aucun rééchantillonnage.
     pub fn place_smart_object(&mut self, content: SmartContent, parent: Option<LayerId>, index: usize) -> Result<LayerId, EngineError> {
         let (w, h) = (f64::from(content.width()), f64::from(content.height()));
-        let (dw, dh) = (f64::from(self.width), f64::from(self.height));
+        // Ajusté et centré dans le plan de travail qui le reçoit, sinon dans le document (voir `placement_frame`).
+        let (fx, fy, fw, fh) = self.placement_frame(parent);
+        let (dw, dh) = (f64::from(fw), f64::from(fh));
         let fit = (dw / w).min(dh / h).min(1.0);
-        let (x, y) = (((dw - w * fit) / 2.0).round(), ((dh - h * fit) / 2.0).round());
+        let (x, y) = ((f64::from(fx) + (dw - w * fit) / 2.0).round(), (f64::from(fy) + (dh - h * fit) / 2.0).round());
         let full = Matrix::translation(x, y).then_after(&Matrix::scaling(fit));
         let name = content.name.clone();
         self.add_smart_layer(Arc::new(content), name, &full, parent, index)
@@ -1686,7 +2360,7 @@ impl Document {
 
     // ------------------------------------------------------------- déplacement
 
-    fn ensure_movable(&self, id: LayerId) -> Result<(), EngineError> {
+    pub(crate) fn ensure_movable(&self, id: LayerId) -> Result<(), EngineError> {
         let locks = self.layer(id)?.props.locks;
         if locks.all || locks.position {
             return Err(EngineError::InvalidOperation("la position de ce calque est verrouillée".into()));
@@ -1705,7 +2379,25 @@ impl Document {
         }
         for id in moved {
             let layer = self.layer_mut(id)?;
+            let before = layer.offset;
             layer.offset = (layer.offset.0 + dx, layer.offset.1 + dy);
+            // Un plan de travail emporte son cadre (sa découpe, dans son repère, suit d'elle-même) et ses repères.
+            let is_board = layer.artboard.is_some();
+            if let Some(board) = layer.artboard.as_mut() {
+                board.x += dx;
+                board.y += dy;
+            }
+            let has_fill = layer.fill_content().is_some();
+            if is_board {
+                for guide in self.guides.iter_mut().filter(|g| g.board == Some(id)) {
+                    guide.position += if guide.orientation == Orientation::Vertical { dx as f32 } else { dy as f32 };
+                }
+            }
+            if has_fill {
+                // Le remplissage suit le calque, mais son rendu doit toujours couvrir le document : seules les tuiles
+                // de bord sont recalculées, les autres sont reprises (voir `refresh_fill_from`).
+                self.refresh_fill_from(id, Some(before))?;
+            }
         }
         Ok(())
     }
@@ -1730,6 +2422,10 @@ impl Document {
         } else if mask {
             current.pixels = Arc::new(current.pixels.translated(dx, dy));
         }
+        if pixels && self.layer(id)?.fill_content().is_some() {
+            let (ox, oy) = self.layer(id)?.offset;
+            self.refresh_fill_from(id, Some((ox - dx, oy - dy)))?;
+        }
         Ok(())
     }
 
@@ -1752,6 +2448,19 @@ impl Document {
         Ok(())
     }
 
+    /// Plan de travail qui découpe `id` : le calque lui-même ou son plus proche parent qui est un plan à découpe.
+    fn clipping_board(&self, id: LayerId) -> Option<&Artboard> {
+        let mut at = Some(id);
+        while let Some(current) = at {
+            let layer = self.layer(current).ok()?;
+            if let Some(board) = layer.artboard.as_ref().filter(|b| b.clip) {
+                return Some(board);
+            }
+            at = layer.parent;
+        }
+        None
+    }
+
     /// Cadre de transformation : étendue exacte, en repère document, de la sélection
     /// s'il y en a une, sinon du contenu des calques donnés (groupes développés).
     pub fn content_bounds(&self, ids: &[LayerId]) -> Result<Option<(i32, i32, i32, i32)>, EngineError> {
@@ -1760,15 +2469,28 @@ impl Document {
             let bounds = if selection.background() == [255] { Some((0, 0, w, h)) } else { selection.pixel_bounds(|px| px[0] > 0) };
             return Ok(bounds.map(|(x0, y0, x1, y1)| (x0.max(0), y0.max(0), x1.min(w), y1.min(h))));
         }
-        let mut stack = self.top_level_selection(ids)?;
+        let union = |a: Option<(i32, i32, i32, i32)>, b: (i32, i32, i32, i32)| Some(a.map_or(b, |a| (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3))));
         let mut bounds: Option<(i32, i32, i32, i32)> = None;
-        while let Some(id) = stack.pop() {
-            let layer = self.layer(id)?;
-            stack.extend_from_slice(layer.children());
-            let Some((x0, y0, x1, y1)) = layer.pixels().and_then(|p| p.pixel_bounds(|px| px[3] > 0)) else { continue };
-            let (ox, oy) = layer.offset;
-            let here = (x0 + ox, y0 + oy, x1 + ox, y1 + oy);
-            bounds = Some(bounds.map_or(here, |b| (b.0.min(here.0), b.1.min(here.1), b.2.max(here.2), b.3.max(here.3))));
+        for top in self.top_level_selection(ids)? {
+            let mut here: Option<(i32, i32, i32, i32)> = None;
+            let mut stack = vec![top];
+            while let Some(id) = stack.pop() {
+                let layer = self.layer(id)?;
+                stack.extend_from_slice(layer.children());
+                let Some((x0, y0, x1, y1)) = layer.pixels().and_then(|p| p.pixel_bounds(|px| px[3] > 0)) else { continue };
+                let (ox, oy) = layer.offset;
+                here = union(here, (x0 + ox, y0 + oy, x1 + ox, y1 + oy));
+            }
+            // Plan de travail qui découpe son contenu (le calque lui-même ou un parent) : ce qui déborde est caché, le
+            // cadre s'arrête à ses bords (son fond, lui, couvre tout le document).
+            if let (Some(b), Some(board)) = (here, self.clipping_board(top)) {
+                let (bx1, by1) = (board.x + board.width as i32, board.y + board.height as i32);
+                let clipped = (b.0.max(board.x), b.1.max(board.y), b.2.min(bx1), b.3.min(by1));
+                here = (clipped.0 < clipped.2 && clipped.1 < clipped.3).then_some(clipped);
+            }
+            if let Some(b) = here {
+                bounds = union(bounds, b);
+            }
         }
         Ok(bounds)
     }
@@ -1779,11 +2501,14 @@ impl Document {
     pub fn transform_layers(&mut self, ids: &[LayerId], matrix: &Matrix, quality: Quality) -> Result<(), EngineError> {
         let mut stack = self.top_level_selection(ids)?;
         let mut targets = Vec::new();
+        let mut groups = Vec::new();
         while let Some(id) = stack.pop() {
             self.ensure_movable(id)?;
             let layer = self.layer(id)?;
             stack.extend_from_slice(layer.children());
             if layer.is_group() {
+                // Un groupe n'a pas de pixels, mais son masque de fusion doit suivre ses enfants.
+                groups.push(id);
                 continue;
             }
             // Un calque de texte se transforme sans être pixellisé : seuls ses réglages changent.
@@ -1792,6 +2517,16 @@ impl Document {
                     return Err(EngineError::InvalidOperation(
                         "désélectionnez (Ctrl+D) pour transformer un objet dynamique : une sélection ne peut pas le découper".into(),
                     ));
+                }
+            } else if layer.filters.is_some() {
+                // Filtres dynamiques : l'origine se transforme entière, les filtres sont refaits (voir plus bas).
+                if self.selection.is_some() {
+                    return Err(EngineError::InvalidOperation(
+                        "désélectionnez (Ctrl+D) pour transformer un calque à filtres dynamiques : une sélection ne peut pas le découper".into(),
+                    ));
+                }
+                if layer.props.locks.all || layer.props.locks.pixels {
+                    return Err(EngineError::InvalidOperation("les pixels de ce calque sont verrouillés".into()));
                 }
             } else if layer.text().is_none() && layer.shape().is_none() {
                 self.ensure_paintable(id)?;
@@ -1816,6 +2551,12 @@ impl Document {
             *self.pixels_mut(*id)? = rest;
             self.selection = Some(Arc::new(transform_store(&selection, matrix, quality)?));
             return Ok(());
+        }
+
+        // Le masque d'un groupe est posé à l'offset du groupe, qui ne bouge pas : on le
+        // transforme sur place (repère groupe -> document -> transformation -> repère groupe).
+        for id in groups {
+            self.follow_mask(id, matrix, quality)?;
         }
 
         for id in targets {
@@ -1843,6 +2584,7 @@ impl Document {
                 let layer = self.layer_mut(id)?;
                 layer.offset = (origin.0.round() as i32 + dx, origin.1.round() as i32 + dy);
                 layer.kind = LayerKind::Shape { shape: next, raster: rendered };
+                self.follow_mask_from(id, offset, matrix, quality)?;
                 continue;
             }
             if let LayerKind::Smart { content, transform, .. } = &self.layer(id)?.kind {
@@ -1851,15 +2593,7 @@ impl Document {
                 let content = Arc::clone(content);
                 let full = placed.then_after(transform);
                 self.place_smart(id, content, &full, quality)?;
-                // Le masque (repère du calque) suit : ancien repère -> document -> transformation -> nouveau repère.
-                if let Some(mask) = mask {
-                    let (nx, ny) = self.layer(id)?.offset;
-                    let back = Matrix::translation(-f64::from(nx), -f64::from(ny)).then_after(&placed);
-                    let moved = transform_store(&mask, &back, quality)?;
-                    if let Some(current) = &mut self.layer_mut(id)?.mask {
-                        current.pixels = Arc::new(moved);
-                    }
-                }
+                self.follow_mask_from(id, offset, matrix, quality)?;
                 continue;
             }
             if let LayerKind::Text { text, transform, .. } = &self.layer(id)?.kind {
@@ -1870,6 +2604,25 @@ impl Document {
                 if let LayerKind::Text { transform, raster, .. } = &mut layer.kind {
                     (*transform, *raster) = (combined, rendered);
                 }
+                self.follow_mask_from(id, offset, matrix, quality)?;
+                continue;
+            }
+            // Filtres dynamiques : l'origine (et le masque de filtre) se transforme, les filtres sont refaits dessus.
+            if let Some(filters) = self.layer(id)?.filters.clone() {
+                let source = Arc::new(transform_store(&filters.source, &placed, quality)?);
+                let filter_mask = filters.mask.as_ref().map(|m| transform_store(&m.pixels, &placed, quality)).transpose()?;
+                let new_mask = mask.map(|m| transform_store(&m, &placed, quality)).transpose()?;
+                let layer = self.layer_mut(id)?;
+                layer.offset = (0, 0);
+                if let (Some(mask), Some(new)) = (&mut layer.mask, new_mask) {
+                    mask.pixels = Arc::new(new);
+                }
+                let filters = layer.filters.as_mut().expect("filtres");
+                filters.source = source;
+                if let (Some(mask), Some(new)) = (&mut filters.mask, filter_mask) {
+                    mask.pixels = Arc::new(new);
+                }
+                self.refilter(id)?;
                 continue;
             }
             let new_pixels = pixels.map(|p| transform_store(&p, &placed, quality)).transpose()?;
@@ -1882,6 +2635,27 @@ impl Document {
             if let (Some(mask), Some(new)) = (&mut layer.mask, new_mask) {
                 mask.pixels = Arc::new(new);
             }
+        }
+        Ok(())
+    }
+
+    /// Fait suivre le masque de fusion d'un calque dont l'offset n'a pas changé (groupe).
+    fn follow_mask(&mut self, id: LayerId, matrix: &Matrix, quality: Quality) -> Result<(), EngineError> {
+        let offset = self.layer(id)?.offset;
+        self.follow_mask_from(id, offset, matrix, quality)
+    }
+
+    /// Fait suivre le masque de fusion d'un calque déjà transformé : le masque vit dans le repère
+    /// du calque (posé à son offset), on le ramène de l'ancien repère (`from`) au document, on
+    /// applique la transformation, puis on le repose dans le nouveau repère (offset actuel).
+    fn follow_mask_from(&mut self, id: LayerId, from: (i32, i32), matrix: &Matrix, quality: Quality) -> Result<(), EngineError> {
+        let Some(mask) = self.layer(id)?.mask.as_ref().map(|m| Arc::clone(&m.pixels)) else { return Ok(()) };
+        let (nx, ny) = self.layer(id)?.offset;
+        let placed = matrix.then_after(&Matrix::translation(f64::from(from.0), f64::from(from.1)));
+        let back = Matrix::translation(-f64::from(nx), -f64::from(ny)).then_after(&placed);
+        let moved = transform_store(&mask, &back, quality)?;
+        if let Some(current) = &mut self.layer_mut(id)?.mask {
+            current.pixels = Arc::new(moved);
         }
         Ok(())
     }
@@ -1914,12 +2688,12 @@ impl Document {
         let plain_group = |group: &Layer| {
             let p = &group.props;
             let masked = group.mask.as_ref().is_some_and(|m| m.enabled);
-            p.visible && p.opacity >= 1.0 && p.fill >= 1.0 && !p.clipped && !masked && matches!(p.blend, BlendMode::PassThrough | BlendMode::Normal)
+            p.visible && p.opacity >= 1.0 && p.fill >= 1.0 && !p.clipped && !masked && p.range().is_none() && matches!(p.blend, BlendMode::PassThrough | BlendMode::Normal)
         };
         for leaf in &leaves[first..] {
             // Un réglage dépend de ce qu'il y a dessous : impossible de le recomposer à part.
             // Un calque à effets déborde de ses pixels (ombre, halo) : pas d'aperçu décomposé non plus.
-            if leaf.props.blend != BlendMode::Normal || leaf.props.clipped || leaf.adjustment().is_some() || crate::effects::any_enabled(&leaf.effects) {
+            if leaf.props.blend != BlendMode::Normal || leaf.props.range().is_some() || leaf.props.clipped || leaf.adjustment().is_some() || crate::effects::any_enabled(&leaf.effects) {
                 return None;
             }
             let mut parent = leaf.parent;
@@ -1964,20 +2738,40 @@ impl Document {
     /// un texte existant doit toujours permettre d'y entrer, jamais d'en créer un second par-dessus.
     pub fn pick_text_layer(&self, x: i32, y: i32) -> Option<LayerId> {
         self.walk_top_down().into_iter().map(|(_, layer)| layer).find(|layer| {
-            let (Some(_), Some(pixels)) = (layer.text(), layer.pixels()) else { return false };
+            let (Some(data), Some(pixels)) = (layer.text(), layer.pixels()) else { return false };
+            if !layer.props.visible {
+                return false;
+            }
             let (lx, ly) = (x - layer.offset.0, y - layer.offset.1);
-            layer.props.visible && pixels.pixel_bounds(|px| px[3] > 0).is_some_and(|(x0, y0, x1, y1)| lx >= x0 && lx < x1 && ly >= y0 && ly < y1)
+            // Texte de paragraphe : tout son cadre (même vide, même sous le texte masqué) ouvre la saisie.
+            if let (Some(frame), LayerKind::Text { transform, .. }) = (data.frame, &layer.kind) {
+                let inside = transform.inverse().and_then(|inverse| inverse.apply(f64::from(lx) + 0.5, f64::from(ly) + 0.5)).is_some_and(|(tx, ty)| {
+                    tx >= 0.0 && ty >= 0.0 && tx <= f64::from(frame.width) && ty <= f64::from(frame.height)
+                });
+                if inside {
+                    return true;
+                }
+            }
+            pixels.pixel_bounds(|px| px[3] > 0).is_some_and(|(x0, y0, x1, y1)| lx >= x0 && lx < x1 && ly >= y0 && ly < y1)
         }).map(|layer| layer.id)
     }
 
     /// Sélection automatique : calque de pixels visible le plus haut qui n'est pas
-    /// transparent au point `(x, y)` du document.
+    /// transparent au point `(x, y)` du document, masques compris (les siens et ceux de ses dossiers).
     pub fn pick_layer(&self, x: i32, y: i32) -> Option<LayerId> {
+        // Visible ici : le calque et ses dossiers sont affichés, et aucun masque actif de la chaîne ne cache ce point.
+        // La découpe d'un plan de travail est le masque de son groupe : sans ce test, le fond d'un plan (un remplissage
+        // qui couvre tout le document, découpé par le plan) se saisissait partout, jusque dans les plans voisins.
         let visible = |layer: &Layer| {
             let mut current = Some(layer);
             while let Some(l) = current {
                 if !l.props.visible {
                     return false;
+                }
+                if let Some(mask) = l.mask.as_ref().filter(|m| m.enabled) {
+                    if Sampler::new(&mask.pixels).get(x - l.offset.0, y - l.offset.1)[0] <= 8 {
+                        return false;
+                    }
                 }
                 current = l.parent.and_then(|p| self.nodes.get(&p)).map(Arc::as_ref);
             }
@@ -1985,6 +2779,12 @@ impl Document {
         };
         // Un calque verrouillé (cadenas ou position), ou rangé dans un dossier verrouillé, ne se saisit pas à la souris :
         // le clic le traverse vers ce qui est dessous. Il se sélectionne toujours dans le panneau Calques.
+        // Le fond géré d'un plan de travail : un clic dans le vide d'un plan saisit LE PLAN (comme Photoshop), jamais
+        // ce fond (le glisser le décalait de son plan). Une fois son cadenas retiré, c'est un calque ordinaire
+        // (`release_artboard_background`).
+        let managed = |layer: &Layer| {
+            layer.parent.filter(|p| self.nodes.get(p).and_then(|g| g.artboard.as_ref()).is_some_and(|a| a.background_layer == Some(layer.id)))
+        };
         let fixed = |layer: &Layer| {
             let mut current = Some(layer);
             while let Some(l) = current {
@@ -2008,9 +2808,9 @@ impl Document {
             }
             Sampler::new(pixels).get(lx, ly)[3] > 8
         })
-        .map(|layer| self.clipping_base(layer.id))
+        .map(|layer| managed(layer).unwrap_or_else(|| self.clipping_base(layer.id)))
         // Calque écrêté sur une base verrouillée : c'est la base qu'on saisirait, elle ne bouge pas.
-        .filter(|id| self.nodes.get(id).is_none_or(|base| !fixed(base)))
+        .filter(|id| self.nodes.get(id).is_none_or(|base| base.artboard.is_some() || !fixed(base)))
     }
 
     /// Base d'un groupe d'écrêtage : un calque écrêté n'apparaît qu'à travers le calque du dessous,
@@ -2041,7 +2841,7 @@ impl Document {
 
     /// Retire de la sélection les calques déjà contenus dans un groupe sélectionné,
     /// et trie le reste dans l'ordre du document (du bas vers le haut).
-    fn top_level_selection(&self, ids: &[LayerId]) -> Result<Vec<LayerId>, EngineError> {
+    pub(crate) fn top_level_selection(&self, ids: &[LayerId]) -> Result<Vec<LayerId>, EngineError> {
         for id in ids {
             self.layer(*id)?;
         }
@@ -2086,7 +2886,8 @@ impl Document {
         Ok(())
     }
 
-    /// Supprime des calques et leurs descendants. Un document garde toujours au moins un calque.
+    /// Supprime des calques et leurs descendants. Un document garde toujours au moins un calque : supprimer le dernier
+    /// (ou tous à la fois) le remplace par un calque vide et transparent, « Calque 1 », dans la même étape d'historique.
     pub fn remove_layers(&mut self, ids: &[LayerId]) -> Result<(), EngineError> {
         let removed = self.top_level_selection(ids)?;
         let mut doomed = HashSet::new();
@@ -2095,19 +2896,31 @@ impl Document {
             doomed.insert(id);
             stack.extend_from_slice(self.layer(id)?.children());
         }
-        if doomed.len() >= self.nodes.len() {
-            return Err(EngineError::InvalidOperation("impossible de supprimer le dernier calque".into()));
-        }
         // Le cadenas « Tout verrouiller » protège aussi de la suppression, comme dans Photoshop.
         if doomed.iter().any(|id| self.nodes.get(id).is_some_and(|l| l.props.locks.all)) {
             return Err(EngineError::InvalidOperation("ce calque est verrouillé : ouvrez le cadenas pour le supprimer".into()));
         }
+        let everything = doomed.len() >= self.nodes.len();
         for id in &removed {
             let parent = self.layer(*id)?.parent;
             self.children_mut(parent)?.retain(|c| c != id);
         }
         self.nodes.retain(|id, _| !doomed.contains(id));
+        self.guides.retain(|g| g.board.is_none_or(|b| !doomed.contains(&b)));
+        if everything {
+            // Identifiant neuf : aucun cache de rendu ne le confond avec un calque supprimé.
+            self.add_pixel_layer("Calque 1", TileStore::new(), None, 0)?;
+        }
         Ok(())
+    }
+
+    /// Aplatit le document : tous les calques (verrouillés compris, comme l'aplatissement de Photoshop) sont remplacés
+    /// par un seul calque de pixels, au sommet de la pile. Sert aux conversions de mode qui exigent une image aplatie
+    /// (Bitmap). Le nouveau calque reçoit un identifiant neuf : les caches de rendu ne le confondent avec aucun autre.
+    pub(crate) fn replace_all_layers(&mut self, name: impl Into<String>, pixels: TileStore) -> Result<LayerId, EngineError> {
+        self.nodes.clear();
+        self.root.clear();
+        self.add_pixel_layer(name, pixels, None, 0)
     }
 
     /// Ctrl+G : regroupe les calques à l'emplacement du plus haut d'entre eux.
@@ -2123,8 +2936,19 @@ impl Document {
     /// Ctrl+J : copie placée juste au-dessus. Les pixels restent partagés jusqu'à la première retouche.
     pub fn duplicate_layer(&mut self, id: LayerId) -> Result<LayerId, EngineError> {
         let (parent, index) = self.slot_above(id)?;
-        let copy = self.clone_subtree(id, parent, true)?;
+        let board = self.layer(id)?.artboard.clone();
+        let copy = self.clone_subtree(id, parent, board.is_none())?;
         self.children_mut(parent)?.insert(index, copy);
+        if let Some(b) = board {
+            // Plan de travail : « Story 2 », « Story 3 »…, posé à droite du dernier plan (marge de 100 px), jamais dessus.
+            let base = self.layer(id)?.props.name.clone();
+            let base = base.rsplit_once(' ').filter(|(_, n)| n.parse::<u32>().is_ok()).map_or(base.as_str(), |(b, _)| b).to_string();
+            let names: Vec<String> = self.nodes.values().filter(|l| l.artboard.is_some()).map(|l| l.props.name.clone()).collect();
+            let name = (2..).map(|n| format!("{base} {n}")).find(|n| !names.contains(n)).unwrap_or(base);
+            self.edit_props(copy, |p| p.name = name)?;
+            let right = self.nodes.values().filter(|l| l.id != copy).filter_map(|l| l.artboard.as_ref()).map(|a| a.x + a.width as i32).max().unwrap_or(b.x + b.width as i32);
+            self.move_artboard(copy, right + 100 - b.x, 0, true)?;
+        }
         Ok(copy)
     }
 
@@ -2141,6 +2965,10 @@ impl Document {
             let originals = std::mem::take(children);
             for child in originals {
                 let cloned = self.clone_subtree(child, Some(new_id), false)?;
+                // Plan de travail : son fond géré est la copie du fond d'origine.
+                if let Some(board) = layer.artboard.as_mut().filter(|b| b.background_layer == Some(child)) {
+                    board.background_layer = Some(cloned);
+                }
                 children.push(cloned);
             }
         }
@@ -2157,8 +2985,10 @@ impl Document {
     /// Avec `positions` à faux, la position des calques est ignorée : sert à reconnaître un
     /// simple déplacement, qui ne périme que les tuiles survolées et non toute l'image.
     pub(crate) fn same_structure_with(&self, other: &Self, positions: bool) -> bool {
-        // Un changement de taille (recadrage) périme tout, quelle que soit la suite.
+        // Un changement de taille (recadrage) périme tout, quelle que soit la suite. De même un changement de mode
+        // colorimétrique : le rendu final de chaque tuile en dépend (passage en gris, seuil du bitmap).
         (self.width, self.height) == (other.width, other.height)
+            && self.color_mode == other.color_mode
             && self.root == other.root
             && self.nodes.len() == other.nodes.len()
             && self.nodes.iter().all(|(id, a)| {
@@ -2186,7 +3016,7 @@ impl Document {
     pub(crate) fn pixels_slot(&mut self, id: LayerId) -> Option<&mut Arc<TileStore>> {
         match &mut self.layer_mut(id).ok()?.kind {
             LayerKind::Pixel { pixels } => Some(pixels),
-            LayerKind::Text { raster, .. } | LayerKind::Shape { raster, .. } | LayerKind::Smart { raster, .. } => Some(raster),
+            LayerKind::Text { raster, .. } | LayerKind::Shape { raster, .. } | LayerKind::Smart { raster, .. } | LayerKind::Fill { raster, .. } => Some(raster),
             LayerKind::Group { .. } | LayerKind::Adjustment { .. } => None,
         }
     }
@@ -2204,6 +3034,8 @@ impl Document {
 
 const TEXT_IS_NOT_PAINTABLE: &str = "calque de texte : pixellisez-le (clic droit > Pixelliser le calque) pour le peindre";
 const SHAPE_IS_NOT_PAINTABLE: &str = "calque de forme : pixellisez-le (clic droit > Pixelliser le calque) pour le peindre";
+pub(crate) const FILTERED_IS_NOT_PAINTABLE: &str = "calque à filtres dynamiques : pixellisez ses filtres (clic droit > Pixelliser les filtres) pour le peindre";
+const FILL_IS_NOT_PAINTABLE: &str = "calque de remplissage : pixellisez-le (clic droit > Pixelliser le calque) pour le peindre ou le transformer";
 const NOT_A_TEXT_LAYER: &str = "ce calque n'est pas un calque de texte";
 const NOT_A_SMART_OBJECT: &str = "ce calque n'est pas un objet dynamique";
 
@@ -2228,6 +3060,19 @@ pub struct SmartLinksReport {
 }
 const NO_CLOSED_PATH: &str = "le tracé doit compter au moins trois points";
 
+/// Géométrie d'édition d'un texte, en repère document (voir [`Document::text_caret`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TextCaret {
+    /// Haut et bas du trait du curseur.
+    pub caret: [(f64, f64); 2],
+    /// Un quadrilatère par ligne sélectionnée.
+    pub highlights: Vec<[(f64, f64); 4]>,
+    /// Texte de paragraphe : les quatre coins de son cadre (haut gauche, haut droit, bas droit, bas gauche).
+    pub frame: Option<[(f64, f64); 4]>,
+    /// Texte de paragraphe dont une partie dépasse du cadre et n'est pas dessinée.
+    pub overflow: bool,
+}
+
 /// Nom automatique d'un calque de texte : le début de son contenu.
 fn text_layer_name(text: &TextData) -> String {
     let first_line = text.content.lines().next().unwrap_or_default().trim();
@@ -2248,16 +3093,22 @@ fn split_by_selection(source: &TileStore, offset: (i32, i32), selection: &MaskSt
     let mut mask = Sampler::new(selection);
     let size = TILE_SIZE as i32;
     for (coord, tile) in source.iter() {
-        let (mut taken, mut kept) = (Tile::transparent(), (**tile).clone());
         let (lx, ly) = coord.origin();
+        // Tuile hors de la sélection : elle reste partagée telle quelle, sans copie (un grand calque dont on
+        // déplace un petit morceau ne duplique pas toutes ses tuiles).
+        if !selection.any_nonzero_in((lx + offset.0, ly + offset.1, lx + offset.0 + size, ly + offset.1 + size)) {
+            rest.restore(coord, Some(Arc::clone(tile)));
+            continue;
+        }
+        let (mut taken, mut kept) = (Tile::transparent(), (**tile).clone());
         for (index, px) in kept.bytes_mut().chunks_exact_mut(4).enumerate() {
             let force = mask.get(lx + index as i32 % size + offset.0, ly + index as i32 / size + offset.1)[0];
             if force == 0 {
                 continue;
             }
-            for c in 0..4 {
-                taken.bytes_mut()[index * 4 + c] = mul_div_255(px[c], force);
-                px[c] = mul_div_255(px[c], 255 - force);
+            for (c, value) in px.iter_mut().enumerate() {
+                taken.bytes_mut()[index * 4 + c] = mul_div_255(*value, force);
+                *value = mul_div_255(*value, 255 - force);
             }
         }
         cut.insert(coord, taken);
@@ -2275,6 +3126,35 @@ fn paste_over(under: &mut TileStore, top: &TileStore) {
             dst.copy_from_slice(&out);
         }
     }
+}
+
+/// Masque plein (255) sur le rectangle donné, vide ailleurs.
+fn rect_mask(x: i32, y: i32, width: u32, height: u32) -> MaskStore {
+    let mut mask = MaskStore::with_background([0]);
+    let (x1, y1) = (x + width as i32, y + height as i32);
+    let size = TILE_SIZE as i32;
+    let (first, _, _) = TileCoord::of_pixel(x, y);
+    let (last, _, _) = TileCoord::of_pixel(x1 - 1, y1 - 1);
+    for ty in first.y..=last.y {
+        for tx in first.x..=last.x {
+            let coord = TileCoord::new(tx, ty);
+            let (ox, oy) = coord.origin();
+            let inside = x <= ox && y <= oy && x1 >= ox + size && y1 >= oy + size;
+            let tile = if inside {
+                crate::tiles::MaskTile::filled([255])
+            } else {
+                let mut tile = crate::tiles::MaskTile::filled([0]);
+                for py in y.max(oy)..y1.min(oy + size) {
+                    for px in x.max(ox)..x1.min(ox + size) {
+                        tile.set_pixel((px - ox) as u32, (py - oy) as u32, [255]);
+                    }
+                }
+                tile
+            };
+            mask.restore(coord, Some(Arc::new(tile)));
+        }
+    }
+    mask
 }
 
 #[cfg(test)]
@@ -2340,14 +3220,60 @@ mod tests {
     }
 
     #[test]
-    fn remove_layers_takes_descendants_but_never_the_last_layer() {
+    fn remove_layers_takes_descendants_and_replaces_the_last_layer_with_an_empty_one() {
         let mut d = doc();
         let g = d.add_group("G", None, 1).expect("groupe");
         add(&mut d, "dans G", Some(g));
         d.remove_layers(&[g]).expect("suppression");
         assert_eq!(d.layer_count(), 1);
         let last = d.walk_top_down()[0].1.id;
-        assert!(d.remove_layers(&[last]).is_err());
+        d.remove_layers(&[last]).expect("le dernier calque devient un calque vide");
+        assert_eq!(names_top_down(&d), ["Calque 1"]);
+        assert_ne!(d.walk_top_down()[0].1.id, last);
+        d.validate().expect("arbre cohérent");
+    }
+
+    /// Filtres dynamiques : un filtre appliqué garde l'origine ; œil, retrait, transformation et pixellisation
+    /// repartent d'elle ; peindre un calque filtré est refusé tant que ses filtres ne sont pas pixellisés.
+    #[test]
+    fn smart_filters_keep_the_source_and_replay_on_change() {
+        use crate::smart_filters::SmartFilter;
+        let mut d = Document::new("t", 300, 300, 72.0).expect("document");
+        let l = d.add_pixel_layer("Calque", TileStore::new(), None, 0).expect("calque");
+        d.pixels_mut(l).expect("pixels").fill(100, 100, [0, 0, 255, 255]);
+        let original = Arc::clone(d.layer(l).expect("calque").pixels().expect("pixels"));
+        d.apply_filter(l, &Filter::GaussianBlur { radius: 5.0 }).expect("flou");
+        let filters = d.layer(l).expect("calque").filters.clone().expect("filtre dynamique");
+        assert!(Arc::ptr_eq(&filters.source, &original), "l'origine est gardée telle quelle");
+        let edge = |d: &Document| Sampler::new(d.layer(l).expect("calque").pixels().expect("pixels")).get(102, 50)[3];
+        assert!(edge(&d) > 0, "le résultat est flou");
+        assert!(d.pixels_mut(l).is_err(), "peinture refusée sur un calque filtré");
+        // Œil éteint : l'origine.
+        let mut list = filters.list.clone();
+        list[0].enabled = false;
+        d.set_smart_filters(l, list.clone(), true, None).expect("œil");
+        assert_eq!(edge(&d), 0);
+        list[0].enabled = true;
+        d.set_smart_filters(l, list.clone(), true, None).expect("œil");
+        assert!(edge(&d) > 0);
+        // Deuxième filtre : il reçoit le premier.
+        d.apply_filter(l, &Filter::Posterize { levels: 2 }).expect("isohélie");
+        assert_eq!(d.layer(l).expect("calque").filters.as_ref().expect("filtres").list.len(), 2);
+        assert!(Arc::ptr_eq(&d.filter_input(l, Some(0)).expect("entrée"), &original), "le premier filtre reçoit l'origine");
+        // Transformation : l'origine bouge, les filtres sont refaits.
+        let before = edge(&d);
+        d.transform_layers(&[l], &Matrix::translation(50.0, 0.0), Quality::Final).expect("transformation");
+        assert_eq!(Sampler::new(d.layer(l).expect("calque").pixels().expect("pixels")).get(152, 50)[3], before, "flou déplacé avec l'origine");
+        assert!(d.layer(l).expect("calque").filters.is_some(), "filtres gardés");
+        // Liste vidée : calque ordinaire, pixels d'origine.
+        d.set_smart_filters(l, Vec::<SmartFilter>::new(), true, None).expect("retrait");
+        assert!(d.layer(l).expect("calque").filters.is_none() && d.pixels_mut(l).is_ok());
+        // Pixelliser : le résultat reste, les filtres disparaissent.
+        d.apply_filter(l, &Filter::GaussianBlur { radius: 5.0 }).expect("flou");
+        let blurred = Arc::clone(d.layer(l).expect("calque").pixels().expect("pixels"));
+        d.bake_filters(l).expect("pixellisation");
+        let layer = d.layer(l).expect("calque");
+        assert!(layer.filters.is_none() && Arc::ptr_eq(layer.pixels().expect("pixels"), &blurred));
     }
 
     #[test]
@@ -2462,6 +3388,44 @@ mod tests {
     }
 
     #[test]
+    fn transform_makes_the_mask_of_a_group_and_of_a_text_layer_follow() {
+        // Groupe masqué : le masque révèle un carré (20..30)² ; doubler le groupe doit l'amener en (40..60)².
+        let mut d = doc();
+        let g = d.add_group("G", None, 0).expect("groupe");
+        let child = add(&mut d, "L", Some(g));
+        d.pixels_mut(child).expect("pixels").fill(100, 100, [255, 0, 0, 255]);
+        d.add_mask(g, false).expect("masque noir");
+        let square = |m: &mut MaskStore| {
+            // Carré blanc (20..30)² en repère du calque.
+            for y in 20..30 { for x in 20..30 { m.get_mut(TileCoord::new(0, 0)).set_pixel(x, y, [255]); } }
+        };
+        square(d.mask_mut(g).expect("masque"));
+        let double = Matrix([2.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 1.0]);
+        d.transform_layers(&[g], &double, Quality::Final).expect("transformation du groupe");
+        let mask_at = |d: &Document, x: i32, y: i32| {
+            let layer = d.layer(g).expect("groupe");
+            Sampler::new(&layer.mask.as_ref().expect("masque").pixels).get(x - layer.offset.0, y - layer.offset.1)[0]
+        };
+        assert_eq!((mask_at(&d, 25, 25), mask_at(&d, 45, 45), mask_at(&d, 58, 58), mask_at(&d, 65, 65)), (0, 255, 255, 0), "le masque du groupe a suivi");
+        // Les pixels de l'enfant ont bien été doublés eux aussi (100..200)².
+        assert_eq!(d.content_bounds(&[child]).expect("bornes").map(|b| (b.0 <= 1, b.2 >= 199)), Some((true, true)));
+
+        // Calque de texte masqué : même attente, le masque suit la transformation du texte.
+        let mut d = doc();
+        let id = d.add_text_layer(TextData { content: "Aa".into(), size: 20.0, ..TextData::default() }, (0, 0), None, 0).expect("texte");
+        d.translate_layers(&[id], 20, 20).expect("position");
+        d.add_mask(id, false).expect("masque noir");
+        // Le calque est en (20, 20) : le carré (0..10)² en repère du calque est en (20..30)² dans le document.
+        for y in 0..10 { for x in 0..10 { d.mask_mut(id).expect("masque").get_mut(TileCoord::new(0, 0)).set_pixel(x, y, [255]); } }
+        d.transform_layers(&[id], &double, Quality::Final).expect("transformation du texte");
+        let mask_at = |d: &Document, x: i32, y: i32| {
+            let layer = d.layer(id).expect("texte");
+            Sampler::new(&layer.mask.as_ref().expect("masque").pixels).get(x - layer.offset.0, y - layer.offset.1)[0]
+        };
+        assert_eq!((mask_at(&d, 25, 25), mask_at(&d, 45, 45), mask_at(&d, 58, 58), mask_at(&d, 65, 65)), (0, 255, 255, 0), "le masque du texte a suivi");
+    }
+
+    #[test]
     fn transform_with_a_selection_only_affects_selected_pixels() {
         use crate::selection::Shape;
         let mut d = doc();
@@ -2523,7 +3487,9 @@ mod tests {
         assert!(((after.2 - after.0) - 2 * (before.2 - before.0)).abs() <= 6, "deux fois plus large : {before:?} -> {after:?}");
         assert!(d.layer(id).expect("texte").text().is_some(), "toujours éditable");
         // Le curseur suit la transformation : à la fin du texte, il est deux fois plus loin de l'ancre.
-        let ([top, bottom], _) = d.text_caret(id, 7, 7).expect("curseur");
+        let caret = d.text_caret(id, 7, 7).expect("curseur");
+        let [top, bottom] = caret.caret;
+        assert!(caret.frame.is_none() && !caret.overflow, "texte de point : ni cadre ni débordement");
         assert!((bottom.1 - top.1 - 2.0 * 32.0 * 1.2).abs() < 1.0, "hauteur de curseur doublée");
         assert_eq!(d.text_hit(id, top.0 + 1.0, (top.1 + bottom.1) / 2.0).expect("pointage"), 7);
 
@@ -2536,6 +3502,70 @@ mod tests {
         d.rasterize_layer(id).expect("pixellisation");
         assert!(d.layer(id).expect("calque").text().is_none() && d.pixels_mut(id).is_ok());
         assert!(d.rasterize_layer(id).is_err());
+    }
+
+    #[test]
+    fn paragraph_text_frames_resize_convert_and_follow_the_transform() {
+        use crate::text::TextFrame;
+        let mut d = doc();
+        let words = "un deux trois quatre cinq six sept huit neuf dix";
+        let frame = Some(TextFrame { width: 120.0, height: 200.0 });
+        let id = d.add_text_layer(TextData { content: words.into(), size: 20.0, frame, ..TextData::default() }, (30, 40), None, 1).expect("paragraphe");
+        let caret = d.text_caret(id, 0, 0).expect("curseur");
+        assert_eq!(caret.frame, Some([(30.0, 40.0), (150.0, 40.0), (150.0, 240.0), (30.0, 240.0)]), "cadre en repère document");
+        let bounds = d.content_bounds(&[id]).expect("bornes").expect("contenu");
+        assert!(bounds.0 >= 28 && bounds.2 <= 154 && bounds.3 - bounds.1 > 60, "retour à la ligne dans le cadre : {bounds:?}");
+        // Le cadre vide (sous la dernière ligne) ouvre la saisie ; hors du cadre, rien.
+        assert_eq!(d.pick_text_layer(140, 230), Some(id));
+        assert_eq!(d.pick_text_layer(200, 230), None);
+
+        // Poignée gauche tirée de 20 px vers la gauche : cadre plus large, origine décalée, texte recomposé (pas étiré).
+        d.set_text_frame(id, Some(TextFrame { width: 140.0, height: 200.0 }), (-20.0, 0.0)).expect("cadre");
+        assert_eq!(d.layer(id).expect("texte").offset, (10, 40), "sans transformation, l'origine reste au pixel près");
+        assert_eq!(d.text_transform(id).expect("matrice"), Matrix::IDENTITY);
+        // Cadre trop bas : la fin est masquée et signalée.
+        d.set_text_frame(id, Some(TextFrame { width: 140.0, height: 30.0 }), (0.0, 0.0)).expect("cadre bas");
+        assert!(d.text_caret(id, 0, 0).expect("curseur").overflow, "débordement signalé");
+        let short = d.content_bounds(&[id]).expect("bornes").expect("contenu");
+        assert!(short.3 <= 40 + 30 + 8, "rien n'est dessiné sous le cadre : {short:?}");
+
+        // Ctrl+T (doublé) : le cadre est dans le repère du texte, la transformation s'applique par-dessus.
+        d.set_text_frame(id, Some(TextFrame { width: 140.0, height: 200.0 }), (0.0, 0.0)).expect("cadre");
+        let double = Matrix([2.0, 0.0, -10.0, 0.0, 2.0, -40.0, 0.0, 0.0, 1.0]);
+        d.transform_layers(&[id], &double, Quality::Final).expect("transformation");
+        let frame = d.text_caret(id, 0, 0).expect("curseur").frame.expect("cadre");
+        assert!((frame[2].0 - frame[0].0 - 280.0).abs() < 0.01 && (frame[2].1 - frame[0].1 - 400.0).abs() < 0.01, "cadre doublé : {frame:?}");
+        // Poignée haute tirée : l'origine se décale dans le repère du texte, donc deux fois plus dans le document.
+        d.set_text_frame(id, Some(TextFrame { width: 140.0, height: 210.0 }), (0.0, -10.0)).expect("cadre transformé");
+        let moved = d.text_caret(id, 0, 0).expect("curseur").frame.expect("cadre");
+        assert!((moved[0].1 - (frame[0].1 - 20.0)).abs() < 0.01, "{frame:?} -> {moved:?}");
+
+        // Frappe partie avec la description d'avant le redimensionnement (réponse de set_text_frame pas encore
+        // reçue) : le contenu change, le cadre reste celui du calque (sinon l'ancien cadre sur l'origine décalée).
+        let stale = TextData { content: format!("{words} onze"), frame: Some(TextFrame { width: 140.0, height: 200.0 }), ..d.layer(id).expect("texte").text().expect("texte").clone() };
+        d.set_text(id, stale).expect("frappe");
+        let typed = d.layer(id).expect("texte").text().expect("texte").clone();
+        assert!(typed.content.ends_with("onze"), "le contenu suit la frappe");
+        assert_eq!(typed.frame, Some(TextFrame { width: 140.0, height: 210.0 }), "le cadre n'est pas écrasé par set_text");
+        let unframed = TextData { frame: None, ..typed };
+        d.set_text(id, unframed).expect("frappe sans cadre");
+        assert!(d.layer(id).expect("texte").text().expect("texte").frame.is_some(), "seule une conversion retire le cadre");
+
+        // Conversions : paragraphe -> point -> paragraphe, sans changer l'aspect.
+        let mut e = doc();
+        let p = e.add_text_layer(TextData { content: words.into(), size: 20.0, align: crate::text::TextAlign::Center, frame: Some(TextFrame { width: 120.0, height: 300.0 }), ..TextData::default() }, (30, 40), None, 1).expect("paragraphe");
+        let as_paragraph = e.content_bounds(&[p]).expect("bornes").expect("contenu");
+        e.convert_text(p, false).expect("en texte de point");
+        let point = e.layer(p).expect("texte").text().expect("texte").clone();
+        assert!(point.frame.is_none() && point.content.contains('\n') && point.content.replace('\n', " ") == words, "retours insérés : {:?}", point.content);
+        assert_eq!(e.layer(p).expect("texte").offset, (90, 40), "ancre au milieu du cadre (centré)");
+        let as_point = e.content_bounds(&[p]).expect("bornes").expect("contenu");
+        assert!((0..4).all(|i| [as_point.0 - as_paragraph.0, as_point.1 - as_paragraph.1, as_point.2 - as_paragraph.2, as_point.3 - as_paragraph.3][i].abs() <= 2), "même aspect : {as_paragraph:?} -> {as_point:?}");
+        e.convert_text(p, true).expect("en texte de paragraphe");
+        let back = e.layer(p).expect("texte").text().expect("texte").frame.expect("cadre");
+        assert!(back.width <= 121.0 && back.height >= 20.0, "le cadre est la boîte du texte : {back:?}");
+        let as_paragraph_again = e.content_bounds(&[p]).expect("bornes").expect("contenu");
+        assert!((as_paragraph_again.0 - as_point.0).abs() <= 2 && (as_paragraph_again.2 - as_point.2).abs() <= 2, "même aspect : {as_point:?} -> {as_paragraph_again:?}");
     }
 
     #[test]
@@ -2599,6 +3629,30 @@ mod tests {
     }
 
     #[test]
+    fn a_second_bucket_fill_replaces_the_whole_selection_edge_included() {
+        let mut d = doc();
+        let l = add(&mut d, "L", None);
+        // Sélection au bord adouci (polygone en biais) : le pot la remplit en rouge, puis en bleu.
+        let contour = vec![[40.5, 30.2], [250.7, 60.4], [220.3, 260.9], [30.1, 230.6]];
+        d.set_selection(Some(Shape::Contours { contours: vec![contour] }.rasterize(300, 300)));
+        d.bucket_fill(l, (150, 150), [255, 0, 0], 10, true).expect("rouge");
+        d.bucket_fill(l, (150, 150), [0, 0, 255], 10, true).expect("bleu");
+        let store = Arc::clone(d.layer(l).expect("l").pixels().expect("pixels"));
+        let mut sampler = Sampler::new(&store);
+        let mut edge = 0;
+        for y in 0..300 {
+            for x in 0..300 {
+                let px = sampler.get(x, y);
+                assert_eq!(px[0], 0, "plus de rouge, même au bord ({x}, {y}) : {px:?}");
+                if px[3] > 0 && px[3] < 255 {
+                    edge += 1;
+                }
+            }
+        }
+        assert!(edge > 0, "le bord reste adouci");
+    }
+
+    #[test]
     fn bucket_and_gradient_fills() {
         let mut d = doc();
         let l = add(&mut d, "L", None);
@@ -2644,16 +3698,16 @@ mod tests {
         d.pixels_mut(above).expect("pixels").fill(50, 50, [10, 20, 30, 255]);
         let shown = |d: &Document, x, y| TileRenderer::new().tile(d, 0, TileCoord::new(0, 0)).expect("tuile").pixel(x, y);
         let shown_below = shown(&d, 100, 100);
-        // Inverser (courbe mesurée, interpolée par le compositeur) : 200 → ~52, 100 → ~145, 0 → 255.
-        assert!((i32::from(shown_below[0]) - 52).abs() <= 2 && (i32::from(shown_below[1]) - 145).abs() <= 2 && shown_below[2] == 255, "ce qui est dessous est inversé : {shown_below:?}");
+        // Inverser : 255 - v (à l'arrondi près du compositeur).
+        assert!(shown_below[0].abs_diff(55) <= 1 && shown_below[1].abs_diff(155) <= 1 && shown_below[2] == 255, "ce qui est dessous est inversé : {shown_below:?}");
         assert_eq!(shown(&d, 10, 10), [10, 20, 30, 255], "ce qui est dessus ne l'est pas");
         assert_eq!(Sampler::new(d.layer(below).expect("calque").pixels().expect("pixels")).get(100, 100), [200, 100, 0, 255], "pixels intacts");
 
         // Opacité à 50 % : à mi-chemin ; masqué : sans effet ; invisible : sans effet.
         d.edit_props(adjustment, |p| p.opacity = 0.5).expect("opacité");
         let half = shown(&d, 100, 100);
-        // À mi-chemin entre (200, 100) et (52, 145) : (126, 123).
-        assert!(half[0].abs_diff(126) <= 2 && half[1].abs_diff(123) <= 2, "{half:?}");
+        // À mi-chemin entre (200, 100) et (55, 155) : (128, 128).
+        assert!(half[0].abs_diff(128) <= 2 && half[1].abs_diff(128) <= 2, "{half:?}");
         d.edit_props(adjustment, |p| (p.opacity, p.visible) = (1.0, false)).expect("masquer");
         assert_eq!(shown(&d, 100, 100), [200, 100, 0, 255]);
 
@@ -2670,18 +3724,28 @@ mod tests {
         d.pixels_mut(target).expect("pixels").fill(50, 50, [10, 20, 30, 255]);
         let clipped = d.add_adjustment_layer(Adjustment::Invert, None, 3, true).expect("réglage écrêté");
         assert!(d.layer(clipped).expect("réglage").props.clipped);
-        // Inverser n'est pas le négatif strict : 10 → 245 (extrême quasi exact), 20 → 233 et 30 → 222 (légèrement plus sombres que 235 et 225).
-        let table = crate::adjust::invert_table();
-        assert_eq!(shown(&d, 10, 10), [table[10], table[20], table[30], 255], "le calque ciblé est inversé");
-        assert!(shown(&d, 10, 10)[0] >= 244 && shown(&d, 10, 10)[2] < 225, "courbe mesurée, pas 255 - v : {:?}", shown(&d, 10, 10));
+        // Inverser : exactement 255 - v.
+        assert_eq!(shown(&d, 10, 10), [245, 235, 225, 255], "le calque ciblé est inversé");
         assert_eq!(shown(&d, 100, 100), [200, 100, 0, 255], "le calque d'en dessous ne l'est pas");
 
         // Ctrl+I : inversion directe des pixels, limitée à la sélection.
         d.set_selection(Some(Shape::Rect { x: 0.0, y: 0.0, width: 20.0, height: 300.0 }.rasterize(300, 300)));
         d.invert_layer(bottom).expect("inversion");
         let at = |x| Sampler::new(d.layer(bottom).expect("bas").pixels().expect("pixels")).get(x, 200);
-        assert_eq!((at(10), at(30)), ([table[200], table[100], table[0], 255], [200, 100, 0, 255]));
-        assert_eq!(table[0], 255, "le noir devient blanc");
+        assert_eq!((at(10), at(30)), ([55, 155, 255, 255], [200, 100, 0, 255]), "le noir devient blanc, hors sélection rien ne change");
+        // Une haute lumière bruitée devient un noir bruité, sans pixel épargné ; deux fois redonne l'image.
+        let light = add(&mut d, "reflet", None);
+        let bytes: Vec<u8> = [255u8, 254, 251, 247].iter().flat_map(|&v| [v, v, v, 255]).collect();
+        *d.pixels_mut(light).expect("pixels") = TileStore::from_premultiplied(4, 1, &bytes).expect("reflet");
+        d.set_selection(None);
+        d.invert_layer(light).expect("inversion");
+        let row = |d: &Document| {
+            let mut sampler = Sampler::new(d.layer(light).expect("reflet").pixels().expect("pixels"));
+            [0, 1, 2, 3].map(|x| sampler.get(x, 0)[0])
+        };
+        assert_eq!(row(&d), [0, 1, 4, 8]);
+        d.invert_layer(light).expect("seconde inversion");
+        assert_eq!(row(&d), [255, 254, 251, 247]);
     }
 
     #[test]
@@ -2717,8 +3781,8 @@ mod tests {
         let l = add(&mut d, "L", None);
         d.pixels_mut(l).expect("pixels").fill(300, 300, [0, 0, 255, 255]);
         d.set_selection(Some(Shape::Rect { x: 50.0, y: 50.0, width: 100.0, height: 100.0 }.rasterize(300, 300)));
-        d.guides.push(Guide { orientation: Orientation::Vertical, position: 120.0 });
-        d.guides.push(Guide { orientation: Orientation::Vertical, position: 20.0 });
+        d.guides.push(Guide { orientation: Orientation::Vertical, position: 120.0, board: None });
+        d.guides.push(Guide { orientation: Orientation::Vertical, position: 20.0, board: None });
 
         d.crop(100, 80, 150, 120).expect("recadrage");
         assert_eq!((d.width(), d.height()), (150, 120));
@@ -3040,6 +4104,29 @@ mod tests {
     }
 
     #[test]
+    fn camera_raw_on_a_smart_object_rasterizes_and_filters_in_one_history_step() {
+        let mut d = doc();
+        let l = add(&mut d, "photo", None);
+        d.pixels_mut(l).expect("pixels").fill(80, 80, [200, 40, 40, 255]);
+        let smart = d.convert_to_smart(&[l]).expect("objet dynamique");
+        assert!(d.apply_filter(smart, &Filter::GaussianBlur { radius: 2.0 }).is_err(), "un filtre ordinaire refuse l'objet");
+
+        let mut session = crate::Session::new(d, "Ouvrir");
+        // Filtre invalide : l'opération entière échoue, l'objet reste un objet dynamique et l'historique ne bouge pas.
+        let broken = Filter::Liquify { cols: 1, rows: 1, dx: vec![0.0], dy: vec![0.0] };
+        assert!(session.apply("Filtre", None, |doc| doc.rasterize_and_filter(smart, &broken)).is_err());
+        assert!(session.document().layer(smart).expect("calque").smart().is_some(), "rien n'est pixellisé en cas d'échec");
+        assert_eq!(session.history().0.len(), 1);
+
+        session.apply("Filtre", None, |doc| doc.rasterize_and_filter(smart, &Filter::GaussianBlur { radius: 2.0 })).expect("filtre");
+        let layer = session.document().layer(smart).expect("calque");
+        assert!(layer.smart().is_none() && layer.pixels().is_some(), "pixellisé et filtré");
+        assert_eq!(session.history().0.len(), 2, "une seule étape d'historique");
+        session.undo();
+        assert!(session.document().layer(smart).expect("calque").smart().is_some(), "un Ctrl+Z rend l'objet");
+    }
+
+    #[test]
     fn picking_a_clipped_layer_selects_the_layer_it_is_clipped_on() {
         // Un texte, et par-dessus un aplat écrêté dessus : cliquer sur l'image doit désigner le texte.
         let mut d = doc();
@@ -3092,5 +4179,200 @@ mod tests {
         assert!(snapshot.layer(l).expect("l").mask.is_none());
         assert!(!d.same_structure(&snapshot));
         assert!(d.same_structure(&d.clone()));
+    }
+    /// Sélection automatique dans un document à plans : un clic dans un plan saisit un calque de CE plan, jamais le
+    /// fond d'un plan voisin (son remplissage couvre le document, mais la découpe du plan le cache ailleurs).
+    #[test]
+    fn picking_respects_artboard_clipping() {
+        let mut d = Document::new("plans", 100, 100, 72.0).expect("document");
+        let board = |x, y, w, h| Artboard { x, y, width: w, height: h, background: Some([255, 255, 255]), clip: true, preset: None, background_layer: None };
+        let a = d.add_artboard("A", board(0, 0, 100, 100)).expect("plan");
+        let b = d.add_artboard("B", board(140, 0, 60, 120)).expect("plan");
+        d.fit_to_artboards().expect("ajuster");
+        let bg = |d: &Document, id| d.layer(id).expect("plan").artboard.as_ref().and_then(|b| b.background_layer).expect("fond");
+        let (bg_a, bg_b) = (bg(&d, a), bg(&d, b));
+        // Fonds gérés : un clic dans le vide d'un plan saisit le plan lui-même, jamais son fond ni le plan voisin.
+        assert_eq!((d.pick_layer(50, 50), d.pick_layer(170, 60)), (Some(a), Some(b)));
+        // Cadenas retirés : calques ordinaires, saisis seulement dans leur plan.
+        for id in [bg_a, bg_b] {
+            d.edit_props(id, |p| p.locks = Locks::default()).expect("verrous");
+            d.release_artboard_background(id).expect("libéré");
+        }
+        assert_eq!(d.pick_layer(50, 50), Some(bg_a), "dans A : le fond de A, pas celui de B (B est au-dessus dans la pile)");
+        assert_eq!(d.pick_layer(170, 60), Some(bg_b));
+        assert_eq!(d.pick_layer(120, 50), None, "entre les plans : rien");
+        // Un masque de calque qui cache le point le rend insaisissable là aussi.
+        let px = d.add_pixel_layer("tache", TileStore::new(), Some(a), 1).expect("calque");
+        d.pixels_mut(px).expect("pixels").fill(100, 100, [0, 0, 0, 255]);
+        d.add_mask(px, false).expect("masque noir");
+        assert_eq!(d.pick_layer(50, 50), Some(bg_a), "calque entièrement masqué : traversé");
+    }
+
+    /// Repères par plan : posés sur un plan, suivent son déplacement, partent avec lui ; l'effacement ne touche que
+    /// le plan visé ; un projet d'avant rattache ses repères au plan où ils tombent.
+    #[test]
+    fn guides_belong_to_their_artboard() {
+        let mut d = Document::new("plans", 100, 100, 72.0).expect("document");
+        let board = |x, y, w, h| Artboard { x, y, width: w, height: h, background: Some([255, 255, 255]), clip: true, preset: None, background_layer: None };
+        let a = d.add_artboard("A", board(0, 0, 100, 100)).expect("plan");
+        let b = d.add_artboard("B", board(140, 0, 60, 120)).expect("plan");
+        d.fit_to_artboards().expect("ajuster");
+        assert!(d.add_guide(Orientation::Vertical, 10.0, None).is_err(), "dans un document à plans, un plan est obligatoire");
+        d.add_guide(Orientation::Vertical, 30.0, Some(a)).expect("repère");
+        d.add_guide(Orientation::Horizontal, 50.0, Some(b)).expect("repère");
+        d.set_guides(vec![Guide { orientation: Orientation::Vertical, position: 160.0, board: None }], Some(b), false).expect("disposition");
+        assert_eq!(d.guides.iter().filter(|g| g.board == Some(b)).count(), 2, "la disposition est posée sur le plan visé");
+        // Le plan B bouge : ses repères suivent, ceux de A restent.
+        d.move_artboard(b, 20, 10, true).expect("déplacer");
+        let of = |d: &Document, id| d.guides.iter().filter(|g| g.board == Some(id)).map(|g| g.position).collect::<Vec<_>>();
+        assert_eq!(of(&d, b), vec![60.0, 180.0]);
+        assert_eq!(of(&d, a), vec![30.0]);
+        // Effacer les repères de A ne touche pas B.
+        d.clear_guides(Some(a)).expect("effacer");
+        assert!(of(&d, a).is_empty() && of(&d, b).len() == 2);
+        // Supprimer B emporte ses repères.
+        d.remove_layers(&[b]).expect("supprimer");
+        assert!(d.guides.is_empty());
+        // Projet d'avant : repères sans plan, rattachés au plan où ils tombent, sinon retirés.
+        d.guides.push(Guide { orientation: Orientation::Vertical, position: 40.0, board: None });
+        d.guides.push(Guide { orientation: Orientation::Horizontal, position: 110.0, board: None });
+        d.adopt_orphan_guides();
+        assert_eq!(d.guides.len(), 1);
+        assert_eq!((d.guides[0].board, d.guides[0].position), (Some(a), 40.0));
+    }
+
+    /// Cadenas retiré du fond d'un plan : il devient un calque de pixels blanc, peignable, que le plan ne pilote plus.
+    #[test]
+    fn unlocking_an_artboard_background_turns_it_into_a_pixel_layer() {
+        let mut d = Document::new("plans", 100, 100, 72.0).expect("document");
+        let board = |x, y, w, h| Artboard { x, y, width: w, height: h, background: Some([255, 255, 255]), clip: true, preset: None, background_layer: None };
+        let a = d.add_artboard("Post", board(0, 0, 100, 100)).expect("plan");
+        d.fit_to_artboards().expect("ajuster");
+        let bg = d.layer(a).expect("plan").artboard.as_ref().and_then(|b| b.background_layer).expect("fond");
+        assert!(d.layer(bg).expect("fond").props.locks.pixels, "fond verrouillé à la création");
+        assert!(!d.release_artboard_background(bg).expect("verrouillé"), "tant que le cadenas est là, rien ne change");
+        // Peindre est refusé tant que c'est un remplissage verrouillé.
+        let brush = crate::paint::Brush { size: 10.0, hardness: 1.0, opacity: 1.0, color: [255, 0, 0], mode: crate::paint::BrushMode::Paint, pressure_size: false, pressure_opacity: false };
+        assert!(crate::paint::Stroke::begin(&d, bg, false, brush).is_err());
+
+        d.edit_props(bg, |p| p.locks.pixels = false).expect("cadenas");
+        assert!(d.release_artboard_background(bg).expect("libéré"));
+        let layer = d.layer(bg).expect("fond");
+        assert!(layer.fill_content().is_none() && layer.pixels().is_some() && layer.mask.is_none(), "calque de pixels ordinaire");
+        assert_eq!(layer.parent, Some(a), "toujours dans son plan");
+        let b = d.layer(a).expect("plan").artboard.clone().expect("plan");
+        assert_eq!((b.background_layer, b.background), (None, None), "le plan ne pilote plus ce fond");
+        // Blanc partout dans le plan, et un trait s'y pose.
+        let flat = crate::io::flatten_for_export(&d, 1.0).expect("aplat");
+        assert_eq!(&flat.rgba[(50 * 100 + 50) * 4..(50 * 100 + 50) * 4 + 4], [255, 255, 255, 255]);
+        let mut stroke = crate::paint::Stroke::begin(&d, bg, false, brush).expect("peignable");
+        stroke.extend(&mut d, &[crate::paint::StrokePoint { x: 50.0, y: 50.0, pressure: 1.0 }]).expect("trait");
+        stroke.finish(&mut d).expect("fin");
+        let flat = crate::io::flatten_for_export(&d, 1.0).expect("aplat");
+        assert_eq!(&flat.rgba[(50 * 100 + 50) * 4..(50 * 100 + 50) * 4 + 4], [255, 0, 0, 255], "peint en rouge");
+        // Redimensionner le plan (fond « transparent », tel que la fenêtre des plans le montre désormais) ne recrée
+        // pas de fond ni ne touche au calque ; choisir à nouveau une couleur en recrée un dessous.
+        d.set_artboard(a, Artboard { background: None, ..board(0, 0, 120, 100) }, true).expect("cadre");
+        assert_eq!(d.children_of(Some(a)).expect("enfants"), &[bg]);
+        d.set_artboard(a, board(0, 0, 120, 100), true).expect("couleur");
+        let children = d.children_of(Some(a)).expect("enfants").to_vec();
+        assert_eq!((children.len(), children[1]), (2, bg), "nouveau fond sous le calque peint");
+    }
+
+    #[test]
+    fn artboards_clip_fill_move_and_grow_the_document() {
+        let mut d = Document::new("plans", 100, 100, 72.0).expect("document");
+        let board = |x, y, w, h| Artboard { x, y, width: w, height: h, background: Some([255, 255, 255]), clip: true, preset: None, background_layer: None };
+        let a = d.add_artboard("Post", board(0, 0, 100, 100)).expect("plan");
+        let b = d.add_artboard("Story", board(140, 0, 60, 120)).expect("plan");
+        d.fit_to_artboards().expect("ajuster");
+        assert_eq!((d.width(), d.height()), (200, 120));
+        // Fond blanc dans le plan, transparent entre les plans (la découpe agit).
+        let flat = crate::io::flatten_for_export(&d, 1.0).expect("aplat");
+        let px = |x: usize, y: usize| &flat.rgba[(y * 200 + x) * 4..(y * 200 + x) * 4 + 4];
+        assert_eq!(px(50, 50), [255, 255, 255, 255]);
+        assert_eq!(px(120, 50)[3], 0, "entre deux plans");
+        assert_eq!(px(150, 110), [255, 255, 255, 255], "la story est plus haute");
+        // Déplacer un plan à gauche de l'origine : le document s'agrandit et tout est recalé.
+        d.move_artboard(a, -30, 0, true).expect("déplacer");
+        assert_eq!(d.width(), 230);
+        assert_eq!(d.layer(a).expect("plan").artboard.as_ref().map(|b| b.x), Some(0));
+        assert_eq!(d.layer(b).expect("plan").artboard.as_ref().map(|b| b.x), Some(170));
+        // Fond retiré : le plan devient transparent.
+        let mut clear = d.layer(b).expect("plan").artboard.clone().expect("plan");
+        clear.background = None;
+        d.set_artboard(b, clear, true).expect("fond");
+        assert!(d.layer(b).expect("plan").children().is_empty());
+        // Copie : son fond géré est bien le sien.
+        let copy = d.duplicate_layer(a).expect("copie");
+        let bg = d.layer(copy).expect("copie").artboard.as_ref().and_then(|b| b.background_layer).expect("fond");
+        assert_eq!(d.layer(bg).expect("fond").parent, Some(copy));
+    }
+
+    #[test]
+    fn an_artboard_frame_stops_at_its_edges() {
+        let mut d = Document::new("plans", 200, 100, 72.0).expect("document");
+        let board = |x, y, w, h| Artboard { x, y, width: w, height: h, background: Some([255, 255, 255]), clip: true, preset: None, background_layer: None };
+        let a = d.add_artboard("A", board(0, 0, 80, 100)).expect("plan");
+        let b = d.add_artboard("B", board(120, 10, 60, 50)).expect("plan");
+        // Le fond couvre tout le document ; le cadre du plan, lui, s'arrête à ses bords.
+        assert_eq!(d.content_bounds(&[b]).expect("bornes"), Some((120, 10, 180, 60)));
+        assert_eq!(d.content_bounds(&[a, b]).expect("bornes"), Some((0, 0, 180, 100)));
+        // Sans découpe : tout le contenu compte.
+        let mut open = d.layer(b).expect("plan").artboard.clone().expect("plan");
+        open.clip = false;
+        d.set_artboard(b, open, false).expect("découpe");
+        assert_eq!(d.content_bounds(&[b]).expect("bornes").map(|r| r.0), Some(0));
+    }
+
+
+    #[test]
+    fn the_artboard_window_applies_a_whole_plan_at_once() {
+        let mut d = Document::new("plans", 200, 100, 72.0).expect("document");
+        let mut rgba = vec![0u8; 40 * 40 * 4];
+        rgba.chunks_exact_mut(4).for_each(|p| p.copy_from_slice(&[255, 0, 0, 255]));
+        let red = d.add_pixel_layer("Rouge", TileStore::from_premultiplied(40, 40, &rgba).expect("tampon"), None, 0).expect("calque");
+        let board = |x, y, w, h| Artboard { x, y, width: w, height: h, background: Some([255, 255, 255]), clip: true, preset: None, background_layer: None };
+        // Document sans plan : le document devient le premier plan (avec ses calques), plus un nouveau à droite.
+        let ids = d.apply_artboards(vec![(None, "Doc".into(), board(0, 0, 200, 100)), (None, "Story".into(), board(300, 0, 54, 96))], &[]).expect("plans");
+        assert_eq!((d.width(), d.height()), (354, 100));
+        assert_eq!(d.layer(red).expect("calque").parent, Some(ids[0]));
+        // Le premier plan déplacé à gauche emporte son contenu ; le document suit.
+        d.apply_artboards(vec![(Some(ids[0]), "Doc".into(), board(-100, 0, 200, 100)), (Some(ids[1]), "Story".into(), board(300, 0, 54, 96))], &[]).expect("plans");
+        assert_eq!(d.width(), 454);
+        assert_eq!(d.layer(red).expect("calque").offset, (0, 0), "le calque a suivi son plan");
+        // Supprimer un plan le supprime vraiment, et le document se réajuste.
+        d.apply_artboards(vec![(Some(ids[0]), "Doc".into(), board(0, 0, 200, 100))], &[ids[1]]).expect("plans");
+        assert!(d.layer(ids[1]).is_err());
+        assert_eq!((d.width(), d.height()), (200, 100));
+        // Copie d'un plan : « Doc 2 », à droite, sans chevauchement.
+        let copy = d.duplicate_layer(ids[0]).expect("copie");
+        assert_eq!(d.layer(copy).expect("copie").props.name, "Doc 2");
+        let b = d.layer(copy).expect("copie").artboard.clone().expect("plan");
+        let a = d.layer(ids[0]).expect("plan").artboard.clone().expect("plan");
+        assert!(b.x >= a.x + a.width as i32 + 100);
+    }
+
+    /// Partage par la sélection : les tuiles hors de la sélection restent partagées avec la source (pas de copie),
+    /// celles qu'elle touche sont partagées entre « découpé » et « restant » au prorata du masque.
+    #[test]
+    fn split_by_selection_keeps_untouched_tiles_shared() {
+        let mut source = TileStore::new();
+        source.fill(600, 300, [40, 80, 120, 255]);
+        let selection = rect_mask(10, 10, 50, 50);
+        let (cut, rest) = split_by_selection(&source, (0, 0), &selection);
+        let origin = TileCoord::new(0, 0);
+        assert!(!Arc::ptr_eq(source.get(origin).expect("tuile"), rest.get(origin).expect("tuile")), "tuile touchée : copiée");
+        assert_eq!(rest.get(origin).expect("tuile").pixel(20, 20), [0; 4]);
+        assert_eq!(cut.get(origin).expect("tuile").pixel(20, 20), [40, 80, 120, 255]);
+        assert_eq!(rest.get(origin).expect("tuile").pixel(100, 100), [40, 80, 120, 255]);
+        for coord in [TileCoord::new(1, 0), TileCoord::new(2, 0), TileCoord::new(0, 1), TileCoord::new(2, 1)] {
+            assert!(Arc::ptr_eq(source.get(coord).expect("tuile"), rest.get(coord).expect("tuile")), "{coord:?} : partagée telle quelle");
+            assert!(cut.get(coord).is_none());
+        }
+        // Décalage du calque : la sélection est en repère document.
+        let (cut, rest) = split_by_selection(&source, (-300, 0), &rect_mask(0, 0, 20, 20));
+        assert!(cut.get(TileCoord::new(1, 0)).is_some());
+        assert!(Arc::ptr_eq(source.get(origin).expect("tuile"), rest.get(origin).expect("tuile")));
     }
 }

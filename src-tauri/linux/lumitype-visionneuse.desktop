@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=Lumitype Visionneuse
+GenericName=Visionneuse d'images
+GenericName[en]=Image Viewer
+Comment=Regarder ses images et celles d'un dossier (zoom, pellicule, comparaison, diaporama)
+Comment[en]=View your images and the rest of their folder (zoom, filmstrip, compare, slideshow)
+Categories=Graphics;Viewer;RasterGraphics;2DGraphics;Photography;
+Icon=lumitype
+Exec=lumitype --visionneuse %f
+TryExec=lumitype
+Terminal=false
+StartupWMClass=lumitype
+MimeType=image/jpeg;image/png;image/webp;image/avif;image/gif;image/bmp;image/tiff;image/heic;image/heif;image/x-adobe-dng;image/x-sony-arw;image/x-canon-cr2;image/x-canon-cr3;image/x-nikon-nef;image/x-nikon-nrw;image/x-fuji-raf;image/x-olympus-orf;image/x-panasonic-rw2;image/x-pentax-pef;image/x-samsung-srw;

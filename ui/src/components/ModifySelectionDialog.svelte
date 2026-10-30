@@ -23,7 +23,7 @@
   <form onsubmit={(event) => (event.preventDefault(), close(true))}>
     <h2>{t("Modifier la sélection")}</h2>
     <label>
-      <span>{amount < 0 ? "Contracter" : "Dilater"}</span>
+      <span>{amount < 0 ? t("Contracter") : t("Dilater")}</span>
       <output>{amount > 0 ? "+" : ""}{amount} px</output>
       <input type="range" min="-100" max="100" step="1" bind:value={amount} />
     </label>

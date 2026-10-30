@@ -7,8 +7,8 @@
 //!    l'échec est silencieux. Sur une carte intégrée, ce tas est pris sur la mémoire vive : il est signalé
 //!    comme *partagé* ;
 //! 2. **Linux** : `mem_info_vram_total` dans sysfs (pilote amdgpu ; la plus grosse carte l'emporte) ;
-//! 3. **Windows** : DXGI, la mémoire dédiée (`DedicatedVideoMemory`) de la carte la mieux dotée, cartes logicielles
-//!    (WARP) exclues ;
+//! 3. **Windows** : DXGI, la carte la mieux dotée, cartes logicielles (WARP) exclues : sa mémoire dédiée
+//!    (`DedicatedVideoMemory`), ou pour une carte intégrée sa mémoire partagée en plus (signalée comme *partagée*) ;
 //! 4. sinon `None` : taille inconnue, l'interface suppose alors 2 Gio et le dit.
 //!
 //! Une carte intégrée (portable) se reconnaît à une mémoire dédiée petite (< 1 Gio), partagée ou inconnue : sa mémoire
@@ -44,7 +44,7 @@ fn system_video_memory() -> Option<VideoMemory> {
     }
     #[cfg(windows)]
     {
-        dxgi_vram_mb().map(|mb| VideoMemory { mb, shared: false })
+        dxgi_video_memory()
     }
     #[cfg(not(any(target_os = "linux", windows)))]
     {
@@ -106,26 +106,33 @@ fn linux_sysfs_vram_mb() -> Option<u64> {
         .max()
 }
 
-/// DXGI énumère les cartes avec leur mémoire dédiée ; on retient la plus dotée, cartes logicielles (WARP) exclues.
-/// `DXGI_ADAPTER_DESC1.DedicatedVideoMemory` suffit (la mémoire dédiée est fixe) ; `QueryVideoMemoryInfo` ne
-/// donnerait en plus que l'occupation du moment, dont on n'a pas besoin.
+/// DXGI : la carte la mieux dotée, cartes logicielles (WARP) exclues. Une carte intégrée (Intel, AMD APU) n'a que
+/// quelques centaines de Mio « dédiés » (souvent 128) : c'est la mémoire vive partagée qu'elle utilise vraiment
+/// (`SharedSystemMemory`). Ne compter que la mémoire dédiée réservait aux calques quelques dizaines de Mio : la
+/// carte graphique ne composait presque jamais, et chaque déplacement était recalculé par le processeur.
 #[cfg(windows)]
-fn dxgi_vram_mb() -> Option<u64> {
+fn dxgi_video_memory() -> Option<VideoMemory> {
     use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE};
     // SÉCURITÉ : appels COM documentés, sans pointeur fourni par nous ; les objets sont libérés à la fin de la portée.
     let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.ok()?;
-    let mut best = None;
+    let mut best: Option<VideoMemory> = None;
     for index in 0.. {
         let Ok(adapter) = (unsafe { factory.EnumAdapters1(index) }) else { break };
         let Ok(desc) = (unsafe { adapter.GetDesc1() }) else { continue };
         if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
             continue;
         }
-        let mb = desc.DedicatedVideoMemory as u64 / (1024 * 1024);
-        if mb == 0 {
+        let dedicated = desc.DedicatedVideoMemory as u64 / (1024 * 1024);
+        let shared = desc.SharedSystemMemory as u64 / (1024 * 1024);
+        let found = if dedicated >= 1024 { VideoMemory { mb: dedicated, shared: false } } else { VideoMemory { mb: dedicated + shared, shared: true } };
+        if found.mb == 0 {
             continue;
         }
-        best = Some(best.map_or(mb, |known: u64| known.max(mb)));
+        // Une carte dédiée l'emporte sur une intégrée, puis la plus grosse.
+        best = Some(match best {
+            Some(known) if (known.shared, std::cmp::Reverse(known.mb)) <= (found.shared, std::cmp::Reverse(found.mb)) => known,
+            _ => found,
+        });
     }
     best
 }

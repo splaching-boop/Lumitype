@@ -35,11 +35,39 @@ pub enum TextAlign {
     Left,
     Center,
     Right,
+    /// Justifié : les lignes d'un texte de paragraphe remplissent la largeur du cadre (la dernière ligne de chaque
+    /// paragraphe reste alignée à gauche, comme dans Photoshop). Un texte de point justifié s'aligne à gauche.
+    Justify,
+}
+
+/// Cadre d'un texte de paragraphe (« texte en bloc »), en pixels du repère texte : le texte revient à la ligne dans
+/// sa largeur ; ce qui dépasse sa hauteur n'est pas dessiné (voir [`overflows`]).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TextFrame {
+    pub width: f32,
+    pub height: f32,
+}
+
+/// Casse d'un texte : telle que tapée, tout en capitales, ou en petites capitales (fonction `smcp` de la police).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TextCaps {
+    #[default]
+    Normal,
+    AllCaps,
+    SmallCaps,
+}
+
+impl TextCaps {
+    fn is_normal(&self) -> bool {
+        *self == Self::Normal
+    }
 }
 
 /// Tout ce qui définit un calque de texte. Le point d'ancrage est la position du calque :
 /// bord gauche, centre ou bord droit de la première ligne selon l'alignement, comme le
-/// « texte de point » de Photoshop.
+/// « texte de point » de Photoshop. Un texte de paragraphe (`frame`) a pour origine le coin
+/// haut gauche de son cadre.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TextData {
@@ -65,6 +93,45 @@ pub struct TextData {
     /// police, une autre couleur…). En cas de recouvrement, la dernière l'emporte.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub runs: Vec<StyleRun>,
+    /// Texte de paragraphe : son cadre. Absent (fichiers écrits avant son existence compris) : texte de point.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame: Option<TextFrame>,
+    /// Texte dynamique (texte de paragraphe seulement) : chaque ligne est mise à la taille qui remplit la largeur du
+    /// cadre, les mots répartis pour en remplir la hauteur. Absent : texte ordinaire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic: Option<DynamicText>,
+    /// Casse du calque (les portions peuvent avoir la leur).
+    #[serde(default, skip_serializing_if = "TextCaps::is_normal")]
+    pub caps: TextCaps,
+    /// Style de caractère appliqué au calque entier (identifiant dans `Document::text_styles`). Ses réglages sont
+    /// recopiés dans le texte : le rendu n'en dépend pas, l'identifiant sert à le retrouver et à le mettre à jour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub style: Option<u32>,
+}
+
+/// Réglages d'un texte dynamique (voir [`TextData::dynamic`]).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DynamicText {
+    /// Nombre de lignes : 0 = automatique (celui qui remplit le mieux le cadre).
+    #[serde(default)]
+    pub lines: u16,
+    /// Les retours à la ligne tapés font les lignes (`lines` est alors ignoré).
+    #[serde(default)]
+    pub manual: bool,
+    /// Espace entre deux lignes, en part de la hauteur moyenne d'une ligne (0,12 = 12 %).
+    #[serde(default = "dynamic_gap")]
+    pub gap: f32,
+}
+
+fn dynamic_gap() -> f32 {
+    0.12
+}
+
+impl Default for DynamicText {
+    fn default() -> Self {
+        Self { lines: 0, manual: false, gap: dynamic_gap() }
+    }
 }
 
 /// Style propre à une portion du texte. `start..end` en unités UTF-16, comme la sélection
@@ -82,6 +149,17 @@ pub struct StyleRun {
     pub italic: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color: Option<[u8; 3]>,
+    /// Corps de la portion, en pixels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<f32>,
+    /// Approche de la portion, en millièmes de cadratin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracking: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caps: Option<TextCaps>,
+    /// Style de caractère appliqué à la portion (voir [`TextData::style`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub style: Option<u32>,
 }
 
 fn regular_weight() -> u16 {
@@ -479,11 +557,41 @@ pub fn bundled_font_file(family: &str) -> Option<PathBuf> {
 /// Mise en page d'un texte : tampon `cosmic-text`, largeur du bloc et abscisse de l'ancre.
 /// Les coordonnées de mise en page ont leur origine en haut à gauche du bloc ; le repère
 /// « texte » utilisé partout ailleurs a son origine à l'ancre : `x_texte = x_page - anchor`.
+/// Texte de paragraphe : le bloc est le cadre, l'ancre son bord gauche (`anchor = 0`).
 struct Layout {
     buffer: Buffer,
     width: f32,
     height: f32,
     anchor: f32,
+    /// Bas de la zone dessinée : la hauteur du cadre d'un texte de paragraphe ; l'infini pour un texte de point.
+    clip: f32,
+}
+
+/// Une ligne mise en page est dessinée si elle tient EN ENTIER dans la hauteur du cadre (comme dans Photoshop : une
+/// ligne à moitié visible est masquée, pas coupée). Un demi-pixel de tolérance absorbe les arrondis.
+fn line_shown(run: &cosmic_text::LayoutRun<'_>, clip: f32) -> bool {
+    run.line_top + run.line_height <= clip + 0.5
+}
+
+/// Alignement de cosmic-text pour un réglage du calque ; `None` : alignement naturel (gauche, ou droite en arabe…).
+fn cosmic_align(align: TextAlign, paragraph: bool) -> Option<Align> {
+    match align {
+        TextAlign::Left => None,
+        TextAlign::Center => Some(Align::Center),
+        TextAlign::Right => Some(Align::Right),
+        // Justifier n'a de sens que dans une largeur imposée : un texte de point justifié reste aligné à gauche.
+        TextAlign::Justify if paragraph => Some(Align::Justified),
+        TextAlign::Justify => None,
+    }
+}
+
+/// Abscisse (repère de mise en page) d'une ligne vide selon l'alignement : là où le curseur s'y place.
+fn empty_line_x(align: TextAlign, width: f32) -> f32 {
+    match align {
+        TextAlign::Left | TextAlign::Justify => 0.0,
+        TextAlign::Center => width / 2.0,
+        TextAlign::Right => width,
+    }
 }
 
 fn attributes(family: &str, weight: u16, italic: bool, tracking: f32) -> Attrs<'_> {
@@ -494,6 +602,37 @@ fn attributes(family: &str, weight: u16, italic: bool, tracking: f32) -> Attrs<'
         .weight(Weight(weight.clamp(100, 900)))
         .style(if italic { Style::Italic } else { Style::Normal })
         .letter_spacing(tracking / 1000.0)
+}
+
+/// Petites capitales : la fonction OpenType `smcp` de la police (sans effet si elle ne l'a pas).
+fn with_caps(attrs: Attrs<'_>, caps: TextCaps) -> Attrs<'_> {
+    if caps != TextCaps::SmallCaps {
+        return attrs;
+    }
+    let mut features = cosmic_text::FontFeatures::new();
+    features.enable(cosmic_text::FeatureTag::SMALL_CAPS);
+    attrs.font_features(features)
+}
+
+/// Texte tel qu'affiché : les caractères « tout en capitales » passent en majuscule quand leur majuscule tient dans
+/// le même nombre d'octets (les positions du curseur et des portions restent valables), sinon ils restent tels quels.
+fn shown_content(text: &TextData) -> std::borrow::Cow<'_, str> {
+    let any = text.caps == TextCaps::AllCaps || text.runs.iter().any(|r| r.caps == Some(TextCaps::AllCaps));
+    if !any {
+        return std::borrow::Cow::Borrowed(&text.content);
+    }
+    let mut out = String::with_capacity(text.content.len());
+    let mut utf16 = 0;
+    for ch in text.content.chars() {
+        let caps = text.runs.iter().rev().find(|run| utf16 >= run.start && utf16 < run.end).and_then(|run| run.caps).unwrap_or(text.caps);
+        let mut upper = ch.to_uppercase();
+        match (caps, upper.next(), upper.next()) {
+            (TextCaps::AllCaps, Some(u), None) if u.len_utf8() == ch.len_utf8() => out.push(u),
+            _ => out.push(ch),
+        }
+        utf16 += ch.len_utf16();
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 fn layout(fonts: &mut Fonts, text: &TextData) -> Result<Layout, EngineError> {
@@ -508,16 +647,26 @@ fn layout(fonts: &mut Fonts, text: &TextData) -> Result<Layout, EngineError> {
         .iter()
         .map(|run| fonts.resolve(run.font_family.as_deref().unwrap_or(&text.font_family), run.weight.unwrap_or(text.weight), run.italic.unwrap_or(text.italic)))
         .collect();
-    fonts.prepare(&text.content);
+    fonts.prepare(&shown_content(text));
     let system = &mut fonts.system;
     let line_height = text.size * text.line_height.clamp(0.5, 5.0);
     let mut buffer = Buffer::new(system, Metrics::new(text.size, line_height));
-    let attrs = attributes(&family, weight, text.italic, text.tracking);
-    buffer.set_size(system, None, None);
+    let attrs = with_caps(attributes(&family, weight, text.italic, text.tracking), text.caps);
+    let content = shown_content(text);
+    if let Some(frame) = text.frame {
+        let valid = |v: f32| v.is_finite() && (1.0..=MAX_BLOCK).contains(&v);
+        if !(valid(frame.width) && valid(frame.height)) {
+            return Err(EngineError::InvalidOperation("cadre de texte hors limites".into()));
+        }
+    }
+    // Texte de paragraphe : retour à la ligne automatique dans la largeur du cadre, par mots, et à l'intérieur d'un mot
+    // seulement s'il est plus long qu'une ligne. Texte de point : aucune largeur, aucun retour automatique.
+    buffer.set_wrap(system, cosmic_text::Wrap::WordOrGlyph);
+    buffer.set_size(system, text.frame.map(|frame| frame.width), None);
     // Tabulation : taquets tous les quatre espaces (Tab dans l'éditeur insère le caractère, comme dans Photoshop).
     buffer.set_tab_width(system, TAB_WIDTH);
     if text.runs.is_empty() {
-        buffer.set_text(system, &text.content, &attrs, Shaping::Advanced);
+        buffer.set_text(system, &content, &attrs, Shaping::Advanced);
     } else {
         // Style de chaque caractère (le dernier passage qui le couvre gagne), puis regroupement
         // des caractères voisins de même style en segments.
@@ -539,14 +688,28 @@ fn layout(fonts: &mut Fonts, text: &TextData) -> Result<Layout, EngineError> {
             let run = owner[from].map(|index| &text.runs[index]);
             let (family, weight) = owner[from].map_or((family.as_str(), weight), |index| (resolved[index].0.as_str(), resolved[index].1));
             let italic = run.and_then(|r| r.italic).unwrap_or(text.italic);
-            let mut span = attributes(family, weight, italic, text.tracking);
+            let tracking = run.and_then(|r| r.tracking).unwrap_or(text.tracking);
+            let mut span = with_caps(attributes(family, weight, italic, tracking), run.and_then(|r| r.caps).unwrap_or(text.caps));
             if let Some([r, g, b]) = run.and_then(|r| r.color) {
                 span = span.color(Color::rgb(r, g, b));
             }
-            spans.push((&text.content[start..end], span));
+            if let Some(size) = run.and_then(|r| r.size).filter(|v| v.is_finite() && (1.0..=4_000.0).contains(v)) {
+                span = span.metrics(Metrics::new(size, size * text.line_height.clamp(0.5, 5.0)));
+            }
+            spans.push((&content[start..end], span));
             from = i;
         }
         buffer.set_rich_text(system, spans, &attrs, Shaping::Advanced, None);
+    }
+
+    if let Some(frame) = text.frame {
+        // Texte de paragraphe : les lignes s'alignent dans la largeur du cadre, dès la première mise en page.
+        let align = cosmic_align(text.align, true);
+        for line in &mut buffer.lines {
+            line.set_align(align);
+        }
+        buffer.shape_until_scroll(system, false);
+        return Ok(Layout { buffer, width: frame.width, height: frame.height, anchor: 0.0, clip: frame.height });
     }
     buffer.shape_until_scroll(system, false);
 
@@ -556,8 +719,7 @@ fn layout(fonts: &mut Fonts, text: &TextData) -> Result<Layout, EngineError> {
     if width > MAX_BLOCK || height > MAX_BLOCK {
         return Err(EngineError::InvalidOperation("bloc de texte trop grand".into()));
     }
-    if text.align != TextAlign::Left {
-        let align = if text.align == TextAlign::Center { Align::Center } else { Align::Right };
+    if let Some(align) = cosmic_align(text.align, false) {
         for line in &mut buffer.lines {
             line.set_align(Some(align));
         }
@@ -565,11 +727,27 @@ fn layout(fonts: &mut Fonts, text: &TextData) -> Result<Layout, EngineError> {
         buffer.shape_until_scroll(system, false);
     }
     let anchor = match text.align {
-        TextAlign::Left => 0.0,
+        TextAlign::Left | TextAlign::Justify => 0.0,
         TextAlign::Center => (width / 2.0).round(),
         TextAlign::Right => width,
     };
-    Ok(Layout { buffer, width, height, anchor })
+    Ok(Layout { buffer, width, height, anchor, clip: f32::INFINITY })
+}
+
+/// Vrai si une partie d'un texte de paragraphe ne tient pas dans la hauteur de son cadre (elle n'est pas dessinée,
+/// comme dans Photoshop, et l'interface le signale). Toujours faux pour un texte de point.
+pub fn overflows(text: &TextData) -> Result<bool, EngineError> {
+    if text.frame.is_none() || text.content.is_empty() || dynamic_of(text).is_some() {
+        return Ok(false);
+    }
+    let mut guard = fonts().lock().unwrap_or_else(PoisonError::into_inner);
+    let Layout { buffer, clip, .. } = layout(&mut guard, text)?;
+    Ok(overflow_of(&buffer, clip))
+}
+
+/// Une ligne masquée qui contient quelque chose (des lignes vides sous le cadre ne cachent rien).
+fn overflow_of(buffer: &Buffer, clip: f32) -> bool {
+    buffer.layout_runs().any(|run| !line_shown(&run, clip) && !run.glyphs.is_empty())
 }
 
 /// Rend le texte en pixels, en repère texte : l'origine `(0, 0)` est le point d'ancrage.
@@ -578,28 +756,39 @@ pub fn render(text: &TextData) -> Result<TileStore, EngineError> {
         return Ok(TileStore::new());
     }
     let mut guard = fonts().lock().unwrap_or_else(PoisonError::into_inner);
-    let Layout { buffer, width, height, anchor } = layout(&mut guard, text)?;
+    if let Some((dynamic, frame)) = dynamic_of(text) {
+        return render_dynamic(&mut guard, text, dynamic, frame);
+    }
+    let Layout { buffer, width, height, anchor, clip } = layout(&mut guard, text)?;
     let Fonts { system, cache, .. } = &mut *guard;
 
     // Marge : italiques, accents et jambages peuvent dépasser de la boîte de mise en page.
     let pad = text.size.ceil() as i32;
-    let (w, h) = ((width as i32 + 2 * pad) as usize, (height as i32 + 2 * pad) as usize);
+    let (w, h) = ((width.ceil() as i32 + 2 * pad) as usize, (height.ceil() as i32 + 2 * pad) as usize);
     let mut rgba = vec![0u8; w * h * 4];
     let [r, g, b] = text.color;
-    buffer.draw(system, cache, Color::rgb(r, g, b), |x, y, rect_w, rect_h, color| {
-        // `color.a()` est la couverture du glyphe ; les glyphes colorés (émojis) gardent leur couleur.
-        let ink = premultiply([color.r(), color.g(), color.b(), color.a()]);
-        for py in y + pad..y + pad + rect_h as i32 {
-            for px in x + pad..x + pad + rect_w as i32 {
+    // Comme `Buffer::draw`, mais seulement les lignes qui tiennent dans le cadre d'un texte de paragraphe (toutes
+    // pour un texte de point). Les lignes viennent de haut en bas : la première qui dépasse arrête le dessin.
+    for run in buffer.layout_runs() {
+        if !line_shown(&run, clip) {
+            break;
+        }
+        for glyph in run.glyphs {
+            let physical = glyph.physical((0.0, 0.0), 1.0);
+            let base = glyph.color_opt.unwrap_or(Color::rgb(r, g, b));
+            cache.with_pixels(system, physical.cache_key, base, |x, y, color| {
+                let (px, py) = (physical.x + x + pad, run.line_y as i32 + physical.y + y + pad);
                 if px < 0 || py < 0 || px as usize >= w || py as usize >= h {
-                    continue;
+                    return;
                 }
+                // `color.a()` est la couverture du glyphe ; les glyphes colorés (émojis) gardent leur couleur.
+                let ink = premultiply([color.r(), color.g(), color.b(), color.a()]);
                 let i = (py as usize * w + px as usize) * 4;
                 let under = [rgba[i], rgba[i + 1], rgba[i + 2], rgba[i + 3]];
                 rgba[i..i + 4].copy_from_slice(&over(ink, under));
-            }
+            });
         }
-    });
+    }
 
     let store = TileStore::from_premultiplied(w as u32, h as u32, &rgba)
         .ok_or_else(|| EngineError::Corrupt("tampon de texte de taille inattendue".into()))?;
@@ -622,9 +811,332 @@ pub fn render_transformed(text: &TextData, matrix: &Matrix, quality: Quality) ->
     }
     // Le corps est borné ; au-delà, le reste de l'agrandissement passe par le rééchantillonnage.
     let factor = factor.clamp(1.0 / f64::from(text.size), 4_000.0 / f64::from(text.size));
-    let scaled = TextData { size: (f64::from(text.size) * factor) as f32, ..text.clone() };
+    // Le cadre d'un texte de paragraphe grandit avec le corps : les lignes reviennent à la ligne aux mêmes mots.
+    let frame = text.frame.map(|frame| TextFrame { width: (f64::from(frame.width) * factor) as f32, height: (f64::from(frame.height) * factor) as f32 });
+    let scaled = TextData { size: (f64::from(text.size) * factor) as f32, frame, ..text.clone() };
     let residual = matrix.then_after(&Matrix::scaling(1.0 / factor));
     transform_store(&render(&scaled)?, &residual, quality)
+}
+
+// ---- Texte dynamique ---------------------------------------------------------------------------------------------
+//
+// Les mots sont répartis en lignes (nombre choisi, automatique, ou retours tapés), puis chaque ligne est composée
+// comme un petit texte de point, au corps qui remplit exactement la largeur du cadre (bords de l'encre, pas de la
+// chasse). Les lignes s'empilent avec l'interligne demandé ; si le tout dépasse la hauteur du cadre, tout est réduit
+// d'un même facteur et centré. Le curseur et le clic se placent dans la ligne visée, à son échelle.
+
+/// Corps de mesure : les lignes sont mesurées à ce corps, puis mises à l'échelle.
+const DYNAMIC_REFERENCE: f32 = 100.0;
+/// Nombre de lignes essayé au plus en mode automatique.
+const DYNAMIC_MAX_LINES: usize = 24;
+
+/// Texte dynamique effectif : un cadre et des réglages.
+fn dynamic_of(text: &TextData) -> Option<(DynamicText, TextFrame)> {
+    Some((text.dynamic?, text.frame?))
+}
+
+/// Une ligne d'un texte dynamique : sa portion du contenu (octets), le texte de point qui la dessine et la position
+/// de son ancre dans le repère du texte, avec son étendue verticale.
+struct DynamicLine {
+    start: usize,
+    end: usize,
+    text: TextData,
+    offset: (f32, f32),
+    top: f32,
+    bottom: f32,
+}
+
+/// Mots du contenu : plages d'octets sans espace.
+fn words_of(content: &str) -> Vec<(usize, usize)> {
+    let mut words = Vec::new();
+    let mut from: Option<usize> = None;
+    for (i, ch) in content.char_indices() {
+        if ch.is_whitespace() {
+            if let Some(start) = from.take() {
+                words.push((start, i));
+            }
+        } else if from.is_none() {
+            from = Some(i);
+        }
+    }
+    if let Some(start) = from {
+        words.push((start, content.len()));
+    }
+    words
+}
+
+/// Portion `start..end` (octets) du texte, en texte de point au corps `size` : retours remplacés par des espaces
+/// (même longueur : les positions restent les mêmes), portions stylées recalées.
+fn line_text(text: &TextData, start: usize, end: usize, size: f32) -> TextData {
+    let content: String = text.content[start..end].chars().map(|c| if c == '\n' || c == '\r' { ' ' } else { c }).collect();
+    let (u0, u1) = (text.content[..start].encode_utf16().count(), text.content[..end].encode_utf16().count());
+    let runs = text
+        .runs
+        .iter()
+        .filter(|r| r.end > u0 && r.start < u1)
+        .map(|r| StyleRun { start: r.start.max(u0) - u0, end: r.end.min(u1) - u0, size: r.size.map(|v| v * size / text.size.max(1.0)), ..r.clone() })
+        .collect();
+    TextData { content, size, align: TextAlign::Left, frame: None, dynamic: None, runs, line_height: 1.0, ..text.clone() }
+}
+
+/// Étendue de l'encre d'un texte de point (repère texte), ou rien s'il n'a aucun pixel.
+fn ink_bounds(fonts: &mut Fonts, text: &TextData) -> Result<Option<(f32, f32, f32, f32)>, EngineError> {
+    let Layout { buffer, .. } = layout(fonts, text)?;
+    let Fonts { system, cache, .. } = fonts;
+    let mut b = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    for run in buffer.layout_runs() {
+        for glyph in run.glyphs {
+            let physical = glyph.physical((0.0, 0.0), 1.0);
+            cache.with_pixels(system, physical.cache_key, Color::rgb(0, 0, 0), |x, y, color| {
+                if color.a() == 0 {
+                    return;
+                }
+                let (px, py) = ((physical.x + x) as f32, run.line_y + (physical.y + y) as f32);
+                b = (b.0.min(px), b.1.min(py), b.2.max(px + 1.0), b.3.max(py + 1.0));
+            });
+        }
+    }
+    Ok((b.0 < b.2).then_some(b))
+}
+
+/// Répartit des mots de largeurs `widths` (espace `space` entre deux) en `n` lignes de largeurs aussi proches que
+/// possible (moindres carrés) : plages d'indices de mots.
+fn balance(widths: &[f32], space: f32, n: usize) -> Vec<(usize, usize)> {
+    let count = widths.len();
+    let n = n.clamp(1, count.max(1));
+    if count == 0 {
+        return Vec::new();
+    }
+    let mut prefix = vec![0.0f32; count + 1];
+    for (i, w) in widths.iter().enumerate() {
+        prefix[i + 1] = prefix[i] + w;
+    }
+    let total = prefix[count] + space * (count as f32 - n as f32).max(0.0);
+    let target = total / n as f32;
+    let cost = |i: usize, j: usize| {
+        let w = prefix[j] - prefix[i] + space * (j - i - 1) as f32;
+        (w - target) * (w - target)
+    };
+    // best[k][j] : coût minimal des j premiers mots en k lignes.
+    let mut best = vec![vec![f32::INFINITY; count + 1]; n + 1];
+    let mut cut = vec![vec![0usize; count + 1]; n + 1];
+    best[0][0] = 0.0;
+    for k in 1..=n {
+        for j in k..=count {
+            for i in (k - 1)..j {
+                let c = best[k - 1][i] + cost(i, j);
+                if c < best[k][j] {
+                    best[k][j] = c;
+                    cut[k][j] = i;
+                }
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(n);
+    let mut j = count;
+    for k in (1..=n).rev() {
+        let i = cut[k][j];
+        out.push((i, j));
+        j = i;
+    }
+    out.reverse();
+    out
+}
+
+/// Mise en page d'un texte dynamique : ses lignes, de haut en bas.
+fn dynamic_lines(fonts: &mut Fonts, text: &TextData, dynamic: DynamicText, frame: TextFrame) -> Result<Vec<DynamicLine>, EngineError> {
+    let valid = |v: f32| v.is_finite() && (1.0..=MAX_BLOCK).contains(&v);
+    if !(valid(frame.width) && valid(frame.height)) {
+        return Err(EngineError::InvalidOperation("cadre de texte hors limites".into()));
+    }
+    let content = &text.content;
+    // Lignes : plages d'octets du contenu (du premier au dernier mot de la ligne).
+    let groups: Vec<(usize, usize)> = if dynamic.manual {
+        let mut out = Vec::new();
+        let mut at = 0;
+        for line in content.split('\n') {
+            let words = words_of(line);
+            if let (Some(first), Some(last)) = (words.first(), words.last()) {
+                out.push((at + first.0, at + last.1));
+            }
+            at += line.len() + 1;
+        }
+        out
+    } else {
+        let words = words_of(content);
+        if words.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Chasse de chaque mot au corps de mesure (une seule mise en page : un mot par ligne).
+        let mut probe: String = content.clone();
+        // SAFETY de longueur : chaque espace ASCII devient un retour, d'un octet aussi.
+        probe = probe.chars().map(|c| if c == ' ' || c == '\t' { '\n' } else { c }).collect();
+        let measure = TextData { content: probe, ..line_text(text, 0, 0, DYNAMIC_REFERENCE) };
+        let measure = TextData { runs: text.runs.clone(), ..measure };
+        let Layout { buffer, .. } = layout(fonts, &measure)?;
+        let starts: Vec<usize> = std::iter::once(0).chain(measure.content.match_indices('\n').map(|(i, _)| i + 1)).collect();
+        let mut widths = vec![0.0f32; words.len()];
+        for run in buffer.layout_runs() {
+            let Some(line_start) = starts.get(run.line_i) else { continue };
+            if let Some(w) = words.iter().position(|(a, _)| a == line_start) {
+                widths[w] = widths[w].max(run.line_w);
+            }
+        }
+        let space = DYNAMIC_REFERENCE * 0.28;
+        let height_of = |parts: &[(usize, usize)]| -> f32 {
+            let lines: Vec<f32> = parts
+                .iter()
+                .map(|&(i, j)| {
+                    let w = widths[i..j].iter().sum::<f32>() + space * (j - i - 1) as f32;
+                    frame.width / w.max(1.0) * DYNAMIC_REFERENCE * 0.74
+                })
+                .collect();
+            let mean = lines.iter().sum::<f32>() / lines.len().max(1) as f32;
+            lines.iter().sum::<f32>() + dynamic.gap.clamp(-0.2, 2.0) * mean * (lines.len() as f32 - 1.0)
+        };
+        let to_bytes = |parts: Vec<(usize, usize)>| parts.iter().map(|&(i, j)| (words[i].0, words[j - 1].1)).collect::<Vec<_>>();
+        if dynamic.lines > 0 {
+            to_bytes(balance(&widths, space, usize::from(dynamic.lines)))
+        } else {
+            // Automatique : le nombre de lignes dont la hauteur approche le mieux celle du cadre. L'estimation (chasse
+            // des mots) désigne un nombre ; ses voisins sont ensuite mesurés pour de bon (encre réelle) et le
+            // meilleur l'emporte.
+            let most = words.len().min(DYNAMIC_MAX_LINES);
+            let miss = |h: f32| (h / frame.height).ln().abs();
+            let guess = (1..=most).min_by(|a, b| miss(height_of(&balance(&widths, space, *a))).total_cmp(&miss(height_of(&balance(&widths, space, *b))))).unwrap_or(1);
+            let mut best: Option<(f32, Vec<(usize, usize)>)> = None;
+            for n in guess.saturating_sub(2).max(1)..=(guess + 2).min(most) {
+                let groups = to_bytes(balance(&widths, space, n));
+                let (_, total) = measure_lines(fonts, text, &groups, dynamic, frame)?;
+                if best.as_ref().is_none_or(|(m, _)| miss(total) < *m) {
+                    best = Some((miss(total), groups));
+                }
+            }
+            best.map(|(_, g)| g).unwrap_or_default()
+        }
+    };
+
+    // Chaque ligne mesurée au corps de référence, puis mise à la largeur du cadre.
+    let (measured, total) = measure_lines(fonts, text, &groups, dynamic, frame)?;
+    if measured.is_empty() {
+        return Ok(Vec::new());
+    }
+    let scale_of = |b: &(f32, f32, f32, f32)| frame.width / (b.2 - b.0).max(1.0);
+    let heights: Vec<f32> = measured.iter().map(|(_, _, b)| (b.3 - b.1) * scale_of(b)).collect();
+    let mean = heights.iter().sum::<f32>() / heights.len() as f32;
+    let gap = dynamic.gap.clamp(-0.2, 2.0) * mean;
+    let fit = (frame.height / total.max(1.0)).min(1.0);
+    let mut y = (frame.height - total * fit) / 2.0;
+    let mut lines = Vec::with_capacity(measured.len());
+    for (start, end, b) in measured {
+        let size = (DYNAMIC_REFERENCE * scale_of(&b) * fit).clamp(1.0, 4_000.0);
+        let k = size / DYNAMIC_REFERENCE;
+        let width = (b.2 - b.0) * k;
+        let height = (b.3 - b.1) * k;
+        let x = (frame.width - width) / 2.0;
+        lines.push(DynamicLine { start, end, text: line_text(text, start, end, size), offset: (x - b.0 * k, y - b.1 * k), top: y, bottom: y + height });
+        y += height + gap * fit;
+    }
+    Ok(lines)
+}
+
+/// Encre de chaque ligne au corps de référence, et hauteur totale une fois chaque ligne à la largeur du cadre.
+#[allow(clippy::type_complexity)]
+fn measure_lines(fonts: &mut Fonts, text: &TextData, groups: &[(usize, usize)], dynamic: DynamicText, frame: TextFrame) -> Result<(Vec<(usize, usize, (f32, f32, f32, f32))>, f32), EngineError> {
+    let mut measured = Vec::new();
+    for &(start, end) in groups {
+        if let Some(b) = ink_bounds(fonts, &line_text(text, start, end, DYNAMIC_REFERENCE))? {
+            measured.push((start, end, b));
+        }
+    }
+    let heights: Vec<f32> = measured.iter().map(|(_, _, b)| (b.3 - b.1) * frame.width / (b.2 - b.0).max(1.0)).collect();
+    let mean = heights.iter().sum::<f32>() / heights.len().max(1) as f32;
+    let total = heights.iter().sum::<f32>() + dynamic.gap.clamp(-0.2, 2.0) * mean * (heights.len() as f32 - 1.0).max(0.0);
+    Ok((measured, total))
+}
+
+/// Rendu d'un texte dynamique, en repère texte (origine : coin haut gauche du cadre).
+fn render_dynamic(fonts: &mut Fonts, text: &TextData, dynamic: DynamicText, frame: TextFrame) -> Result<TileStore, EngineError> {
+    let lines = dynamic_lines(fonts, text, dynamic, frame)?;
+    let pad = 8i32;
+    let (w, h) = ((frame.width.ceil() as i32 + 2 * pad) as usize, (frame.height.ceil() as i32 + 2 * pad) as usize);
+    let mut rgba = vec![0u8; w * h * 4];
+    let [r, g, b] = text.color;
+    for line in &lines {
+        let Layout { buffer, .. } = layout(fonts, &line.text)?;
+        let Fonts { system, cache, .. } = &mut *fonts;
+        let (ox, oy) = (line.offset.0.round() as i32 + pad, line.offset.1.round() as i32 + pad);
+        for run in buffer.layout_runs() {
+            for glyph in run.glyphs {
+                let physical = glyph.physical((0.0, 0.0), 1.0);
+                let base = glyph.color_opt.unwrap_or(Color::rgb(r, g, b));
+                cache.with_pixels(system, physical.cache_key, base, |x, y, color| {
+                    let (px, py) = (physical.x + x + ox, run.line_y as i32 + physical.y + y + oy);
+                    if px < 0 || py < 0 || px as usize >= w || py as usize >= h {
+                        return;
+                    }
+                    let ink = premultiply([color.r(), color.g(), color.b(), color.a()]);
+                    let i = (py as usize * w + px as usize) * 4;
+                    let under = [rgba[i], rgba[i + 1], rgba[i + 2], rgba[i + 3]];
+                    rgba[i..i + 4].copy_from_slice(&over(ink, under));
+                });
+            }
+        }
+    }
+    let store = TileStore::from_premultiplied(w as u32, h as u32, &rgba).ok_or_else(|| EngineError::Corrupt("tampon de texte de taille inattendue".into()))?;
+    Ok(store.translated(-pad, -pad))
+}
+
+/// Ligne d'un texte dynamique qui contient la position `byte` (entre deux lignes : la fin de la précédente).
+fn line_at(lines: &[DynamicLine], byte: usize) -> Option<usize> {
+    if lines.is_empty() {
+        return None;
+    }
+    Some(lines.iter().position(|l| byte <= l.end).unwrap_or(lines.len() - 1))
+}
+
+/// Octet du contenu à la position `utf16`.
+fn byte_at(content: &str, utf16: usize) -> usize {
+    let mut units = 0;
+    for (i, ch) in content.char_indices() {
+        if units >= utf16 {
+            return i;
+        }
+        units += ch.len_utf16();
+    }
+    content.len()
+}
+
+fn dynamic_caret(fonts: &mut Fonts, text: &TextData, dynamic: DynamicText, frame: TextFrame, start: usize, end: usize) -> Result<CaretGeometry, EngineError> {
+    let lines = dynamic_lines(fonts, text, dynamic, frame)?;
+    let local = |line: &DynamicLine, byte: usize| text.content[line.start..byte.clamp(line.start, line.end)].encode_utf16().count();
+    let focus = byte_at(&text.content, end);
+    let Some(at) = line_at(&lines, focus) else {
+        let size = text.size.min(frame.height);
+        return Ok(CaretGeometry { caret: ((0.0, 0.0), (0.0, size)), highlights: Vec::new(), overflow: false });
+    };
+    let line = &lines[at];
+    let here = caret_in(fonts, &line.text, local(line, focus), local(line, focus))?;
+    let shift = |(x, y): (f32, f32)| (x + line.offset.0, y + line.offset.1);
+    let caret = (shift(here.caret.0), shift(here.caret.1));
+    let (from, to) = (byte_at(&text.content, start.min(end)), byte_at(&text.content, start.max(end)));
+    let mut highlights = Vec::new();
+    if from < to {
+        for line in lines.iter().filter(|l| l.end > from && l.start < to) {
+            let part = caret_in(fonts, &line.text, local(line, from), local(line, to))?;
+            highlights.extend(part.highlights.into_iter().map(|(x, y, w, h)| (x + line.offset.0, y + line.offset.1, w, h)));
+        }
+    }
+    Ok(CaretGeometry { caret, highlights, overflow: false })
+}
+
+fn dynamic_hit(fonts: &mut Fonts, text: &TextData, dynamic: DynamicText, frame: TextFrame, x: f32, y: f32) -> Result<usize, EngineError> {
+    let lines = dynamic_lines(fonts, text, dynamic, frame)?;
+    // La ligne la plus proche verticalement.
+    let distance = |l: &DynamicLine| if y < l.top { l.top - y } else if y > l.bottom { y - l.bottom } else { 0.0 };
+    let Some(line) = lines.iter().min_by(|a, b| distance(a).total_cmp(&distance(b))) else { return Ok(text.content.encode_utf16().count()) };
+    let local = hit_in(fonts, &line.text, x - line.offset.0, y - line.offset.1)?;
+    Ok(text.content[..line.start].encode_utf16().count() + local)
 }
 
 /// Position d'un curseur dans le texte, en unités UTF-16 comme dans un champ de saisie du navigateur.
@@ -675,46 +1187,170 @@ fn caret_x(run: &cosmic_text::LayoutRun<'_>, index: usize, empty_line_x: f32) ->
 pub struct CaretGeometry {
     pub caret: ((f32, f32), (f32, f32)),
     pub highlights: Vec<(f32, f32, f32, f32)>,
+    /// Texte de paragraphe dont une partie dépasse du cadre (voir [`overflows`]).
+    pub overflow: bool,
+}
+
+/// Début (octet dans la ligne) de ce qu'affiche une ligne visuelle ; une ligne sans glyphe commence à 0.
+fn run_start(run: &cosmic_text::LayoutRun<'_>) -> usize {
+    run.glyphs.iter().map(|g| g.start).min().unwrap_or(0)
 }
 
 pub fn caret_geometry(text: &TextData, start: usize, end: usize) -> Result<CaretGeometry, EngineError> {
     let mut guard = fonts().lock().unwrap_or_else(PoisonError::into_inner);
-    let Layout { buffer, width, anchor, .. } = layout(&mut guard, text)?;
+    if let Some((dynamic, frame)) = dynamic_of(text) {
+        return dynamic_caret(&mut guard, text, dynamic, frame, start, end);
+    }
+    caret_in(&mut guard, text, start, end)
+}
+
+fn caret_in(fonts: &mut Fonts, text: &TextData, start: usize, end: usize) -> Result<CaretGeometry, EngineError> {
+    let Layout { buffer, width, anchor, clip, .. } = layout(fonts, text)?;
     let (from, to) = (cursor_at(&text.content, start.min(end)), cursor_at(&text.content, start.max(end)));
     let focus = cursor_at(&text.content, end);
-    let empty_line_x = match text.align {
-        TextAlign::Left => 0.0,
-        TextAlign::Center => width / 2.0,
-        TextAlign::Right => width,
-    };
+    let empty_line_x = empty_line_x(text.align, width);
+    let runs: Vec<_> = buffer.layout_runs().collect();
 
     let line_height = text.size * text.line_height.clamp(0.5, 5.0);
     // Ligne sans mise en page (ligne vide en fin de texte, juste après Entrée) : le curseur
-    // se place quand même sur SA ligne, à l'ancre, et non au début du texte.
-    let top = focus.line as f32 * line_height;
+    // se place quand même sur SA ligne, à l'ancre, sous la dernière ligne mise en page qui la précède.
+    let above = runs.iter().filter(|run| run.line_i < focus.line).map(|run| (run.line_i, run.line_top + run.line_height)).fold((None, 0.0f32), |acc, (i, b)| (Some(i), acc.1.max(b)));
+    let top = match above {
+        (Some(last), bottom) => bottom + (focus.line - last - 1) as f32 * line_height,
+        (None, _) => focus.line as f32 * line_height,
+    };
     let mut caret = ((-anchor + empty_line_x, top), (-anchor + empty_line_x, top + line_height));
+    // Une ligne du texte peut occuper plusieurs lignes visuelles (retour à la ligne d'un paragraphe) : le curseur va
+    // sur celle qui contient sa position ; à la jonction de deux, au début de la suivante, comme dans un traitement
+    // de texte (taper l'espace qui fait passer le mot à la ligne y emmène le curseur).
+    // L'espace de coupure, elle, n'est pas toujours mise en page : juste avant elle, c'est la fin de la ligne.
+    let same: Vec<_> = runs.iter().filter(|run| run.line_i == focus.line).collect();
+    let chosen = (0..same.len()).find(|&k| same.get(k + 1).is_none_or(|next| focus.index < run_start(next)));
+    if let Some(run) = chosen.and_then(|k| same.get(k)) {
+        let x = caret_x(run, focus.index, empty_line_x) - anchor;
+        caret = ((x, run.line_top), (x, run.line_top + run.line_height));
+    }
     let mut highlights = Vec::new();
-    for run in buffer.layout_runs() {
-        if run.line_i == focus.line {
-            let x = caret_x(&run, focus.index, empty_line_x) - anchor;
-            caret = ((x, run.line_top), (x, run.line_top + run.line_height));
-        }
-        if from != to {
+    if from != to {
+        for run in &runs {
             if let Some((x, w)) = run.highlight(from, to) {
                 highlights.push((x - anchor, run.line_top, w.max(text.size * 0.25), run.line_height));
             }
         }
     }
-    Ok(CaretGeometry { caret, highlights })
+    let overflow = text.frame.is_some() && overflow_of(&buffer, clip);
+    Ok(CaretGeometry { caret, highlights, overflow })
 }
 
 /// Position du curseur (en unités UTF-16) la plus proche du point `(x, y)` du repère texte.
 pub fn hit_test(text: &TextData, x: f32, y: f32) -> Result<usize, EngineError> {
     let mut guard = fonts().lock().unwrap_or_else(PoisonError::into_inner);
-    let Layout { buffer, height, anchor, .. } = layout(&mut guard, text)?;
-    // Au-dessus ou au-dessous du bloc, on vise la première ou la dernière ligne.
-    let cursor = buffer.hit(x + anchor, y.clamp(0.0, (height - 1.0).max(0.0)));
+    if let Some((dynamic, frame)) = dynamic_of(text) {
+        return dynamic_hit(&mut guard, text, dynamic, frame, x, y);
+    }
+    hit_in(&mut guard, text, x, y)
+}
+
+fn hit_in(fonts: &mut Fonts, text: &TextData, x: f32, y: f32) -> Result<usize, EngineError> {
+    let Layout { buffer, height, anchor, clip, .. } = layout(fonts, text)?;
+    // Au-dessus ou au-dessous du bloc, on vise la première ou la dernière ligne. Texte de paragraphe : la dernière
+    // ligne VISIBLE (on ne place pas le curseur dans le texte masqué en cliquant sous le cadre).
+    let bottom = if text.frame.is_some() {
+        buffer.layout_runs().take_while(|run| line_shown(run, clip)).map(|run| run.line_top + run.line_height).fold(0.0f32, f32::max).min(height)
+    } else {
+        height
+    };
+    let cursor = buffer.hit(x + anchor, y.clamp(0.0, (bottom - 1.0).max(0.0)));
     Ok(cursor.map_or_else(|| text.content.encode_utf16().count(), |c| utf16_of(&text.content, c)))
+}
+
+/// Contenu tel qu'il s'affiche dans un texte de paragraphe, une ligne visuelle par ligne : chaque retour à la ligne
+/// automatique devient un vrai retour (l'espace où la ligne se coupe est remplacée, sinon un retour est inséré).
+/// Les portions stylées sont recalées. Sert à « Convertir en texte de point » sans changer l'aspect du texte.
+fn hard_wrapped(text: &TextData, buffer: &Buffer) -> TextData {
+    // Points de coupure, en octets du contenu : début de chaque ligne visuelle qui n'est pas la première de sa ligne.
+    let line_starts: Vec<usize> = std::iter::once(0).chain(text.content.match_indices('\n').map(|(i, _)| i + 1)).collect();
+    let mut breaks: Vec<usize> = Vec::new();
+    let mut previous_line = None;
+    for run in buffer.layout_runs() {
+        let start = run.glyphs.iter().map(|g| g.start).min();
+        if previous_line == Some(run.line_i) {
+            if let (Some(start), Some(line_start)) = (start, line_starts.get(run.line_i)) {
+                breaks.push(line_start + start);
+            }
+        }
+        previous_line = Some(run.line_i);
+    }
+    let mut content = String::with_capacity(text.content.len() + breaks.len());
+    let mut runs = text.runs.clone();
+    let mut copied = 0;
+    let mut inserted = 0usize; // unités UTF-16 ajoutées jusqu'ici
+    for at in breaks {
+        let before = &text.content[copied..at];
+        match before.char_indices().next_back() {
+            // Coupure après une espace : l'espace devient le retour à la ligne (une unité UTF-16 l'une comme l'autre :
+            // les portions stylées ne bougent pas).
+            Some((i, ' ' | '\t' | '\u{3000}')) => {
+                content.push_str(&before[..i]);
+                content.push('\n');
+            }
+            // Coupure au milieu d'un mot trop long : un retour est inséré, les portions qui suivent se décalent.
+            _ => {
+                content.push_str(before);
+                content.push('\n');
+                let position = text.content[..at].encode_utf16().count() + inserted;
+                for run in &mut runs {
+                    if run.start >= position {
+                        run.start += 1;
+                    }
+                    if run.end > position {
+                        run.end += 1;
+                    }
+                }
+                inserted += 1;
+            }
+        }
+        copied = at;
+    }
+    content.push_str(&text.content[copied..]);
+    TextData { content, runs, ..text.clone() }
+}
+
+/// « Convertir en texte de paragraphe » : le cadre est la boîte actuelle du texte, et le texte garde son aspect.
+/// Rend le nouveau texte et le décalage de son origine (repère texte d'avant) : l'ancre devient le coin du cadre.
+pub fn to_paragraph(text: &TextData) -> Result<(TextData, (f32, f32)), EngineError> {
+    if text.frame.is_some() {
+        return Ok((text.clone(), (0.0, 0.0)));
+    }
+    let mut guard = fonts().lock().unwrap_or_else(PoisonError::into_inner);
+    let Layout { width, height, anchor, .. } = layout(&mut guard, text)?;
+    // Texte vide : un cadre d'au moins un corps de côté, pour qu'il reste saisissable.
+    let frame = TextFrame { width: width.max(text.size.ceil()).max(1.0), height: height.max(1.0) };
+    Ok((TextData { frame: Some(frame), ..text.clone() }, (-anchor, 0.0)))
+}
+
+/// « Convertir en texte de point » : chaque ligne visuelle du paragraphe devient une ligne du texte (retours
+/// insérés), le texte masqué sous le cadre réapparaît. Rend le nouveau texte et le décalage de son origine (repère
+/// texte d'avant) : le coin du cadre devient l'ancre (bord gauche, milieu ou bord droit selon l'alignement).
+pub fn to_point(text: &TextData) -> Result<(TextData, (f32, f32)), EngineError> {
+    let Some(frame) = text.frame else {
+        return Ok((text.clone(), (0.0, 0.0)));
+    };
+    let mut guard = fonts().lock().unwrap_or_else(PoisonError::into_inner);
+    let Layout { buffer, .. } = layout(&mut guard, text)?;
+    let mut point = hard_wrapped(text, &buffer);
+    point.frame = None;
+    point.dynamic = None;
+    // Un texte de point justifié s'aligne à gauche : autant le dire au panneau.
+    if point.align == TextAlign::Justify {
+        point.align = TextAlign::Left;
+    }
+    let dx = match point.align {
+        TextAlign::Left | TextAlign::Justify => 0.0,
+        TextAlign::Center => (frame.width / 2.0).round(),
+        TextAlign::Right => frame.width.round(),
+    };
+    Ok((point, (dx, 0.0)))
 }
 
 impl Default for TextData {
@@ -731,6 +1367,10 @@ impl Default for TextData {
             bold: false,
             italic: false,
             runs: Vec::new(),
+            frame: None,
+            dynamic: None,
+            caps: TextCaps::Normal,
+            style: None,
         }
     }
 }
@@ -745,6 +1385,39 @@ mod tests {
 
     fn extent(store: &TileStore) -> (i32, i32, i32, i32) {
         store.pixel_bounds(|px| px[3] > 0).expect("du texte a été dessiné")
+    }
+
+    /// Texte dynamique : chaque ligne remplit la largeur du cadre (à quelques pixels près), le tout tient dans le
+    /// cadre ; le curseur et le clic retombent sur le bon caractère ; le nombre de lignes demandé est respecté.
+    #[test]
+    fn dynamic_text_fills_the_frame_width_line_by_line() {
+        let text = TextData {
+            content: "Le texte qui remplit toute la largeur du cadre".into(),
+            size: 40.0,
+            frame: Some(TextFrame { width: 400.0, height: 500.0 }),
+            dynamic: Some(DynamicText::default()),
+            ..TextData::default()
+        };
+        let store = render(&text).expect("rendu");
+        let (x0, y0, x1, y1) = extent(&store);
+        assert!(x0 >= -3 && x1 <= 403 && x1 - x0 >= 392, "largeur remplie : {:?}", (x0, x1));
+        assert!(y0 >= -3 && y1 <= 503, "dans le cadre : {:?}", (y0, y1));
+        let mut guard = fonts().lock().unwrap_or_else(PoisonError::into_inner);
+        let lines = dynamic_lines(&mut guard, &text, DynamicText::default(), TextFrame { width: 400.0, height: 500.0 }).expect("lignes");
+        assert!(lines.len() >= 3, "le cadre haut appelle plusieurs lignes ({})", lines.len());
+        let fixed = dynamic_lines(&mut guard, &text, DynamicText { lines: 2, ..DynamicText::default() }, TextFrame { width: 400.0, height: 500.0 }).expect("lignes");
+        assert_eq!(fixed.len(), 2);
+        let manual = TextData { content: "UN\ndeux trois".into(), ..text.clone() };
+        let rows = dynamic_lines(&mut guard, &manual, DynamicText { manual: true, ..DynamicText::default() }, TextFrame { width: 400.0, height: 500.0 }).expect("lignes");
+        assert_eq!(rows.iter().map(|l| &manual.content[l.start..l.end]).collect::<Vec<_>>(), ["UN", "deux trois"]);
+        drop(guard);
+        // Le clic au milieu de la dernière ligne vise un caractère de cette ligne.
+        let last = &lines[lines.len() - 1];
+        let hit = hit_test(&text, 200.0, (last.top + last.bottom) / 2.0).expect("clic");
+        let first_of_last = text.content[..last.start].encode_utf16().count();
+        assert!(hit >= first_of_last, "{hit} < {first_of_last}");
+        let caret = caret_geometry(&text, hit, hit).expect("curseur").caret;
+        assert!(caret.0.1 < last.bottom && caret.1.1 > last.top, "curseur sur la ligne visée");
     }
 
     #[test]
@@ -868,7 +1541,7 @@ mod tests {
     #[test]
     fn a_styled_run_changes_only_its_part_of_the_text() {
         // « ab cd » : « cd » (positions 3..5) en vert et en gras, le reste en rouge.
-        let run = StyleRun { start: 3, end: 5, font_family: None, weight: Some(900), italic: None, color: Some([0, 255, 0]) };
+        let run = StyleRun { start: 3, end: 5, font_family: None, weight: Some(900), italic: None, color: Some([0, 255, 0]), size: None, tracking: None, caps: None, style: None };
         let plain = sample("ab cd");
         let styled = TextData { runs: vec![run], ..plain.clone() };
         let store = render(&styled).expect("rendu");
@@ -892,6 +1565,167 @@ mod tests {
         assert!(red_left > 50 && green_right > 50 && wrong == 0, "rouge à gauche {red_left}, vert à droite {green_right}, mal placés {wrong}");
         // Un ancien fichier sans `runs` se relit, et un texte sans portion stylée n'écrit pas le champ.
         assert!(!serde_json::to_string(&plain).expect("json").contains("runs"));
+    }
+
+    fn paragraph(content: &str, width: f32, height: f32) -> TextData {
+        TextData { frame: Some(TextFrame { width, height }), ..sample(content) }
+    }
+
+    /// Lignes visuelles d'un texte : (texte de la ligne, gauche de l'encre, droite de l'encre, haut de ligne).
+    fn visual_lines(text: &TextData) -> Vec<(String, f32, f32, f32)> {
+        let mut guard = fonts().lock().unwrap_or_else(PoisonError::into_inner);
+        let Layout { buffer, .. } = layout(&mut guard, text).expect("mise en page");
+        buffer
+            .layout_runs()
+            .map(|run| {
+                let shown: String = run.glyphs.iter().map(|g| &run.text[g.start..g.end]).collect();
+                let ink: Vec<_> = run.glyphs.iter().filter(|g| !run.text[g.start..g.end].trim().is_empty()).collect();
+                let left = ink.first().map_or(0.0, |g| g.x);
+                let right = ink.last().map_or(0.0, |g| g.x + g.w);
+                (shown, left, right, run.line_top)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn paragraph_text_wraps_by_words_inside_its_frame() {
+        let text = paragraph("Lorem ipsum dolor sit amet consectetur", 300.0, 400.0);
+        let lines = visual_lines(&text);
+        assert!(lines.len() >= 3, "plusieurs lignes : {lines:?}");
+        for (shown, _, right, _) in &lines {
+            assert!(*right <= 300.5, "« {shown} » dépasse la largeur du cadre ({right})");
+        }
+        // Coupure par mots : aucun mot n'est coupé, et chaque mot du texte se retrouve tel quel.
+        let rebuilt: Vec<String> = lines.iter().flat_map(|(s, ..)| s.split_whitespace().map(str::to_owned).collect::<Vec<_>>()).collect();
+        assert_eq!(rebuilt.join(" "), "Lorem ipsum dolor sit amet consectetur");
+        // Le rendu est celui de la mise en page, dans le cadre ; un texte de point reste sur une ligne.
+        let (x0, y0, x1, y1) = extent(&render(&text).expect("rendu"));
+        assert!(x0 >= -2 && x1 <= 304 && y0 >= 0 && y1 > 100, "{:?}", (x0, y0, x1, y1));
+        assert_eq!(visual_lines(&sample("Lorem ipsum dolor sit amet consectetur")).len(), 1);
+    }
+
+    #[test]
+    fn a_word_longer_than_the_line_is_broken_and_empty_lines_are_kept() {
+        let lines = visual_lines(&paragraph("Anticonstitutionnellement", 120.0, 400.0));
+        assert!(lines.len() >= 2, "mot trop long coupé : {lines:?}");
+        assert!(lines.iter().all(|(_, _, right, _)| *right <= 120.5));
+        assert_eq!(lines.iter().map(|(s, ..)| s.as_str()).collect::<String>(), "Anticonstitutionnellement");
+        // Lignes vides (Entrée, Entrée) : elles gardent leur hauteur.
+        let blank = visual_lines(&paragraph("a\n\nb", 300.0, 400.0));
+        assert_eq!(blank.len(), 3, "{blank:?}");
+        assert!((blank[2].3 - 2.0 * 40.0 * 1.2).abs() < 1.0, "troisième ligne à deux interlignes : {blank:?}");
+    }
+
+    #[test]
+    fn paragraph_alignment_uses_the_frame_width() {
+        let content = "Un deux trois quatre cinq six sept huit";
+        let lines = |align| visual_lines(&TextData { align, ..paragraph(content, 300.0, 400.0) });
+        let (left, center, right, justify) = (lines(TextAlign::Left), lines(TextAlign::Center), lines(TextAlign::Right), lines(TextAlign::Justify));
+        assert!(left.iter().all(|(_, l, ..)| *l < 6.0), "à gauche : {left:?}");
+        assert!(right.iter().all(|(_, _, r, _)| *r > 290.0 && *r <= 300.5), "à droite : {right:?}");
+        assert!(center.iter().all(|(_, l, r, _)| ((l + r) / 2.0 - 150.0).abs() < 8.0), "centré : {center:?}");
+        // Justifié : toutes les lignes pleines vont d'un bord à l'autre, sauf la dernière, alignée à gauche.
+        let (last, full) = justify.split_last().expect("lignes");
+        assert!(full.len() >= 1 && full.iter().all(|(_, l, r, _)| *l < 6.0 && *r > 290.0), "justifié : {justify:?}");
+        assert!(last.2 < 290.0, "dernière ligne non étirée : {last:?}");
+        // Un texte de point justifié s'aligne à gauche (rien à justifier sans largeur).
+        let point = render(&TextData { align: TextAlign::Justify, ..sample("Un\nDeux lignes") }).expect("rendu");
+        assert!(extent(&point).0 >= -4);
+    }
+
+    #[test]
+    fn text_below_the_frame_is_hidden_and_reported() {
+        let content = "Lorem ipsum dolor sit amet consectetur adipiscing elit";
+        let tall = paragraph(content, 200.0, 1000.0);
+        let short = paragraph(content, 200.0, 100.0);
+        assert!(!overflows(&tall).expect("mesure") && overflows(&short).expect("mesure"));
+        assert!(caret_geometry(&short, 0, 0).expect("curseur").overflow);
+        let (_, _, _, tall_bottom) = extent(&render(&tall).expect("rendu"));
+        let (_, _, _, short_bottom) = extent(&render(&short).expect("rendu"));
+        assert!(tall_bottom > 150 && short_bottom <= 100 + 6, "seules les lignes entières du cadre sont dessinées : {short_bottom}");
+        // Lignes vides sous le cadre : rien n'est caché.
+        assert!(!overflows(&paragraph("abc\n\n\n\n\n\n", 200.0, 50.0)).expect("mesure"));
+        assert!(!overflows(&sample(content)).expect("texte de point"));
+    }
+
+    #[test]
+    fn resizing_the_frame_recomposes_the_text_without_scaling_it() {
+        let content = "Lorem ipsum dolor sit amet consectetur";
+        let (narrow, wide) = (render(&paragraph(content, 150.0, 600.0)).expect("rendu"), render(&paragraph(content, 600.0, 600.0)).expect("rendu"));
+        let (n, w) = (extent(&narrow), extent(&wide));
+        assert!(n.3 - n.1 > 2 * (w.3 - w.1), "plus étroit : plus de lignes ({n:?} / {w:?})");
+        // Même corps : une ligne d'un « H » a la même hauteur d'encre dans les deux cadres.
+        let h = |width| extent(&render(&paragraph("H", width, 100.0)).expect("rendu"));
+        let (a, b) = (h(100.0), h(400.0));
+        assert_eq!(a.3 - a.1, b.3 - b.1, "pas d'étirement vertical");
+        assert_eq!(a.2 - a.0, b.2 - b.0, "pas d'étirement horizontal");
+        assert!(render(&paragraph("a", 0.0, 10.0)).is_err() && render(&paragraph("a", f32::NAN, 10.0)).is_err(), "cadre invalide refusé");
+    }
+
+    #[test]
+    fn caret_and_hit_testing_follow_the_paragraph_layout() {
+        let text = paragraph("alpha beta gamma delta epsilon", 160.0, 400.0);
+        let lines = visual_lines(&text);
+        assert!(lines.len() >= 2, "{lines:?}");
+        let second_start = text.content.find(lines[1].0.trim_start()).expect("deuxième ligne");
+        let first_end = lines[0].0.trim_end().len();
+        // Juste après le dernier mot d'une ligne : la fin de CETTE ligne ; après l'espace de coupure, la suivante.
+        let ((end_x, end_top), _) = caret_geometry(&text, first_end, first_end).expect("curseur").caret;
+        assert!(end_top < 1.0 && end_x > 40.0, "fin de la première ligne : {:?}", (end_x, end_top));
+        let ((x, top), (_, bottom)) = caret_geometry(&text, second_start, second_start).expect("curseur").caret;
+        assert!(x < 2.0 && top >= 40.0, "début de la deuxième ligne : {:?}", (x, top));
+        assert_eq!(hit_test(&text, x + 0.5, (top + bottom) / 2.0).expect("pointage"), second_start);
+        for offset in [0usize, 3, second_start + 2, 30] {
+            let ((x, top), (_, bottom)) = caret_geometry(&text, offset, offset).expect("curseur").caret;
+            assert_eq!(hit_test(&text, x + 0.5, (top + bottom) / 2.0).expect("pointage"), offset, "décalage {offset}");
+        }
+        // Une sélection sur deux lignes visuelles : deux zones.
+        assert_eq!(caret_geometry(&text, 1, second_start + 2).expect("sélection").highlights.len(), 2);
+        // Sous le cadre : la dernière ligne visible, pas le texte masqué.
+        let hidden = paragraph("alpha beta gamma delta epsilon", 160.0, 50.0);
+        let below = hit_test(&hidden, 5.0, 300.0).expect("pointage");
+        assert!(below <= second_start, "le clic sous le cadre reste sur la ligne visible : {below}");
+    }
+
+    #[test]
+    fn frames_survive_serialization_and_old_files_are_point_text() {
+        let text = TextData { align: TextAlign::Justify, ..paragraph("abc", 120.5, 80.0) };
+        let json = serde_json::to_string(&text).expect("json");
+        assert!(json.contains(r#""frame":{"width":120.5,"height":80.0}"#) && json.contains(r#""align":"justify""#), "{json}");
+        assert_eq!(serde_json::from_str::<TextData>(&json).expect("relu"), text);
+        let old: TextData = serde_json::from_str(r#"{"content":"a","fontFamily":"","size":40,"lineHeight":1.2,"tracking":0,"align":"left","color":[0,0,0],"weight":400,"italic":false}"#).expect("ancien");
+        assert!(old.frame.is_none(), "un ancien texte reste un texte de point");
+        assert!(!serde_json::to_string(&sample("a")).expect("json").contains("frame"), "un texte de point n'écrit pas le champ");
+    }
+
+    #[test]
+    fn converting_between_point_and_paragraph_keeps_the_look() {
+        // Paragraphe -> point : un retour par ligne visuelle ; un mot coupé reçoit un retour inséré, les portions suivent.
+        let run = StyleRun { start: 6, end: 10, font_family: None, weight: None, italic: None, color: Some([0, 0, 255]), size: None, tracking: None, caps: None, style: None };
+        let text = TextData { runs: vec![run], ..paragraph("alpha beta gamma Anticonstitutionnellement", 200.0, 600.0) };
+        let (point, (dx, dy)) = to_point(&text).expect("conversion");
+        assert!(point.frame.is_none() && (dx, dy) == (0.0, 0.0));
+        let lines: Vec<&str> = point.content.split('\n').collect();
+        assert!(lines.len() >= 3, "{lines:?}");
+        let letters = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+        assert_eq!(letters(&point.content), letters(&text.content), "aucune lettre perdue ni ajoutée");
+        assert_eq!(point.content.matches('\n').count(), lines.len() - 1);
+        assert!(lines.iter().all(|line| !line.ends_with(' ')), "l'espace de coupure devient le retour : {lines:?}");
+        let blue: String = point.content.encode_utf16().collect::<Vec<_>>()[point.runs[0].start..point.runs[0].end].iter().map(|u| char::from_u32(u32::from(*u)).unwrap_or('?')).collect();
+        assert_eq!(blue, "beta", "la portion stylée suit le texte");
+        let a = extent(&render(&text).expect("paragraphe"));
+        let b = extent(&render(&point).expect("point"));
+        assert!([a.0 - b.0, a.1 - b.1, a.2 - b.2, a.3 - b.3].iter().all(|d| d.abs() <= 1), "même aspect : {a:?} / {b:?}");
+        // Point -> paragraphe : le cadre est la boîte du texte, l'ancre devient le coin haut gauche.
+        let centered = TextData { align: TextAlign::Center, ..sample("Un\nDeux lignes") };
+        let (para, (dx, _)) = to_paragraph(&centered).expect("conversion");
+        let frame = para.frame.expect("cadre");
+        assert!(dx < 0.0 && (dx + (frame.width / 2.0).round()).abs() < 0.01, "origine au bord gauche : {dx} / {frame:?}");
+        let before = extent(&render(&centered).expect("point"));
+        let after = extent(&render(&para).expect("paragraphe"));
+        let moved = (after.0 + dx as i32, after.1, after.2 + dx as i32, after.3);
+        assert!((moved.0 - before.0).abs() <= 1 && (moved.2 - before.2).abs() <= 1 && moved.1 == before.1, "{before:?} -> {moved:?}");
+        assert!(!overflows(&para).expect("mesure"), "la boîte du texte le contient en entier");
     }
 
     #[test]

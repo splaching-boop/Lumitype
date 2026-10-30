@@ -1,5 +1,6 @@
 // Cibles du magnétisme, communes à l'outil Déplacement, au cadre de transformation et aux repères.
 import { app } from "../state/app.svelte";
+import { guideTarget, guidesOf } from "./artboards.svelte";
 
 /** Portée du magnétisme, en pixels d'écran. */
 export const SNAP_PIXELS = 8;
@@ -11,18 +12,19 @@ export function setSnapObjects(bounds: readonly (readonly number[])[]): void {
 }
 
 /**
- * Sur un axe : bords et centre du plan de travail, repères perpendiculaires à cet axe (s'ils sont
- * affichés), et bords et centre des autres objets.
+ * Sur un axe : bords et centre du cadre de travail (le plan de travail actif, sinon le document), repères de ce cadre
+ * perpendiculaires à cet axe (s'ils sont affichés), et bords et centre des autres objets.
  */
 export function snapTargets(axis: "x" | "y"): number[] {
   const info = app.active?.info;
   if (!info) return [];
-  const extent = axis === "x" ? info.width : info.height;
+  const frame = guideTarget() ?? { board: null, x: 0, y: 0, width: info.width, height: info.height };
+  const [from, to] = axis === "x" ? [frame.x, frame.x + frame.width] : [frame.y, frame.y + frame.height];
   const wanted = axis === "x" ? "vertical" : "horizontal";
-  const guides = app.guidesVisible ? info.guides.filter((g) => g.orientation === wanted).map((g) => g.position) : [];
+  const guides = app.guidesVisible ? guidesOf(info.guides, frame.board).filter((g) => g.orientation === wanted).map((g) => g.position) : [];
   const [lo, hi] = axis === "x" ? [0, 2] : [1, 3];
   const others = objects.flatMap((b) => edgesAndCenter(b[lo] ?? 0, b[hi] ?? 0));
-  return [0, extent / 2, extent, ...guides, ...others];
+  return [from, (from + to) / 2, to, ...guides, ...others];
 }
 
 /** Bords et milieu d'un intervalle : les trois positions d'un objet qui peuvent s'aimanter. */

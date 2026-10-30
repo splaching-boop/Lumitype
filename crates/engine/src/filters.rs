@@ -7,6 +7,7 @@
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use crate::creative::{self, ChromeTint, CrtMask, HalftonePattern, MoshPalette, RisoInks, SortDirection, StippleShape, TruchetColor, TruchetPattern};
 use crate::error::EngineError;
 use crate::tiles::TileStore;
 
@@ -69,11 +70,194 @@ pub enum Filter {
     ColorDither { scale: u32, contrast: f32, threshold: f32, strength: f32 },
     /// Aberration chromatique : le rouge et le bleu sont décalés en sens opposés, de `amount` pixels
     /// (0 à 100). `radial` : le décalage part du centre et grandit vers les bords, comme un objectif ;
-    /// sinon il est uniforme, dans la direction `angle` (degrés).
-    ChromaticAberration { amount: f32, angle: f32, radial: bool },
+    /// sinon il est uniforme, dans la direction `angle` (degrés). Avec `warp` (ondulation, 0 à 60 px)
+    /// ou `streak` (traînées, 0 à 60 px), l'aberration devient « organique » : magenta et vert se
+    /// séparent le long d'une lentille irrégulière, en copies fantômes.
+    ChromaticAberration {
+        amount: f32,
+        angle: f32,
+        radial: bool,
+        #[serde(default)]
+        warp: f32,
+        #[serde(default)]
+        streak: f32,
+    },
     /// Image recomposée en caractères : cellules de `cell` pixels de haut (6 à 64) ;
     /// `color` = chaque caractère prend la couleur de sa cellule, sinon blanc sur noir.
-    Ascii { cell: u32, color: bool },
+    /// `glow` (0 à 100) : halo de l'image, floutée, derrière les caractères.
+    Ascii {
+        cell: u32,
+        color: bool,
+        #[serde(default)]
+        glow: f32,
+    },
+    /// Flou en zoom depuis un centre (`x`, `y` de 0 à 1 sur le contenu) : `strength` de 0 à 100 %,
+    /// `fringe` (0 à 100) : franges colorées.
+    RadialBlur { strength: f32, x: f32, y: f32, fringe: f32 },
+    /// Grain argentique : `amount` 0 à 100 %, amas de `size` pixels (1 à 8).
+    FilmGrain {
+        amount: f32,
+        size: f32,
+        #[serde(default)]
+        seed: u32,
+    },
+    /// Verre cannelé : cannelures de `rib` pixels (2 à 120), `refraction` (0 à 8), ondulation `wave`
+    /// (0 à 20 px), verticales ou `horizontal`.
+    FlutedGlass { rib: f32, refraction: f32, wave: f32, horizontal: bool },
+    /// Vignettage : `amount` de -100 (bords clairs) à 100 (bords sombres), `size` et `softness` 0 à 100.
+    Vignette { amount: f32, size: f32, softness: f32 },
+    /// Film d'essence : `strength` 0 à 100 %, `bands` (0,5 à 5), taille des nappes `scale` (20 à 2 000 px).
+    PetrolSheen {
+        strength: f32,
+        bands: f32,
+        scale: f32,
+        #[serde(default)]
+        seed: u32,
+    },
+    /// Chrome : `rings` anneaux (2 à 24), douceur `softness` (1 à 40 px), teinte du métal.
+    Chrome { rings: f32, softness: f32, tint: ChromeTint },
+    /// Relief : lumière venant de `angle` (degrés), hauteur `height` (1 à 20 px), `amount` 1 à 500 %,
+    /// gris ou posé sur la couleur.
+    Emboss { angle: f32, height: f32, amount: f32, color: bool },
+    /// Demi-teinte : trame de `cell` pixels (3 à 60), inclinée de `angle` degrés ; motif (points, cercles
+    /// concentriques autour de `(x, y)` — 0 à 1 sur le contenu —, lignes, CMJN), contraste -100 à 100, encre
+    /// et papier. `color` : ancien réglage « En couleur » (points de la couleur de l'image).
+    Halftone {
+        cell: f32,
+        angle: f32,
+        #[serde(default)]
+        color: bool,
+        #[serde(default)]
+        pattern: HalftonePattern,
+        #[serde(default)]
+        contrast: f32,
+        #[serde(default = "black")]
+        ink: [u8; 3],
+        #[serde(default = "white")]
+        paper: [u8; 3],
+        #[serde(default = "half")]
+        x: f32,
+        #[serde(default = "half")]
+        y: f32,
+    },
+    /// Impression rétro : une encre sur papier, grains irréguliers. `density` 0 à 100, `grain` 0,5 à 6 px,
+    /// `contrast` -100 à 100, `bleed` (bavure) 0 à 100.
+    RetroPrint {
+        ink: [u8; 3],
+        paper: [u8; 3],
+        density: f32,
+        grain: f32,
+        contrast: f32,
+        bleed: f32,
+        #[serde(default)]
+        seed: u32,
+    },
+    /// Traînée : flou de mouvement d'un seul côté (vers `angle` degrés, sur `length` pixels, atténué de
+    /// `falloff` 0 à 100 % le long du chemin), posé sur l'original en mode Fondu à `opacity` (0 à 100 %) ;
+    /// `sharp` (0 à 100 %) épargne le sujet lui-même.
+    Trail {
+        angle: f32,
+        length: f32,
+        opacity: f32,
+        falloff: f32,
+        sharp: f32,
+        #[serde(default)]
+        seed: u32,
+    },
+    /// Lames : l'image tourne de `rotation` degrés dans son plan, bascule en perspective de `tilt` degrés (0 à 80),
+    /// puis est découpée en tranches parallèles d'orientation `orient` (degrés, dans le plan) : `density` lames sur la
+    /// diagonale du contenu (3 à 120), chacune devenant une paroi verticale de `height` % (de la diagonale) qui part
+    /// du dessus et se fond vers le noir. Une vague court le long des lames : `amp` % de hauteur, longueur d'onde
+    /// `wavelength` %, phase `phase` degrés. `light` (10 à 100 %) : clarté du haut des lames ; `color` : couleur de
+    /// l'image au lieu du blanc ; `transparent` : fondu vers le transparent au lieu du noir.
+    Blades {
+        rotation: f32,
+        tilt: f32,
+        orient: f32,
+        density: f32,
+        height: f32,
+        amp: f32,
+        wavelength: f32,
+        #[serde(default)]
+        phase: f32,
+        #[serde(default = "eighty_five")]
+        light: f32,
+        #[serde(default)]
+        color: bool,
+        #[serde(default)]
+        transparent: bool,
+    },
+    /// Risographie : trame de `cell` pixels (3 à 30), décalage des encres `shift` (0 à 20 px),
+    /// grain 0 à 100 %, jeu d'encres.
+    Riso {
+        cell: f32,
+        shift: f32,
+        grain: f32,
+        inks: RisoInks,
+        #[serde(default)]
+        seed: u32,
+    },
+    /// Pointillisme : un point candidat toutes les `spacing` pixels (3 à 60), de rayon `size` (0,5 à 20 px).
+    Stipple {
+        spacing: f32,
+        size: f32,
+        shape: StippleShape,
+        paper: bool,
+        #[serde(default)]
+        seed: u32,
+    },
+    /// Écran CRT : triades de `pitch` pixels (3 à 40), halo 0 à 100 %, masque.
+    Crt { pitch: f32, glow: f32, mask: CrtMask },
+    /// Lignes de balayage : une ligne toutes les `period` pixels (2 à 24), profondeur 0 à 100 %,
+    /// décrochage `jitter` (0 à 60 px), contraste 50 à 200 %.
+    Scanlines {
+        period: f32,
+        depth: f32,
+        jitter: f32,
+        contrast: f32,
+        #[serde(default)]
+        seed: u32,
+    },
+    /// Pixellisation : cases de `cell` pixels (2 à 300).
+    Pixelate { cell: u32 },
+    /// Distorsion numérique : intensité 0 à 100 %.
+    Glitch {
+        intensity: f32,
+        #[serde(default)]
+        seed: u32,
+    },
+    /// Datamosh : macroblocs de `block` pixels (4 à 120), bavure, blocs déplacés et grain 0 à 100 %.
+    Datamosh {
+        block: u32,
+        bleed: f32,
+        glitches: f32,
+        grain: f32,
+        palette: MoshPalette,
+        #[serde(default)]
+        seed: u32,
+    },
+    /// Tri de pixels : les suites de pixels de luminosité entre `low` et `high` (0 à 100) sont triées.
+    PixelSort { low: f32, high: f32, direction: SortDirection },
+    /// Peinture à l'huile (filtre de Kuwahara) : touches de `radius` pixels (2 à 30).
+    OilPaint { radius: f32 },
+    /// Postérisation : `levels` tons par couche (2 à 16).
+    Posterize { levels: u32 },
+    /// Contours : intensité `amount` 10 à 400 %, traits foncés ou en couleur.
+    Contours { amount: f32, color: bool },
+    /// Truchet : cases de `cell` pixels (4 à 300), épaisseur `width` (2 à 40 % de la case), halo 0 à 100 %.
+    Truchet {
+        cell: f32,
+        width: f32,
+        glow: f32,
+        pattern: TruchetPattern,
+        color: TruchetColor,
+        #[serde(default)]
+        seed: u32,
+    },
+    /// Filtre Camera Raw : la chaîne de la fenêtre « Développement RAW » (balance des blancs relative, exposition,
+    /// tonalité, présence, détail, vignetage) appliquée aux pixels du calque, repassés en lumière linéaire. Voir
+    /// `raw::develop_image`.
+    CameraRaw { params: crate::raw::RawParams },
 }
 
 impl Filter {
@@ -93,6 +277,30 @@ impl Filter {
             Self::ColorDither { .. } => "Tramage couleur",
             Self::ChromaticAberration { .. } => "Aberration chromatique",
             Self::Ascii { .. } => "ASCII",
+            Self::RadialBlur { .. } => "Flou radial",
+            Self::FilmGrain { .. } => "Grain argentique",
+            Self::FlutedGlass { .. } => "Verre cannelé",
+            Self::Vignette { .. } => "Vignettage",
+            Self::PetrolSheen { .. } => "Film d'essence",
+            Self::Chrome { .. } => "Chrome",
+            Self::Emboss { .. } => "Relief",
+            Self::Halftone { .. } => "Demi-teinte",
+            Self::RetroPrint { .. } => "Impression rétro",
+            Self::Trail { .. } => "Traînée",
+            Self::Blades { .. } => "Lames",
+            Self::Riso { .. } => "Risographie",
+            Self::Stipple { .. } => "Pointillisme",
+            Self::Crt { .. } => "Écran CRT",
+            Self::Scanlines { .. } => "Lignes de balayage",
+            Self::Pixelate { .. } => "Pixellisation",
+            Self::Glitch { .. } => "Distorsion numérique",
+            Self::Datamosh { .. } => "Datamosh",
+            Self::PixelSort { .. } => "Tri de pixels",
+            Self::OilPaint { .. } => "Peinture à l'huile",
+            Self::Posterize { .. } => "Postérisation",
+            Self::Contours { .. } => "Contours",
+            Self::Truchet { .. } => "Truchet",
+            Self::CameraRaw { .. } => "Filtre Camera Raw",
         }
     }
 }
@@ -118,10 +326,337 @@ impl Filter {
                 Self::GaussianNoise { radius: radius * k, scatter: scatter * k, amount, grain: ((grain as f32 * k).round() as u32).max(1), monochrome }
             }
             Self::ColorDither { scale, contrast, threshold, strength } => Self::ColorDither { scale: ((scale as f32 * k).round() as u32).max(1), contrast, threshold, strength },
-            Self::ChromaticAberration { amount, angle, radial } => Self::ChromaticAberration { amount: amount * k, angle, radial },
-            Self::Ascii { cell, color } => Self::Ascii { cell: ((cell as f32 * k).round() as u32).max(6), color },
+            Self::ChromaticAberration { amount, angle, radial, warp, streak } => Self::ChromaticAberration { amount: amount * k, angle, radial, warp: warp * k, streak: streak * k },
+            Self::Ascii { cell, color, glow } => Self::Ascii { cell: ((cell as f32 * k).round() as u32).max(6), color, glow },
+            // Proportions du contenu ou intensités : rien à mettre à l'échelle.
+            same @ (Self::RadialBlur { .. } | Self::Blades { .. } | Self::Vignette { .. } | Self::Glitch { .. } | Self::PixelSort { .. } | Self::Posterize { .. } | Self::Contours { .. }) => same,
+            Self::FilmGrain { amount, size, seed } => Self::FilmGrain { amount, size: (size * k).max(0.5), seed },
+            Self::FlutedGlass { rib, refraction, wave, horizontal } => Self::FlutedGlass { rib: (rib * k).max(2.0), refraction, wave: wave * k, horizontal },
+            Self::PetrolSheen { strength, bands, scale, seed } => Self::PetrolSheen { strength, bands, scale: (scale * k).max(4.0), seed },
+            Self::Chrome { rings, softness, tint } => Self::Chrome { rings, softness: (softness * k).max(0.5), tint },
+            Self::Emboss { angle, height, amount, color } => Self::Emboss { angle, height: (height * k).max(0.5), amount, color },
+            Self::Halftone { cell, angle, color, pattern, contrast, ink, paper, x, y } => Self::Halftone { cell: (cell * k).max(2.0), angle, color, pattern, contrast, ink, paper, x, y },
+            Self::RetroPrint { ink, paper, density, grain, contrast, bleed, seed } => Self::RetroPrint { ink, paper, density, grain: (grain * k).max(0.3), contrast, bleed, seed },
+            Self::Trail { angle, length, opacity, falloff, sharp, seed } => Self::Trail { angle, length: (length * k).max(1.0), opacity, falloff, sharp, seed },
+            Self::Riso { cell, shift, grain, inks, seed } => Self::Riso { cell: (cell * k).max(2.0), shift: shift * k, grain, inks, seed },
+            Self::Stipple { spacing, size, shape, paper, seed } => Self::Stipple { spacing: (spacing * k).max(2.0), size: (size * k).max(0.4), shape, paper, seed },
+            Self::Crt { pitch, glow, mask } => Self::Crt { pitch: (pitch * k).max(3.0), glow, mask },
+            Self::Scanlines { period, depth, jitter, contrast, seed } => Self::Scanlines { period: (period * k).max(1.5), depth, jitter: jitter * k, contrast, seed },
+            Self::Pixelate { cell } => Self::Pixelate { cell: ((cell as f32 * k).round() as u32).max(1) },
+            Self::Datamosh { block, bleed, glitches, grain, palette, seed } => Self::Datamosh { block: ((block as f32 * k).round() as u32).max(2), bleed, glitches, grain, palette, seed },
+            Self::OilPaint { radius } => Self::OilPaint { radius: (radius * k).max(1.0) },
+            Self::Truchet { cell, width, glow, pattern, color, seed } => Self::Truchet { cell: (cell * k).max(3.0), width, glow, pattern, color, seed },
+            // Rayons du bruit et de la netteté de l'ordre du pixel, vignetage relatif au contenu : gardés tels quels.
+            camera @ Self::CameraRaw { .. } => camera,
         }
     }
+}
+
+fn black() -> [u8; 3] {
+    [0, 0, 0]
+}
+fn white() -> [u8; 3] {
+    [255, 255, 255]
+}
+fn half() -> f32 {
+    0.5
+}
+fn rgb_unit(c: [u8; 3]) -> [f32; 3] {
+    c.map(|v| f32::from(v) / 255.0)
+}
+
+/// Plus grande longueur de traînée, en pixels.
+fn eighty_five() -> f32 {
+    85.0
+}
+
+/// Géométrie des Lames (voir [`Filter::Blades`]), en pixels du contenu : rotation, perspective, coupes, vague.
+struct BladeView {
+    /// Taille du contenu.
+    size: (f32, f32),
+    /// Diagonale du contenu : unité des réglages en %.
+    diag: f32,
+    rotation: f32,
+    tilt: f32,
+    /// Direction des coupes, dans le plan.
+    dir: (f32, f32),
+    spacing: f32,
+    height: f32,
+    amp: f32,
+    wavelength: f32,
+    phase: f32,
+    /// Distance de la caméra au plan (perspective).
+    dist: f32,
+}
+
+impl BladeView {
+    #[allow(clippy::too_many_arguments)]
+    fn new(size: (f32, f32), rotation: f32, tilt: f32, orient: f32, density: f32, height: f32, amp: f32, wavelength: f32, phase: f32) -> Self {
+        let diag = size.0.hypot(size.1).max(1.0);
+        let pct = |v: f32, max: f32| v.clamp(0.0, max) / 100.0 * diag;
+        Self {
+            size,
+            diag,
+            rotation: rotation.to_radians(),
+            tilt: tilt.clamp(0.0, 80.0).to_radians(),
+            dir: (orient.to_radians().cos(), orient.to_radians().sin()),
+            spacing: diag / density.clamp(3.0, 120.0),
+            height: pct(height, 100.0),
+            amp: pct(amp, 30.0),
+            wavelength: pct(wavelength, 400.0).max(diag * 0.05),
+            phase: phase.to_radians(),
+            dist: diag * 1.65,
+        }
+    }
+
+    /// Projection d'un point du plan (centré, déjà tourné) à la hauteur `z` : position à l'écran (centrée) et
+    /// profondeur. Le haut de l'image s'éloigne ; les parois descendent sous le plan.
+    fn project(&self, x: f32, y: f32, z: f32) -> (f32, f32, f32) {
+        let (s, c) = self.tilt.sin_cos();
+        let depth = (self.dist - y * s).max(1.0);
+        let k = self.dist / depth;
+        // Recentrage vertical : la moitié de la hauteur des parois remonte, l'ensemble reste centré.
+        (x * k, (y * c - z * s) * k - self.height * s * 0.5, depth)
+    }
+
+    /// Plus grand agrandissement de la perspective (bord le plus proche).
+    fn nearest(&self) -> f32 {
+        let r = self.diag / 2.0;
+        self.dist / (self.dist - r * self.tilt.sin()).max(1.0)
+    }
+
+    /// Débord du rendu autour du contenu, en pixels.
+    fn margin(&self) -> i32 {
+        let r = self.diag / 2.0;
+        let k = self.nearest();
+        let (s, c) = self.tilt.sin_cos();
+        let shift = self.height * s * 0.5;
+        let across = r * k - self.size.0 / 2.0;
+        let up = (r * c + self.amp * s) * k + shift - self.size.1 / 2.0;
+        let down = (r * c + (self.amp + self.height) * s) * k - shift - self.size.1 / 2.0;
+        (across.max(up).max(down).max(0.0).ceil() as i32 + 4).min(8192)
+    }
+}
+
+/// Une colonne de paroi à dessiner : profondeur, abscisse et haut/bas (pixels suréchantillonnés), couleur du haut.
+struct BladeColumn {
+    depth: f32,
+    x: i32,
+    top: f32,
+    bottom: f32,
+    rgb: [f32; 3],
+}
+
+/// Rendu des Lames dans le tampon `w`×`h` (contenu au centre, entouré de `margin`). Suréchantillonné puis réduit :
+/// arêtes et bords des parois lissés. Les parois sont peintes de la plus lointaine à la plus proche.
+#[allow(clippy::too_many_arguments)]
+fn blades(source: &[f32], w: usize, h: usize, margin: f32, view: &BladeView, light: f32, color: bool, transparent: bool) -> Vec<u8> {
+    // Suréchantillonnage : 3 × 3, moins sur les très grands calques (mémoire).
+    let ss: usize = if w * h <= 3_000_000 { 3 } else if w * h <= 12_000_000 { 2 } else { 1 };
+    let (sw, sh) = (w * ss, h * ss);
+    let center = (margin + view.size.0 / 2.0, margin + view.size.1 / 2.0);
+    // Alpha (et couleur droite) de la source, interpolés.
+    let sample = |x: f32, y: f32| -> [f32; 4] {
+        if !(x >= 0.0 && y >= 0.0 && x < (w - 1) as f32 && y < (h - 1) as f32) {
+            return [0.0; 4];
+        }
+        let (x0, y0) = (x as usize, y as usize);
+        let (fx, fy) = (x - x0 as f32, y - y0 as f32);
+        let at = |xx: usize, yy: usize, c: usize| source[(yy * w + xx) * 4 + c];
+        let mut out = [0.0; 4];
+        for (c, slot) in out.iter_mut().enumerate() {
+            let top = at(x0, y0, c) * (1.0 - fx) + at(x0 + 1, y0, c) * fx;
+            let bottom = at(x0, y0 + 1, c) * (1.0 - fx) + at(x0 + 1, y0 + 1, c) * fx;
+            *slot = top * (1.0 - fy) + bottom * fy;
+        }
+        out
+    };
+    let (rs, rc) = view.rotation.sin_cos();
+    let (dx, dy) = view.dir;
+    let (nx, ny) = (-dy, dx);
+    let r = view.diag / 2.0;
+    // Pas le long d'une lame : moins d'un demi-pixel suréchantillonné à l'écran.
+    let step = 0.5 / (ss as f32 * view.nearest());
+    let lanes: Vec<f32> = {
+        let count = (2.0 * r / view.spacing).floor() as i32;
+        (0..=count).map(|i| -r + view.spacing * (i as f32 + 0.5)).filter(|o| *o < r).collect()
+    };
+    let samples = (2.0 * r / step).ceil() as usize;
+    let mut columns: Vec<BladeColumn> = lanes
+        .par_iter()
+        .flat_map_iter(|&offset| {
+            (0..samples).filter_map(move |i| {
+                let t = -r + i as f32 * step;
+                // Point du plan (lettre tournée), puis le point de la source qui s'y trouve.
+                let (px, py) = (nx * offset + dx * t, ny * offset + dy * t);
+                let (sx, sy) = (px * rc + py * rs, -px * rs + py * rc);
+                let p = sample(center.0 + sx, center.1 + sy);
+                if p[3] < 127.5 {
+                    return None;
+                }
+                let z = view.amp * (std::f32::consts::TAU * t / view.wavelength + view.phase).sin();
+                let (x, top, depth) = view.project(px, py, z);
+                let (_, bottom, _) = view.project(px, py, z - view.height);
+                let rgb = if color { [p[0] / p[3], p[1] / p[3], p[2] / p[3]] } else { [1.0; 3] };
+                let f = ss as f32;
+                Some(BladeColumn { depth, x: ((center.0 + x) * f) as i32, top: (center.1 + top) * f, bottom: (center.1 + bottom) * f, rgb })
+            })
+        })
+        .collect();
+    columns.par_sort_unstable_by(|a, b| b.depth.total_cmp(&a.depth));
+
+    // Peinture par bandes de lignes, en parallèle : chaque bande parcourt toutes les colonnes dans l'ordre.
+    let band = 32 * ss;
+    // Couleur prémultipliée, alpha, et part « non fondue » (fondu transparent : le noir de la face devient du vide).
+    let mut big = vec![[0.0f32; 5]; sw * sh];
+    big.par_chunks_mut(band * sw).enumerate().for_each(|(b, rows)| {
+        let (y0, y1) = (b * band, (b * band + rows.len() / sw) as f32);
+        for col in &columns {
+            if col.x < 0 || col.x as usize >= sw || col.bottom <= y0 as f32 || col.top >= y1 {
+                continue;
+            }
+            let len = (col.bottom - col.top).max(1.0);
+            let first = col.top.max(y0 as f32).floor() as usize;
+            let last = (col.bottom.min(y1).ceil() as usize).min(y0 + rows.len() / sw);
+            for y in first..last {
+                // Couverture verticale partielle de la première et de la dernière ligne (arêtes lissées).
+                let cover = ((y as f32 + 1.0).min(col.bottom) - (y as f32).max(col.top)).clamp(0.0, 1.0);
+                if cover <= 0.0 {
+                    continue;
+                }
+                let k = ((y as f32 + 0.5 - col.top) / len).clamp(0.0, 1.0);
+                // Face : claire en haut, fondue vers le noir (ou le transparent) en bas.
+                let fade = (1.0 - k.powf(1.5)).powf(1.6) * 0.95 + 0.05 * (1.0 - k);
+                let a = cover;
+                let px = &mut rows[(y - y0) * sw + col.x as usize];
+                // « Par-dessus » : la paroi plus proche recouvre la précédente (le noir de sa face compris).
+                for (v, rgb) in px.iter_mut().zip(col.rgb) {
+                    *v = rgb * light * fade * a + *v * (1.0 - a);
+                }
+                px[3] = a + px[3] * (1.0 - a);
+                px[4] = fade * a + px[4] * (1.0 - a);
+            }
+        }
+    });
+
+    // Réduction ss × ss (moyenne), vers des octets prémultipliés.
+    let mut out = vec![0u8; w * h * 4];
+    out.par_chunks_mut(w * 4).enumerate().for_each(|(y, row)| {
+        for x in 0..w {
+            let mut acc = [0.0f32; 5];
+            for yy in 0..ss {
+                for xx in 0..ss {
+                    let p = big[(y * ss + yy) * sw + x * ss + xx];
+                    for c in 0..5 {
+                        acc[c] += p[c];
+                    }
+                }
+            }
+            if transparent {
+                // Fondu transparent : la face s'efface au lieu de noircir (l'alpha suit le fondu).
+                acc[3] = acc[4];
+            }
+            let n = (ss * ss) as f32;
+            for c in 0..4 {
+                row[x * 4 + c] = (acc[c] / n * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+            }
+        }
+    });
+    out
+}
+
+const TRAIL_MAX: f32 = 3000.0;
+
+/// Pointeur partagé entre fils : chaque ligne de la traînée écrit des pixels qui ne sont qu'à elle.
+#[derive(Clone, Copy)]
+struct SharedOut(*mut f32);
+unsafe impl Send for SharedOut {}
+unsafe impl Sync for SharedOut {}
+
+impl SharedOut {
+    /// Passer par une méthode fait capturer la structure entière (Send), pas son seul pointeur.
+    fn at(&self, i: usize) -> *mut f32 {
+        self.0.wrapping_add(i)
+    }
+}
+
+/// Traînée : flou de mouvement d'un seul côté, puis posé en mode Fondu sur l'original.
+///
+/// 1. Chaque pixel reçoit la moyenne de ce qui se trouve derrière lui, jusqu'à `length` pixels dans le sens
+///    opposé à `angle` (la matière « part » vers `angle`), pondérée de façon linéaire (`falloff` : 0 = égale,
+///    1 = nulle au bout). Le calcul suit des lignes de pixels parallèles à la direction avec des sommes
+///    glissantes : son coût ne dépend pas de la longueur.
+/// 2. Mode Fondu : chaque pixel prend, tout opaque, la couleur du flou avec une probabilité égale à l'alpha du
+///    flou × `opacity` (× 1 − `sharp` sur le sujet lui-même), sinon il garde l'original. D'où la poussière fine
+///    qui se raréfie avec la distance.
+#[allow(clippy::too_many_arguments)]
+fn trail(source: &[f32], w: usize, h: usize, angle: f32, length: f32, opacity: f32, falloff: f32, sharp: f32, seed: u32) -> Vec<u8> {
+    let (dx, dy) = (angle.to_radians().cos(), -angle.to_radians().sin());
+    // Axe principal : on avance d'un pixel sur lui à chaque pas, l'autre coordonnée suit la pente.
+    let along_x = dx.abs() >= dy.abs();
+    let (major, minor) = if along_x { (dx, dy) } else { (dy, dx) };
+    // Pente signée : un pas dans le sens de la direction sur l'axe principal décale l'autre axe d'autant qu'elle.
+    let slope = minor / if major.abs() < 1e-6 { 1e-6 } else { major };
+    let step_len = (1.0 + slope * slope).sqrt();
+    let taps = ((length / step_len).round() as usize).max(1);
+    let forward = major >= 0.0;
+    let (n_major, n_minor) = if along_x { (w, h) } else { (h, w) };
+    // Ligne `c` : les pixels (i, c + round(slope × i)) ; chaque pixel appartient à exactement une ligne.
+    let offset = |i: usize| (slope * i as f32).round() as isize;
+    let (lo, hi) = (offset(0).min(offset(n_major.saturating_sub(1))), offset(0).max(offset(n_major.saturating_sub(1))));
+    let lines: Vec<isize> = (-hi..n_minor as isize - lo).collect();
+    let mut blur = vec![0.0f32; source.len()];
+    let out = SharedOut(blur.as_mut_ptr());
+    let k = falloff / taps as f32;
+    // Somme des poids d'une fenêtre pleine : Σ_{a=0..taps} (1 − k·a).
+    let full = (taps + 1) as f32 - k * (taps * (taps + 1)) as f32 / 2.0;
+    lines.par_iter().for_each(|&c| {
+        let index = |i: usize| -> Option<usize> {
+            let m = c + offset(i);
+            (m >= 0 && (m as usize) < n_minor).then(|| if along_x { m as usize * w + i } else { i * w + m as usize })
+        };
+        // Fenêtre des `taps + 1` derniers échantillons : s0 = Σ v, s1 = Σ âge × v.
+        let mut ring = vec![[0.0f32; 4]; taps + 1];
+        let (mut s0, mut s1) = ([0.0f32; 4], [0.0f32; 4]);
+        for n in 0..n_major {
+            let i = if forward { n } else { n_major - 1 - n };
+            let px = match index(i) {
+                Some(at) => [source[at * 4], source[at * 4 + 1], source[at * 4 + 2], source[at * 4 + 3]],
+                None => [0.0; 4],
+            };
+            let slot = n % (taps + 1);
+            let old = ring[slot];
+            for ch in 0..4 {
+                // Tout vieillit d'un pas ; le plus ancien (âge taps + 1) sort, le nouveau entre à l'âge 0.
+                s1[ch] += s0[ch] - old[ch] * (taps + 1) as f32;
+                s0[ch] += px[ch] - old[ch];
+            }
+            ring[slot] = px;
+            if let Some(at) = index(i) {
+                for ch in 0..4 {
+                    // SAFETY : chaque pixel n'appartient qu'à une ligne, et chaque ligne est traitée par un seul fil.
+                    unsafe { *out.at(at * 4 + ch) = ((s0[ch] - k * s1[ch]) / full).max(0.0) };
+                }
+            }
+        }
+    });
+    let salt = seed.wrapping_mul(2_654_435_761).wrapping_add(11);
+    let mut result = vec![0u8; source.len()];
+    result.par_chunks_exact_mut(4).enumerate().for_each(|(i, px)| {
+        let b = &blur[i * 4..i * 4 + 4];
+        let orig = &source[i * 4..i * 4 + 4];
+        // Alpha du flou renforcé : la traînée reste visible loin du sujet avant de se raréfier.
+        let alpha = (b[3] / 255.0 * 1.6).min(1.0);
+        let chance = alpha * opacity * (1.0 - sharp * orig[3] / 255.0);
+        let pick = hash(i % w, i / w, salt) < chance && b[3] > 0.5;
+        let value = if pick { [b[0] / b[3] * 255.0, b[1] / b[3] * 255.0, b[2] / b[3] * 255.0, 255.0] } else { [orig[0], orig[1], orig[2], orig[3]] };
+        let a = value[3].clamp(0.0, 255.0);
+        for ch in 0..3 {
+            px[ch] = (value[ch].clamp(0.0, a) + 0.5) as u8;
+        }
+        px[3] = (a + 0.5) as u8;
+    });
+    result
 }
 
 /// Plus grand tampon de travail accepté, en pixels.
@@ -158,10 +693,16 @@ pub fn apply(pixels: &TileStore, filter: &Filter) -> Result<TileStore, EngineErr
         Filter::GaussianBlur { radius } => (radius.clamp(0.1, 250.0) * 3.0).ceil() as i32 + 1,
         Filter::MotionBlur { distance, .. } => (distance.clamp(1.0, 500.0) / 2.0).ceil() as i32 + 1,
         Filter::LensBlur { radius, .. } => radius.clamp(1.0, 100.0).ceil() as i32 + 1,
-        Filter::ChromaticAberration { amount, .. } => amount.clamp(0.0, 100.0).ceil() as i32 + 1,
+        Filter::ChromaticAberration { amount, warp, streak, .. } => (amount.clamp(0.0, 100.0) * 1.6 + warp.clamp(0.0, 60.0) + streak.clamp(0.0, 60.0)).ceil() as i32 + 1,
         // Aucune marge : le verre ne dévie qu'à l'intérieur du contenu (les bords lisent leur propre pixel).
         Filter::Glass { .. } => 0,
         Filter::GaussianNoise { radius, scatter, .. } => (radius.clamp(0.0, 250.0) * 3.0 + scatter.clamp(0.0, 100.0) * 3.0).ceil() as i32 + 1,
+        // La traînée part du contenu dans une seule direction, jusqu'à sa longueur.
+        Filter::Trail { length, .. } => length.clamp(1.0, TRAIL_MAX).ceil() as i32 + 1,
+        // Les lames débordent du contenu : perspective, hauteur des parois et vague.
+        Filter::Blades { rotation, tilt, orient, density, height, amp, wavelength, phase, .. } => {
+            BladeView::new(((x1 - x0) as f32, (y1 - y0) as f32), *rotation, *tilt, *orient, *density, *height, *amp, *wavelength, *phase).margin()
+        }
         _ => 0,
     };
     let (left, top) = (x0 - margin, y0 - margin);
@@ -235,8 +776,69 @@ pub fn apply(pixels: &TileStore, filter: &Filter) -> Result<TileStore, EngineErr
         Filter::ColorDither { scale, contrast, threshold, strength } => {
             color_dither(&source, w, scale.clamp(1, 16) as usize, contrast.clamp(0.0, 200.0) / 100.0, threshold.clamp(0.0, 100.0) / 100.0, strength.clamp(0.0, 100.0) / 100.0)
         }
-        Filter::ChromaticAberration { amount, angle, radial } => quantize(&aberration(&source, w, h, amount.clamp(0.0, 100.0), angle, radial)),
-        Filter::Ascii { cell, color } => ascii(&source, w, h, cell.clamp(6, 64) as usize, color)?,
+        Filter::ChromaticAberration { amount, angle, radial, warp, streak } => {
+            if warp > 0.0 || streak > 0.0 {
+                quantize(&creative::organic_aberration(&source, w, h, amount.clamp(0.0, 100.0), warp.clamp(0.0, 60.0), streak.clamp(0.0, 60.0)))
+            } else {
+                quantize(&aberration(&source, w, h, amount.clamp(0.0, 100.0), angle, radial))
+            }
+        }
+        Filter::Ascii { cell, color, glow } => ascii(&source, w, h, cell.clamp(6, 64) as usize, color, glow.clamp(0.0, 100.0) / 100.0)?,
+        Filter::RadialBlur { strength, x, y, fringe } => {
+            let content = ((x1 - x0) as f32, (y1 - y0) as f32);
+            let center = (margin as f32 + x.clamp(0.0, 1.0) * content.0, margin as f32 + y.clamp(0.0, 1.0) * content.1);
+            creative::radial_blur(&source, w, h, center, strength.clamp(0.0, 100.0) / 100.0, fringe.clamp(0.0, 100.0) / 100.0)
+        }
+        Filter::FlutedGlass { rib, refraction, wave, horizontal } => creative::fluted_glass(&source, w, h, rib.clamp(2.0, 120.0), refraction.clamp(0.0, 8.0), wave.clamp(0.0, 20.0), horizontal),
+        Filter::Pixelate { cell } => creative::pixelate(&source, w, h, cell.clamp(1, 300) as usize),
+        Filter::PixelSort { low, high, direction } => creative::pixel_sort(&source, w, h, low.clamp(0.0, 100.0) / 100.0, high.clamp(0.0, 100.0) / 100.0, direction),
+        Filter::Trail { angle, length, opacity, falloff, sharp, seed } => {
+            let unit = |v: f32| v.clamp(0.0, 100.0) / 100.0;
+            trail(&source, w, h, angle, length.clamp(1.0, TRAIL_MAX), unit(opacity), unit(falloff), unit(sharp), seed)
+        }
+        Filter::Blades { rotation, tilt, orient, density, height, amp, wavelength, phase, light, color, transparent } => {
+            let view = BladeView::new(((x1 - x0) as f32, (y1 - y0) as f32), rotation, tilt, orient, density, height, amp, wavelength, phase);
+            blades(&source, w, h, margin as f32, &view, light.clamp(10.0, 100.0) / 100.0, color, transparent)
+        }
+        other => {
+            // Les filtres de couleur : calcul en couleur droite, alpha conservé.
+            let img = creative::Straight::from_premultiplied(&source, w, h);
+            let unit = |v: f32| v.clamp(0.0, 100.0) / 100.0;
+            match other {
+                Filter::FilmGrain { amount, size, seed } => creative::film_grain(&img, unit(amount), size.clamp(0.5, 8.0), seed),
+                Filter::Vignette { amount, size, softness } => creative::vignette(&img, amount.clamp(-100.0, 100.0) / 100.0, unit(size), unit(softness)),
+                Filter::PetrolSheen { strength, bands, scale, seed } => creative::petrol_sheen(&img, unit(strength), bands.clamp(0.5, 5.0), scale.clamp(4.0, 2000.0), seed),
+                Filter::Chrome { rings, softness, tint } => creative::chrome(&img, rings.clamp(2.0, 24.0), softness.clamp(0.5, 40.0), tint),
+                Filter::Emboss { angle, height, amount, color } => creative::emboss(&img, angle, height.clamp(0.5, 20.0), amount.clamp(1.0, 500.0) / 100.0, color),
+                Filter::Halftone { cell, angle, color, pattern, contrast, ink, paper, x, y } => {
+                    let style = creative::HalftoneStyle {
+                        pattern,
+                        contrast: contrast.clamp(-100.0, 100.0) / 100.0,
+                        ink: rgb_unit(ink),
+                        paper: rgb_unit(paper),
+                        center: (x.clamp(0.0, 1.0) * w as f32, y.clamp(0.0, 1.0) * h as f32),
+                        color,
+                    };
+                    creative::halftone(&img, cell.clamp(2.0, 60.0), angle, &style)
+                }
+                Filter::RetroPrint { ink, paper, density, grain, contrast, bleed, seed } => {
+                    creative::retro_print(&img, rgb_unit(ink), rgb_unit(paper), unit(density), grain.clamp(0.3, 6.0), contrast.clamp(-100.0, 100.0) / 100.0, unit(bleed), seed)
+                }
+                Filter::Riso { cell, shift, grain, inks, seed } => creative::riso(&img, cell.clamp(2.0, 30.0), shift.clamp(0.0, 20.0), unit(grain), inks, seed),
+                Filter::Stipple { spacing, size, shape, paper, seed } => creative::stipple(&img, spacing.clamp(2.0, 60.0), size.clamp(0.4, 20.0), shape, paper, seed),
+                Filter::Crt { pitch, glow, mask } => creative::crt(&img, pitch.clamp(3.0, 40.0), unit(glow), mask),
+                Filter::Scanlines { period, depth, jitter, contrast, seed } => creative::scanlines(&img, period.clamp(1.5, 24.0), unit(depth), jitter.clamp(0.0, 60.0), contrast.clamp(50.0, 200.0) / 100.0, seed),
+                Filter::Glitch { intensity, seed } => creative::glitch(&img, unit(intensity), seed),
+                Filter::Datamosh { block, bleed, glitches, grain, palette, seed } => creative::datamosh(&img, block.clamp(2, 120) as usize, unit(bleed), unit(glitches), unit(grain), palette, seed),
+                Filter::OilPaint { radius } => creative::oil_paint(&img, radius.clamp(1.0, 30.0)),
+                Filter::Posterize { levels } => creative::posterize(&img, levels.clamp(2, 16)),
+                Filter::Contours { amount, color } => creative::contours(&img, amount.clamp(10.0, 400.0) / 100.0, color),
+                Filter::Truchet { cell, width, glow, pattern, color, seed } => creative::truchet(&img, cell.clamp(3.0, 300.0), width.clamp(2.0, 40.0) / 100.0, unit(glow), pattern, color, seed),
+                // Le transparent n'a pas de couleur (noir) : l'alpha d'origine le garde invisible.
+                Filter::CameraRaw { params } => img.compose(&crate::raw::develop_image(&img.rgb, w, h, &params)),
+                _ => unreachable!("filtre traité plus haut"),
+            }
+        }
     };
     let store = TileStore::from_premultiplied(w as u32, h as u32, &result).ok_or_else(|| EngineError::Corrupt("tampon de filtre de taille inattendue".into()))?;
     Ok(store.translated(left, top))
@@ -458,7 +1060,7 @@ fn count_inside(x: usize, y: usize, w: usize, h: usize, halves: &[isize], reach:
 }
 
 /// Valeur pseudo-aléatoire déterministe dans `[0, 1)` : le même filtre redonne le même grain.
-fn hash(x: usize, y: usize, salt: u32) -> f32 {
+pub(crate) fn hash(x: usize, y: usize, salt: u32) -> f32 {
     let mut v = (x as u32).wrapping_mul(0x9E37_79B1) ^ (y as u32).wrapping_mul(0x85EB_CA77) ^ salt.wrapping_mul(0xC2B2_AE3D);
     v ^= v >> 15;
     v = v.wrapping_mul(0x2C1B_3C6D);
@@ -584,7 +1186,7 @@ pub fn glass_texture() -> Option<std::sync::Arc<HeightMap>> {
 }
 
 /// Bruit lissé : interpolation douce entre les nœuds d'une grille de pas `cell`.
-fn value_noise(x: f32, y: f32, cell: f32, salt: u32) -> f32 {
+pub(crate) fn value_noise(x: f32, y: f32, cell: f32, salt: u32) -> f32 {
     let (gx, gy) = (x / cell, y / cell);
     let (x0, y0) = (gx.floor(), gy.floor());
     let ease = |t: f32| t * t * (3.0 - 2.0 * t);
@@ -722,7 +1324,7 @@ fn presence(source: &[f32], w: usize, h: usize, texture: f32, clarity: f32, deha
 }
 
 /// Tirage selon une loi normale centrée réduite (Box-Muller), déterministe pour un pixel et un sel donnés.
-fn normal(x: usize, y: usize, salt: u32) -> f32 {
+pub(crate) fn normal(x: usize, y: usize, salt: u32) -> f32 {
     let (u, v) = (hash(x, y, salt).max(1e-7), hash(x, y, salt.wrapping_add(101)));
     (-2.0 * u.ln()).sqrt() * (std::f32::consts::TAU * v).cos()
 }
@@ -844,7 +1446,7 @@ const ASCII_RAMP: &str = " .,:;i1tfLCG08@";
 
 /// Image recomposée en caractères à chasse fixe, sur fond noir : chaque cellule prend le
 /// caractère dont la densité correspond à sa luminosité.
-fn ascii(source: &[f32], w: usize, h: usize, cell: usize, color: bool) -> Result<Vec<u8>, EngineError> {
+fn ascii(source: &[f32], w: usize, h: usize, cell: usize, color: bool, glow: f32) -> Result<Vec<u8>, EngineError> {
     let (cell_w, cell_h) = ((cell as f32 * 0.6).round().max(3.0) as usize, cell);
     // Chaque caractère de la rampe est dessiné une seule fois par le moteur de texte.
     let glyphs: Vec<Vec<f32>> = ASCII_RAMP
@@ -855,7 +1457,21 @@ fn ascii(source: &[f32], w: usize, h: usize, cell: usize, color: bool) -> Result
             Ok(raster.chunks_exact(4).map(|px| f32::from(px[3]) / 255.0).collect())
         })
         .collect::<Result<_, EngineError>>()?;
+    // Halo : l'image floutée et atténuée, derrière les caractères (prémultiplié, 0 à 255).
+    let halo: Option<Vec<f32>> = (glow > 0.0).then(|| {
+        let near = gaussian(source, w, h, cell as f32 * 1.4);
+        let far = gaussian(source, w, h, cell as f32 * 4.0);
+        near.iter().zip(&far).map(|(a, b)| (a * 0.7 + b * 0.3) * glow).collect()
+    });
     let mut out = vec![0u8; source.len()];
+    if let Some(halo) = &halo {
+        for (o, (s, v)) in out.chunks_exact_mut(4).zip(source.chunks_exact(4).zip(halo.chunks_exact(4))) {
+            for c in 0..3 {
+                o[c] = (v[c].clamp(0.0, s[3]) + 0.5) as u8;
+            }
+            o[3] = (s[3] + 0.5) as u8;
+        }
+    }
     out.par_chunks_mut(w * 4 * cell_h).enumerate().for_each(|(row_index, band)| {
         let y0 = row_index * cell_h;
         let rows = band.len() / (w * 4);
@@ -885,7 +1501,8 @@ fn ascii(source: &[f32], w: usize, h: usize, cell: usize, color: bool) -> Result
                     let coverage = glyph[y * cell_w + x];
                     let at = (y * w + x0 + x) * 4;
                     for c in 0..3 {
-                        band[at + c] = (ink[c] * coverage * here + 0.5) as u8;
+                        let behind = f32::from(band[at + c]);
+                        band[at + c] = (behind + (ink[c] * here - behind) * coverage + 0.5).clamp(0.0, here + 0.5) as u8;
                     }
                     band[at + 3] = (here + 0.5) as u8;
                 }
@@ -928,12 +1545,12 @@ pub(crate) fn gaussian_into(source: &[f32], w: usize, h: usize, sigma: f32, out:
 fn box_sizes(sigma: f32) -> [usize; 3] {
     let ideal = (12.0 * sigma * sigma / 3.0 + 1.0).sqrt();
     let mut lower = ideal.floor() as usize;
-    if lower % 2 == 0 {
+    if lower.is_multiple_of(2) {
         lower = lower.saturating_sub(1).max(1);
     }
     let upper = lower + 2;
     let switch = ((12.0 * sigma * sigma - (3 * lower * lower + 12 * lower + 9) as f32) / (-4.0 * lower as f32 - 4.0)).round() as i32;
-    [0, 1, 2].map(|i| if (i as i32) < switch { lower } else { upper })
+    [0, 1, 2].map(|i| if i < switch { lower } else { upper })
 }
 
 /// Moyenne glissante de largeur `size` sur chaque ligne de `line` pixels RGBA ; hors image = transparent.
@@ -1016,6 +1633,74 @@ mod tests {
         assert!(Sampler::new(&vertical).get(150, 90)[3] > 40 && Sampler::new(&vertical).get(95, 150)[3] == 0);
     }
 
+    /// Traînée : la poussière part d'un seul côté (vers l'angle), jamais de l'autre ; le sujet reste en place ; on
+    /// trouve des grains opaques de plus en plus rares avec la distance. Les autres angles (diagonales, vers la
+    /// gauche, vers le haut) vont aussi du bon côté.
+    #[test]
+    fn the_trail_leaves_dust_on_one_side_only() {
+        let count = |out: &TileStore, xs: std::ops::Range<i32>, ys: std::ops::Range<i32>| {
+            let mut s = Sampler::new(out);
+            xs.flat_map(|x| ys.clone().map(move |y| (x, y))).filter(|&(x, y)| s.get(x, y)[3] > 0).count()
+        };
+        for (angle, ahead, behind) in [(0.0, (210..260, 110..190), (40..90, 110..190)), (180.0, (40..90, 110..190), (210..260, 110..190)), (90.0, (110..190, 40..90), (110..190, 210..260)), (-45.0, (210..250, 210..250), (50..90, 50..90))] {
+            let out = apply(&square(), &Filter::Trail { angle, length: 120.0, opacity: 80.0, falloff: 100.0, sharp: 50.0, seed: 1 }).expect("traînée");
+            let near = count(&out, ahead.0.clone(), ahead.1.clone());
+            assert!(near > 200, "angle {angle} : de la poussière devant ({near})");
+            assert_eq!(count(&out, behind.0, behind.1), 0, "angle {angle} : rien derrière");
+            assert_eq!(Sampler::new(&out).get(150, 150)[3], 255, "le sujet reste là");
+        }
+        // Plus loin, plus clairsemé.
+        let out = apply(&square(), &Filter::Trail { angle: 0.0, length: 120.0, opacity: 80.0, falloff: 100.0, sharp: 50.0, seed: 1 }).expect("traînée");
+        assert!(count(&out, 202..222, 110..190) > count(&out, 250..270, 110..190));
+    }
+
+    /// Lames : le rendu déborde du contenu (perspective et parois), le haut des lames est clair et le bas fondu ; le
+    /// fondu transparent garde la forme mais laisse voir dessous ; plus de densité donne plus de lames.
+    #[test]
+    fn blades_slice_the_shape_into_fading_walls() {
+        let blades = |density: f32, transparent: bool| Filter::Blades { rotation: 45.0, tilt: 46.0, orient: 35.0, density, height: 17.0, amp: 4.5, wavelength: 70.0, phase: 0.0, light: 85.0, color: false, transparent };
+        let out = apply(&square(), &blades(26.0, false)).expect("lames");
+        let (x0, y0, x1, y1) = out.pixel_bounds(|p| p[3] > 0).expect("du rendu");
+        assert!(x0 < 100 || y0 < 100 || x1 > 200 || y1 > 200, "le rendu déborde du carré : {:?}", (x0, y0, x1, y1));
+        let mut s = Sampler::new(&out);
+        let column = |s: &mut Sampler<4>, x: i32| (y0..y1).map(|y| s.get(x, y)).filter(|p| p[3] > 0).collect::<Vec<_>>();
+        let middle = column(&mut s, (x0 + x1) / 2);
+        let brightest = middle.iter().map(|p| p[0]).max().expect("une colonne");
+        assert!(brightest > 180, "haut des lames clair ({brightest})");
+        assert!(middle.iter().any(|p| p[0] < 40 && p[3] == 255), "bas des lames fondu vers le noir, opaque");
+        // Bords lissés : des pixels à couverture partielle.
+        assert!((y0..y1).any(|y| (x0..x1).any(|x| { let a = s.get(x, y)[3]; a > 20 && a < 235 })), "anticrénelage");
+        // Fondu transparent : le noir devient du vide.
+        let clear = apply(&square(), &blades(26.0, true)).expect("lames");
+        let mut c = Sampler::new(&clear);
+        assert!((y0..y1).any(|y| { let p = c.get((x0 + x1) / 2, y); p[3] > 0 && p[3] < 128 }), "parois qui s'effacent");
+        // Densité : plus de lames, donc plus de bords verticaux sur une ligne du rendu.
+        // Bords verticaux nets (début d'une lame devant une autre), comptés sur tout le rendu.
+        let edges = |store: &TileStore| {
+            let (x0, y0, x1, y1) = store.pixel_bounds(|p| p[3] > 0).expect("du rendu");
+            let mut s = Sampler::new(store);
+            (y0..y1).map(|y| (x0..x1).filter(|&x| (i32::from(s.get(x, y)[0]) - i32::from(s.get(x + 1, y)[0])).abs() > 30).count()).sum::<usize>()
+        };
+        let (sparse, dense) = (apply(&square(), &blades(8.0, false)).expect("lames"), apply(&square(), &blades(24.0, false)).expect("lames"));
+        assert!(edges(&dense) > edges(&sparse), "plus dense : {} > {}", edges(&dense), edges(&sparse));
+    }
+
+    #[test]
+    fn halftone_patterns_use_ink_and_paper() {
+        for pattern in [HalftonePattern::Dots, HalftonePattern::Circles, HalftonePattern::Lines, HalftonePattern::Cmyk] {
+            let f = Filter::Halftone { cell: 8.0, angle: 30.0, color: false, pattern, contrast: 0.0, ink: [200, 0, 0], paper: [0, 0, 200], x: 0.5, y: 0.5 };
+            let out = apply(&square(), &f).expect("demi-teinte");
+            let mut s = Sampler::new(&out);
+            let px = (110..190).flat_map(|x| (110..190).map(move |y| (x, y))).map(|(x, y)| s.get(x, y)).collect::<Vec<_>>();
+            assert!(px.iter().all(|p| p[3] == 255), "{pattern:?} : alpha gardé");
+            if pattern != HalftonePattern::Cmyk {
+                assert!(px.iter().all(|p| p[1] < 5), "{pattern:?} : seulement encre et papier");
+            }
+        }
+        let retro = apply(&square(), &Filter::RetroPrint { ink: [10, 20, 30], paper: [240, 230, 220], density: 50.0, grain: 1.5, contrast: 0.0, bleed: 30.0, seed: 2 }).expect("impression rétro");
+        assert_eq!(Sampler::new(&retro).get(150, 150)[3], 255);
+    }
+
     #[test]
     fn lens_blur_is_a_flat_disc_and_highlights_bloom() {
         // Un point blanc sur gris sombre : le flou d'objectif en fait une pastille à bord net, pas une cloche.
@@ -1058,7 +1743,7 @@ mod tests {
         let white = dithered.chunks_exact(4).filter(|px| px[0] == 255).count();
         assert!(dithered.chunks_exact(4).all(|px| px[0] == 0 || px[0] == 255) && (1900..=2200).contains(&white), "{white} pixels blancs sur 4096");
 
-        let text = apply(&source, &Filter::Ascii { cell: 12, color: true }).expect("ascii");
+        let text = apply(&source, &Filter::Ascii { cell: 12, color: true, glow: 0.0 }).expect("ascii");
         let inside = text.translated(-100, -100).to_premultiplied(100, 100);
         let (lit, dark) = (inside.chunks_exact(4).filter(|px| px[0] > 128).count(), inside.chunks_exact(4).filter(|px| px[0] < 32).count());
         assert!(lit > 300 && dark > 3000, "des caractères clairs sur fond noir : {lit} clairs, {dark} sombres");
@@ -1275,13 +1960,13 @@ mod tests {
             px.copy_from_slice(&[v, v, v, 255]);
         }
         let source = TileStore::from_premultiplied(100, 40, &rgba).expect("tampon");
-        let out = apply(&source, &Filter::ChromaticAberration { amount: 6.0, angle: 0.0, radial: false }).expect("aberration");
+        let out = apply(&source, &Filter::ChromaticAberration { amount: 6.0, angle: 0.0, radial: false, warp: 0.0, streak: 0.0 }).expect("aberration");
         let mut sampler = Sampler::new(&out);
         assert_eq!(sampler.get(56, 20), [255, 0, 0, 255], "le rouge part à droite");
         assert_eq!(sampler.get(44, 20), [0, 0, 255, 255], "le bleu part à gauche");
         assert_eq!(sampler.get(50, 20), [0, 255, 0, 255], "le vert reste en place");
         // Radial : rien ne bouge au centre.
-        let radial = apply(&source, &Filter::ChromaticAberration { amount: 20.0, angle: 0.0, radial: true }).expect("aberration");
+        let radial = apply(&source, &Filter::ChromaticAberration { amount: 20.0, angle: 0.0, radial: true, warp: 0.0, streak: 0.0 }).expect("aberration");
         assert_eq!(Sampler::new(&radial).get(50, 20), [255, 255, 255, 255]);
     }
 

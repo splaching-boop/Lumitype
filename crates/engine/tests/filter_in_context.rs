@@ -26,8 +26,8 @@ fn the_all_layers_preview_shows_the_filter() {
     let session = Session::new(doc, "ouverture");
 
     let filter = Filter::GaussianBlur { radius: 20.0 };
-    let (cw, ch, filtered) = session.filter_preview_in_context(layer, &filter, 1024).expect("aperçu en contexte");
-    let (nw, nh, plain) = session.filter_preview_in_context(layer, &Filter::GaussianBlur { radius: 0.0 }, 1024).expect("aperçu sans flou");
+    let (cw, ch, filtered) = session.filter_preview_in_context(layer, &filter, 1024, None).expect("aperçu en contexte");
+    let (nw, nh, plain) = session.filter_preview_in_context(layer, &Filter::GaussianBlur { radius: 0.0 }, 1024, None).expect("aperçu sans flou");
     assert_eq!((cw, ch), (nw, nh));
 
     let changed = filtered.chunks_exact(4).zip(plain.chunks_exact(4)).filter(|(a, b)| a[0].abs_diff(b[0]) > 8).count();
@@ -43,8 +43,8 @@ fn the_single_layer_preview_shows_the_filter_too() {
     let layer = doc.add_pixel_layer("image", photo(w, h), None, 1).expect("calque");
 
     let filter = Filter::GaussianBlur { radius: 20.0 };
-    let (cw, ch, filtered) = doc.filter_preview(layer, &filter, 1024).expect("aperçu du calque");
-    let (_, _, plain) = doc.filter_preview(layer, &Filter::GaussianBlur { radius: 0.0 }, 1024).expect("aperçu sans flou");
+    let (cw, ch, filtered) = doc.filter_preview(layer, &filter, 1024, None).expect("aperçu du calque");
+    let (_, _, plain) = doc.filter_preview(layer, &Filter::GaussianBlur { radius: 0.0 }, 1024, None).expect("aperçu sans flou");
     let changed = filtered.chunks_exact(4).zip(plain.chunks_exact(4)).filter(|(a, b)| a[0].abs_diff(b[0]) > 8).count();
     println!("aperçu du calque {cw} x {ch} : {changed} pixels changés sur {}", cw * ch);
     assert!(changed * 10 > (cw * ch) as usize, "le flou doit se voir sur l'aperçu du calque seul");

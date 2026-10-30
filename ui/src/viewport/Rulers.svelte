@@ -5,8 +5,14 @@
     camera,
     pointer,
     onguidestart,
+    unitPx = 1,
+    zero = [0, 0],
   }: {
     camera: Camera | null;
+    /** Pixels du document par unité affichée (1 en pixels ; en mm : ppp / 25,4). */
+    unitPx?: number;
+    /** Zéro des règles, en pixels du document (coin du format fini d'un document d'impression). */
+    zero?: [number, number];
     pointer: { x: number; y: number } | null;
     /** Appui sur une règle : on en « tire » un repère, comme dans Photoshop. */
     onguidestart: (orientation: "horizontal" | "vertical", event: PointerEvent) => void;
@@ -16,7 +22,7 @@
   let left = $state<HTMLCanvasElement>();
   let size = $state({ width: 0, height: 0 });
 
-  const STEPS = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000];
+  const STEPS = [0.1, 0.25, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000];
 
   /** Couleurs et police lues une fois (lire les styles calculés à chaque image forçait une mise en page). */
   let palette: { tick: string; label: string; marker: string; font: string } | null = null;
@@ -61,20 +67,22 @@
 
     // Comme Photoshop : valeurs absolues de part et d'autre du zéro.
     // Graduation principale : au moins 64 px d'écran entre deux libellés.
-    const major = STEPS.find((step) => step * cam.zoom >= 64) ?? 10000;
-    const minor = major / (major === 2 || major === 20 || major === 200 || major === 2000 ? 4 : 5);
-    const origin = horizontal ? cam.x : cam.y;
-    const first = Math.floor(-origin / cam.zoom / minor) * minor;
+    const zoom = cam.zoom * unitPx;
+    const major = STEPS.find((step) => step * zoom >= 64) ?? 10000;
+    const minor = major / (major === 2 || major === 20 || major === 200 || major === 2000 || major === 0.5 ? 4 : 5);
+    const origin = (horizontal ? cam.x + zero[0] * cam.zoom : cam.y + zero[1] * cam.zoom);
+    const first = Math.floor(-origin / zoom / minor) * minor;
+    const text = (value: number) => String(Math.round(value * 100) / 100).replace("-", "−").replace(".", ",");
 
     ctx.beginPath();
-    for (let value = first; origin + value * cam.zoom <= length; value += minor) {
-      const pos = Math.round(origin + value * cam.zoom) + 0.5;
+    for (let value = first; origin + value * zoom <= length; value += minor) {
+      const pos = Math.round(origin + value * zoom) + 0.5;
       const isMajor = Math.abs(value / major - Math.round(value / major)) < 1e-6;
       const tick = isMajor ? thickness : 5;
       if (horizontal) {
         ctx.moveTo(pos, thickness);
         ctx.lineTo(pos, thickness - tick);
-        if (isMajor) ctx.fillText(String(Math.abs(Math.round(value))), pos + 3, 9);
+        if (isMajor) ctx.fillText(text(value), pos + 3, 9);
       } else {
         ctx.moveTo(thickness, pos);
         ctx.lineTo(thickness - tick, pos);
@@ -82,7 +90,7 @@
           ctx.save();
           ctx.translate(9, pos + 3);
           ctx.rotate(-Math.PI / 2);
-          ctx.fillText(String(Math.abs(Math.round(value))), 0, 0);
+          ctx.fillText(text(value), 0, 0);
           ctx.restore();
         }
       }
@@ -92,6 +100,8 @@
 
   // Graduations : redessinées quand la vue ou la taille change — pas quand le pointeur bouge.
   $effect(() => {
+    void unitPx;
+    void zero;
     if (!top || !left || !camera || size.width === 0) return;
     draw(top, true, camera);
     draw(left, false, camera);

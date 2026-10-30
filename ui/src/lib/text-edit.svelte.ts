@@ -42,3 +42,18 @@ export function finishTextEdit(): void {
   dropLatest(id);
   void whenIdle(id).then(() => edit({ op: "delete", ids: [layerId] }));
 }
+
+/**
+ * « Convertir en texte de paragraphe » (`paragraph`) ou « en texte de point », depuis un menu contextuel. Si ce texte
+ * est en cours de saisie, la saisie est d'abord validée : la conversion change le contenu (un retour par ligne
+ * visuelle), le brouillon de la séance ne le décrirait plus.
+ */
+export async function convertText(layerId: number, paragraph: boolean): Promise<void> {
+  const editing = app.textEdit;
+  if (editing?.layerId === layerId && editing.docId === app.activeId) {
+    const { id } = editing;
+    finishTextEdit();
+    await whenIdle(id);
+  }
+  await edit({ op: "convertText", id: layerId, paragraph });
+}
