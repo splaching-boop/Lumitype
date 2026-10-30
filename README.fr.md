@@ -22,6 +22,8 @@ Le nom Lumitype vient d'une machine à composer le texte. J'ai utilisé Claude A
 | Système | Paquet | Installation |
 |---|---|---|
 | **Windows 10 / 11** | [Lumitype-Windows-Setup.exe](https://github.com/splaching-boop/Lumitype/releases/latest/download/Lumitype-Windows-Setup.exe) | Double-clic sur l'installateur |
+| **Windows** : paquet MSI | [Lumitype-Windows.msi](https://github.com/splaching-boop/Lumitype/releases/latest/download/Lumitype-Windows.msi) | Pour un déploiement en entreprise (Intune, GPO) ou une installation silencieuse : `msiexec /i Lumitype-Windows.msi /qn` |
+| **Windows** : portable | [Lumitype-Windows-portable.exe](https://github.com/splaching-boop/Lumitype/releases/latest/download/Lumitype-Windows-portable.exe) | Sans installation : se lance depuis n'importe quel dossier ou une clé USB |
 | **Fedora** · RHEL · openSUSE | [Lumitype-Fedora-x86_64.rpm](https://github.com/splaching-boop/Lumitype/releases/latest/download/Lumitype-Fedora-x86_64.rpm) | `sudo dnf install ./Lumitype-Fedora-x86_64.rpm` |
 | **Debian** · Ubuntu · Mint | [Lumitype-Debian-Ubuntu-amd64.deb](https://github.com/splaching-boop/Lumitype/releases/latest/download/Lumitype-Debian-Ubuntu-amd64.deb) | `sudo apt install ./Lumitype-Debian-Ubuntu-amd64.deb` |
 | **Tout Linux** : AppImage | [Lumitype-Linux-x86_64.AppImage](https://github.com/splaching-boop/Lumitype/releases/latest/download/Lumitype-Linux-x86_64.AppImage) | `chmod +x Lumitype-Linux-x86_64.AppImage && ./Lumitype-Linux-x86_64.AppImage` |
