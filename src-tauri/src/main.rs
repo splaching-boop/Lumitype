@@ -16,6 +16,8 @@ fn main() {
     if std::env::args().nth(1).as_deref() == Some("--miniature") {
         std::process::exit(thumbnail(std::env::args().skip(2).collect()));
     }
+    // Avant Chromium : sans bus D-Bus désigné, il écrit lui-même « disabled: » dans la variable (voir session_bus_usable).
+    let session_bus = session_bus_usable();
     // Chromium : ce même exécutable sert aussi de processus de rendu et de carte graphique ; ceux-là s'arrêtent ici.
     #[cfg(feature = "cef")]
     if rt::start_cef() {
@@ -29,7 +31,7 @@ fn main() {
         context.config_mut().app.windows = vec![viewer_window()];
     }
     let mut builder = tauri::Builder::<rt::Runtime>::new();
-    if !viewer && session_bus_usable() {
+    if !viewer && session_bus {
         // À enregistrer en premier : un second lancement (double-clic sur un autre projet) ne démarre pas une
         // deuxième application ; ses fichiers sont transmis à la fenêtre déjà ouverte, qui passe au premier plan. La
         // visionneuse n'y participe pas : chaque image ouverte depuis l'explorateur a sa fenêtre.
@@ -304,12 +306,27 @@ fn thumbnail(args: Vec<String>) -> i32 {
 }
 
 /// Instance unique sous Linux : passe par le bus de session D-Bus, et l'extension panique (unwrap) si son adresse est
-/// illisible, au lieu de s'en passer. C'est le cas dans les bacs à sable sans D-Bus (« unsupported transport
-/// 'disabled' » : firejail du test d'AppImageHub, certains conteneurs) : Lumitype se fermait aussitôt. Sans bus,
-/// pas d'instance unique : chaque lancement ouvre sa fenêtre, comme la visionneuse.
+/// illisible, au lieu de s'en passer. Sans bus, pas d'instance unique : chaque lancement ouvre sa fenêtre, comme la
+/// visionneuse. Deux cas menaient au plantage (« unsupported transport 'disabled' », test d'AppImageHub) :
+///   - une adresse illisible, posée par un bac à sable ou un conteneur ;
+///   - AUCUNE adresse : Chromium, au démarrage, écrit alors « disabled: » dans la variable (pour ne pas lancer de bus),
+///     et l'extension la lit après lui. On tranche donc AVANT Chromium : si le bus par défaut existe, son adresse est
+///     inscrite dans la variable (Chromium n'y touche plus) ; sinon, pas d'instance unique.
 fn session_bus_usable() -> bool {
     #[cfg(target_os = "linux")]
     {
+        const VARIABLE: &str = "DBUS_SESSION_BUS_ADDRESS";
+        if std::env::var_os(VARIABLE).is_some() {
+            return zbus::Address::session().is_ok();
+        }
+        // Bus par défaut d'une session de bureau : $XDG_RUNTIME_DIR/bus.
+        let Some(dossier) = std::env::var_os("XDG_RUNTIME_DIR") else { return false };
+        let socket = std::path::Path::new(&dossier).join("bus");
+        if !socket.exists() {
+            return false;
+        }
+        // Au tout début de main, avant tout fil d'exécution : écrire dans l'environnement est sans risque ici.
+        std::env::set_var(VARIABLE, format!("unix:path={}", socket.display()));
         zbus::Address::session().is_ok()
     }
     #[cfg(not(target_os = "linux"))]
