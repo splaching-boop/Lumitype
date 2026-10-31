@@ -26,7 +26,7 @@ The name Lumitype comes from a historic typesetting machine. I used Claude AI to
 | **Windows**: portable | [Lumitype-Windows-portable.exe](https://github.com/splaching-boop/Lumitype/releases/latest/download/Lumitype-Windows-portable.exe) | No installation: run it from any folder or a USB stick |
 | **Fedora** · RHEL · openSUSE | [Lumitype-Fedora-x86_64.rpm](https://github.com/splaching-boop/Lumitype/releases/latest/download/Lumitype-Fedora-x86_64.rpm) | `sudo dnf install ./Lumitype-Fedora-x86_64.rpm` |
 | **Debian** · Ubuntu · Mint | [Lumitype-Debian-Ubuntu-amd64.deb](https://github.com/splaching-boop/Lumitype/releases/latest/download/Lumitype-Debian-Ubuntu-amd64.deb) | `sudo apt install ./Lumitype-Debian-Ubuntu-amd64.deb` |
-| **Any Linux**: AppImage | [Lumitype-Linux-x86_64.AppImage](https://github.com/splaching-boop/Lumitype/releases/latest/download/Lumitype-Linux-x86_64.AppImage) | `chmod +x Lumitype-Linux-x86_64.AppImage && ./Lumitype-Linux-x86_64.AppImage` |
+| **Any Linux**: AppImage | [Lumitype-x86_64.AppImage](https://github.com/splaching-boop/Lumitype/releases/latest/download/Lumitype-x86_64.AppImage) | `chmod +x Lumitype-x86_64.AppImage && ./Lumitype-x86_64.AppImage` |
 | **Any Linux**: Flatpak | [Lumitype-Linux.flatpak](https://github.com/splaching-boop/Lumitype/releases/latest/download/Lumitype-Linux.flatpak) | `flatpak install --user ./Lumitype-Linux.flatpak` |
 | **Any Linux**: portable archive | [Lumitype-Linux-portable.tar.gz](https://github.com/splaching-boop/Lumitype/releases/latest/download/Lumitype-Linux-portable.tar.gz) | `tar -xzf Lumitype-Linux-portable.tar.gz` |
 

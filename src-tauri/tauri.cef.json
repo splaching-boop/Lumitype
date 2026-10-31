@@ -21,7 +21,14 @@
       },
       "appimage": {
         "files": {
-          "/usr/lib/Lumitype": "../target/release/cef-bundle"
+          "/usr/lib": "../target/release/cef-bundle",
+          "/usr/lib/libxkbcommon-x11.so.0": "../target/release/appimage-libs/libxkbcommon-x11.so.0",
+          "/usr/lib/libxkbcommon.so.0": "../target/release/appimage-libs/libxkbcommon.so.0",
+          "/usr/lib/libxcb-xkb.so.1": "../target/release/appimage-libs/libxcb-xkb.so.1",
+          "/usr/lib/libsoftokn3.so": "../target/release/appimage-libs/libsoftokn3.so",
+          "/usr/lib/libfreebl3.so": "../target/release/appimage-libs/libfreebl3.so",
+          "/usr/lib/libfreeblpriv3.so": "../target/release/appimage-libs/libfreeblpriv3.so",
+          "/usr/lib/libnssckbi.so": "../target/release/appimage-libs/libnssckbi.so"
         }
       }
     }

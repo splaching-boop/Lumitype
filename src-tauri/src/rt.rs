@@ -51,7 +51,7 @@ pub fn start_cef() -> bool {
 }
 
 /// Paquets Linux installés : l'exécutable est dans `/usr/bin` (ou `~/.local/bin`, `/app/bin`), les
-/// fichiers de Chromium dans `../lib/Lumitype/` avec les ressources de Lumitype. `libcef.so` y est trouvé par le chemin de recherche de
+/// fichiers de Chromium dans `../lib/Lumitype/` (dans `../lib/` pour l'AppImage) avec les ressources de Lumitype. `libcef.so` y est trouvé par le chemin de recherche de
 /// l'exécutable (`rpath`, voir build.rs) ; ses données (`*.pak`, `locales/`) sont désignées explicitement. Rien à
 /// faire en développement : `target/release/` contient tout, à côté de l'exécutable.
 #[cfg(feature = "cef")]
@@ -61,10 +61,14 @@ fn cef_files_switches() -> Vec<(String, Option<String>)> {
     if dir.join("icudtl.dat").exists() {
         return Vec::new();
     }
-    let Ok(lib) = dir.join("../lib/Lumitype").canonicalize() else { return Vec::new() };
-    if !lib.join("icudtl.dat").exists() {
+    // Paquets : ../lib/Lumitype. AppImage : ../lib, où linuxdeploy dirige l'exécutable (il remplace le rpath de build.rs).
+    let Some(lib) = ["../lib/Lumitype", "../lib"]
+        .iter()
+        .filter_map(|sous| dir.join(sous).canonicalize().ok())
+        .find(|lib| lib.join("icudtl.dat").exists())
+    else {
         return Vec::new();
-    }
+    };
     vec![
         ("resources-dir-path".into(), Some(lib.display().to_string())),
         ("locales-dir-path".into(), Some(lib.join("locales").display().to_string())),

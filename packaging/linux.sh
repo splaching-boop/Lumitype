@@ -257,7 +257,7 @@ if [ "$COMPAT" -eq 1 ] && [ "${LUMITYPE_DANS_CONTENEUR:-0}" != 1 ]; then
     case "$argument" in --compat | --install | deb | rpm | arch | pacman | pkg | flatpak | appimage | tar) ;; *) TRANSMIS+=("$argument") ;; esac
   done
   TRANSMIS+=($FORMATS_CONTENEUR --oui)
-  IMAGE="lumitype-build:ubuntu22.04-1"
+  IMAGE="lumitype-build:ubuntu22.04-3"
   CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/lumitype-compat"
   mkdir -p "$CACHE/target" "$CACHE/cargo-registry" "$CACHE/npm"
   titre "Construction compatible : conteneur Ubuntu 22.04 (glibc 2.35), avec $CONTENEUR"
@@ -305,12 +305,14 @@ echo "Lumitype $VERSION — ${PRETTY_NAME:-Linux} ($FAMILLE, $ARCH, glibc $(ldd 
 
 # Installe des paquets de la distribution, après accord (ou directement avec --oui).
 installer() {
-  local commande
+  local commande s="sudo "
+  # Déjà administrateur (conteneur de --compat) : pas de sudo, qui n'y est d'ailleurs pas installé.
+  [ "$(id -u)" = 0 ] && s=""
   case "$FAMILLE" in
-    fedora) commande="sudo dnf install -y $*" ;;
-    debian) commande="sudo apt-get install -y $*" ;;
-    arch) commande="sudo pacman -S --needed --noconfirm $*" ;;
-    suse) commande="sudo zypper install -y $*" ;;
+    fedora) commande="${s}dnf install -y $*" ;;
+    debian) commande="${s}apt-get install -y $*" ;;
+    arch) commande="${s}pacman -S --needed --noconfirm $*" ;;
+    suse) commande="${s}zypper install -y $*" ;;
     *) rouge "Distribution non reconnue : installez vous-même $*"; return 1 ;;
   esac
   echo "  À installer : $*"
@@ -322,8 +324,8 @@ installer() {
   # Debian/Ubuntu : la liste des paquets d'une installation neuve (WSL surtout) est vide ou périmée ; sans « update »,
   # apt ne trouve ni nasm, ni ninja-build, ni libxdo-dev. Le dépôt « universe » d'Ubuntu, où ils sont, est activé au besoin.
   if [ "$FAMILLE" = debian ] && [ "${APT_A_JOUR:-0}" -eq 0 ]; then
-    if [ "${ID:-}" = ubuntu ] && command -v add-apt-repository >/dev/null 2>&1; then sudo add-apt-repository -y universe >/dev/null 2>&1 || true; fi
-    sudo apt-get update -q || true
+    if [ "${ID:-}" = ubuntu ] && command -v add-apt-repository >/dev/null 2>&1; then ${s}add-apt-repository -y universe >/dev/null 2>&1 || true; fi
+    ${s}apt-get update -q || true
     APT_A_JOUR=1
   fi
   eval "$commande"
@@ -401,8 +403,9 @@ paquet_pour() {
     fedora:ninja) echo ninja-build ;; debian:ninja) echo ninja-build ;; arch:ninja) echo ninja ;; suse:ninja) echo ninja ;;
     fedora:cxx) echo gcc-c++ ;; debian:cxx) echo g++ ;; arch:cxx) echo gcc ;; suse:cxx) echo gcc-c++ ;;
     fedora:pkg-config) echo pkgconf-pkg-config ;; debian:pkg-config) echo pkg-config ;; arch:pkg-config) echo pkgconf ;; suse:pkg-config) echo pkg-config ;;
-    fedora:webkit) echo "webkit2gtk4.1-devel openssl-devel librsvg2-devel libxdo-devel libappindicator-gtk3-devel" ;;
-    debian:webkit) echo "libwebkit2gtk-4.1-dev libssl-dev librsvg2-dev libxdo-dev libayatana-appindicator3-dev" ;;
+    # libxkbcommon-x11, libxcb-xkb et les morceaux de NSS : embarqués dans l'AppImage (packaging/lib/cef-bundle.sh).
+    fedora:webkit) echo "webkit2gtk4.1-devel openssl-devel librsvg2-devel libxdo-devel libappindicator-gtk3-devel libxkbcommon-x11 nss nss-softokn nss-softokn-freebl" ;;
+    debian:webkit) echo "libwebkit2gtk-4.1-dev libssl-dev librsvg2-dev libxdo-dev libayatana-appindicator3-dev libxkbcommon-x11-0 libxcb-xkb1 libnss3" ;;
     arch:webkit) echo "webkit2gtk-4.1 openssl librsvg xdotool libappindicator-gtk3" ;;
     suse:webkit) echo "webkit2gtk3-devel libopenssl-devel librsvg-devel libappindicator3-1" ;;
     *:curl) echo curl ;; *:file) echo file ;; *:ar) echo binutils ;;
@@ -554,7 +557,7 @@ if [ "$ESSAI" -eq 1 ]; then
   titre "Dépendances de l'interface"
   dependances_interface
   titre "Compilation pour essai ($MOTEUR) — sans paquet"
-  "$LIB/sync-templates.sh"
+  bash "$LIB/sync-templates.sh"
   npm run tauri build -- --no-bundle "${OPTIONS_TAURI[@]}" "${OPTIONS_CARGO[@]}"
   verifier_glibc || true
   vert "Prêt : $RACINE/target/release/lumitype"
@@ -621,7 +624,8 @@ export TMPDIR="${TMPDIR:-/tmp}"
 # [0x13] section .relr.dyn ») et fait échouer toute l'AppImage. Les bibliothèques des distributions et celles de
 # Chromium (packaging/lib/cef-bundle.sh) sont déjà allégées : on s'en passe.
 export NO_STRIP=true
-"$LIB/sync-templates.sh"
+# Lancé par bash : un dépôt envoyé depuis Windows perd le droit d'exécution des scripts.
+bash "$LIB/sync-templates.sh"
 DEBUT="$(mktemp)"
 trap 'rm -f "$DEBUT"' EXIT
 echec_tauri=0
@@ -669,6 +673,26 @@ ranger() {
   PRODUITS+=("$2  ($(du -h "$SORTIES/$2" | cut -f1))")
 }
 
+# Contenu de l'AppImage contrôlé après fabrication. linuxdeploy dirige l'exécutable vers usr/lib (son rpath remplace
+# celui de build.rs) : Chromium et ses données doivent y être (sinon « Invalid file descriptor to ICU data »), avec
+# les bibliothèques ouvertes à la volée (sinon prises sur le système, d'une autre version, ou absentes).
+verifier_appimage() {
+  local dossier manquants="" fichier
+  dossier="$(mktemp -d)"
+  chmod +x "$1"
+  if ! (cd "$dossier" && "$1" --appimage-extract >/dev/null 2>&1); then
+    rm -rf "$dossier"; rouge "  AppImage : extraction impossible pour la vérification"; return 1
+  fi
+  for fichier in libcef.so icudtl.dat v8_context_snapshot.bin locales/en-US.pak libEGL.so libGLESv2.so \
+                 libxkbcommon-x11.so.0 libxkbcommon.so.0 libxcb-xkb.so.1 \
+                 libnss3.so libnssutil3.so libsmime3.so libnspr4.so libsoftokn3.so libfreebl3.so libfreeblpriv3.so libnssckbi.so; do
+    [ -e "$dossier/squashfs-root/usr/lib/$fichier" ] || manquants="$manquants $fichier"
+  done
+  rm -rf "$dossier"
+  if [ -n "$manquants" ]; then rouge "  AppImage : absents de usr/lib :$manquants"; return 1; fi
+  vert "  AppImage vérifiée : Chromium, ses données, NSS et le clavier X11 sont dans usr/lib"
+}
+
 titre "Rangement dans packaging/out/"
 DEB="$(produit "*.deb")"
 demande deb && { [ -n "$DEB" ] && ranger "$DEB" "Lumitype_${VERSION}_${ARCH_DEB}.deb" || ignorer deb "la compilation a échoué"; }
@@ -694,8 +718,14 @@ if demande appimage; then
     npm run tauri bundle -- --bundles appimage --verbose "${OPTIONS_TAURI[@]}" >"$TRAVAIL/appimage.log" 2>&1 || true
     APPIMAGE="$(produit "*.AppImage")"
   fi
+  if [ -n "$APPIMAGE" ] && ! verifier_appimage "$APPIMAGE"; then
+    if [ "$RELEASE_DEMANDE" -eq 1 ]; then rouge "  AppImage incomplète : pas de publication (--release)."; exit 1; fi
+    jaune "  AppImage incomplète : elle risque de ne pas démarrer sur d'autres machines."
+  fi
   if [ -n "$APPIMAGE" ]; then ranger "$APPIMAGE" "$(basename "$APPIMAGE")"
   else
+    # AppImage d'une construction précédente retirée : sinon packaging/release/ la reprenait comme si elle était neuve.
+    rm -f "$SORTIES"/Lumitype_*_amd64.AppImage "$RELEASE/Lumitype-x86_64.AppImage"
     ignorer appimage "échec de linuxdeploy (journal : packaging/.work/appimage.log)"
     grep -iE 'error|erreur|failed|could not|not found|cannot|unable' "$TRAVAIL/appimage.log" 2>/dev/null | grep -v '^\s*$' | tail -n 20 >&2 || true
   fi
@@ -920,7 +950,8 @@ if [ "$RELEASE_DEMANDE" -eq 1 ]; then
   copier_release 'Lumitype-*.x86_64.rpm' Lumitype-Fedora-x86_64.rpm
   copier_release 'Lumitype_*_amd64.deb' Lumitype-Debian-Ubuntu-amd64.deb
   copier_release 'lumitype-*.pkg.tar.*' Lumitype-Arch-x86_64.pkg.tar.zst
-  copier_release 'Lumitype_*_amd64.AppImage' Lumitype-Linux-x86_64.AppImage
+  # Sans « Linux » : toutes les AppImage sont pour Linux (règle de nommage d'AppImageHub).
+  copier_release 'Lumitype_*_amd64.AppImage' Lumitype-x86_64.AppImage
   copier_release 'Lumitype-*-x86_64.flatpak' Lumitype-Linux.flatpak
   copier_release 'Lumitype-*-x86_64.tar.gz' Lumitype-Linux-portable.tar.gz
   copier_release 'Lumitype_*-setup.exe' Lumitype-Windows-Setup.exe
