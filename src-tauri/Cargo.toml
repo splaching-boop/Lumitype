@@ -64,6 +64,11 @@ cef = { version = "=150.2.1", default-features = false, optional = true }
 
 # Mémoire vidéo de la carte (préférences › Mémoire vidéo utilisable) : lue par DXGI sous Windows quand Vulkan ne
 # répond pas. Même version que dans crates/tauri-runtime-cef, pour ne pas compiler deux fois la crate.
+# Bus de session D-Bus : vérifié avant d'activer l'instance unique (main.rs). Même version que celle de
+# tauri-plugin-single-instance : rien de plus à compiler.
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = "5.9"
+
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common"] }
 

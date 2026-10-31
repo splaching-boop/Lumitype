@@ -3558,6 +3558,7 @@ dependencies = [
  "ureq 2.12.1",
  "webp",
  "windows 0.62.2",
+ "zbus",
 ]
 
 [[package]]

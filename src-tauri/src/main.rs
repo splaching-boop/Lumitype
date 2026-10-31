@@ -29,7 +29,7 @@ fn main() {
         context.config_mut().app.windows = vec![viewer_window()];
     }
     let mut builder = tauri::Builder::<rt::Runtime>::new();
-    if !viewer {
+    if !viewer && session_bus_usable() {
         // À enregistrer en premier : un second lancement (double-clic sur un autre projet) ne démarre pas une
         // deuxième application ; ses fichiers sont transmis à la fenêtre déjà ouverte, qui passe au premier plan. La
         // visionneuse n'y participe pas : chaque image ouverte depuis l'explorateur a sa fenêtre.
@@ -300,5 +300,20 @@ fn thumbnail(args: Vec<String>) -> i32 {
             eprintln!("miniature impossible : {error}");
             1
         }
+    }
+}
+
+/// Instance unique sous Linux : passe par le bus de session D-Bus, et l'extension panique (unwrap) si son adresse est
+/// illisible, au lieu de s'en passer. C'est le cas dans les bacs à sable sans D-Bus (« unsupported transport
+/// 'disabled' » : firejail du test d'AppImageHub, certains conteneurs) : Lumitype se fermait aussitôt. Sans bus,
+/// pas d'instance unique : chaque lancement ouvre sa fenêtre, comme la visionneuse.
+fn session_bus_usable() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        zbus::Address::session().is_ok()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        true
     }
 }
